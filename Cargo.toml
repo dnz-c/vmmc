@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = ["bins/*", "crates/*", "xtask"]
+# Patched upstream crates (see [patch.crates-io]); not part of the workspace proper.
+exclude = ["third_party"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+devices = { path = "crates/devices" }
+hv = { path = "crates/hv" }
+hv-whp = { path = "crates/hv-whp" }
+machine = { path = "crates/machine" }
+vm-core = { path = "crates/vm-core" }
+
+acpi_tables = "0.2.1"
+clap = { version = "4.6.7", features = ["derive"] }
+iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "intel"] }
+linux-loader = { version = "0.14.0", default-features = false, features = ["bzimage"] }
+sha2 = "0.11.0"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+virtio-bindings = "0.2.7"
+virtio-queue = "0.18.0"
+# The default `rawfd` feature is Unix-only and breaks the Windows build.
+vm-memory = { version = "0.18.0", default-features = false, features = ["backend-mmap"] }
+vm-superio = "0.8.2"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Hypervisor",
+    "Win32_System_LibraryLoader",
+] }
+
+# Upstream releases that enable vm-memory's Unix-only default features. Each directory's
+# VMMC-PATCH.md says what changed and when the patch can go.
+[patch.crates-io]
+linux-loader = { path = "third_party/linux-loader" }
+virtio-queue = { path = "third_party/virtio-queue" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"

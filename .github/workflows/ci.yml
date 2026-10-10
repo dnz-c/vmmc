@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins the toolchain; this installs it.
+      - run: rustup show
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Boot tests skip themselves here: hosted runners have no Windows hypervisor.
+      - run: cargo test --workspace
+
+  deny:
+    name: licences and advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  boot-test:
+    name: boot test guests (WHP)
+    # Needs a self-hosted Windows runner with the Windows Hypervisor Platform enabled,
+    # labelled `whp`. Turn on by setting the repository variable WHP_RUNNER to `true`.
+    if: vars.WHP_RUNNER == 'true'
+    runs-on: [self-hosted, windows, whp]
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo xtask boot-test

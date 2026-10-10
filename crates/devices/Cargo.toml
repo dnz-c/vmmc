@@ -1,0 +1,24 @@
+[package]
+name = "devices"
+description = "Device models for the vmmc engine: chipset, PCI and virtio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+virtio-bindings.workspace = true
+virtio-queue.workspace = true
+vm-core.workspace = true
+vm-memory.workspace = true
+vm-superio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+virtio-queue = { workspace = true, features = ["test-utils"] }
+
+[lints]
+workspace = true

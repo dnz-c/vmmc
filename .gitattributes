@@ -1,0 +1,2 @@
+# Guest scripts run inside Linux and must keep LF line endings.
+*.sh text eol=lf

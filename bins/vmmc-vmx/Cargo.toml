@@ -1,0 +1,22 @@
+[package]
+name = "vmmc-vmx"
+description = "Runs one vmmc virtual machine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap.workspace = true
+machine.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+vm-core.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+hv-whp.workspace = true
+windows = { workspace = true, features = ["Win32_System_Console"] }
+
+[lints]
+workspace = true
