@@ -58,6 +58,11 @@ pub fn run<H: Hypervisor>(
     image: &[u8],
     setup: impl FnOnce(&Vm<H::Partition>) -> vm_core::Result<()>,
 ) -> vm_core::Result<(VmExit, String)> {
+    // Windows allows one partition with guest memory per process, and the test harness
+    // runs tests on parallel threads: take turns.
+    static ONE_VM_AT_A_TIME: Mutex<()> = Mutex::new(());
+    let _serial = ONE_VM_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+
     let vm = Vm::new(hypervisor, &PartitionConfig::default(), ram)?;
     vm.memory().write_slice(image, GuestAddress(load_addr))?;
 

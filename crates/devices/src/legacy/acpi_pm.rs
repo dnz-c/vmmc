@@ -26,9 +26,18 @@ pub const S5_SLEEP_TYPE: u16 = 5;
 /// PM timer frequency in Hz.
 pub const PM_TIMER_HZ: u128 = 3_579_545;
 
+// PM1 status bits; the enable register uses the same positions.
 const STS_TMR: u16 = 1 << 0;
+const STS_GBL: u16 = 1 << 5;
 const STS_PWRBTN: u16 = 1 << 8;
+const STS_RTC: u16 = 1 << 10;
 const STS_WAK: u16 = 1 << 15;
+/// Status bits the guest clears by writing 1.
+const STS_CLEARABLE: u16 = STS_TMR | STS_GBL | STS_PWRBTN | STS_RTC | STS_WAK;
+/// Events the guest can enable. ACPI checks each fixed event it uses by writing its
+/// enable bit and reading it back, so these must stick even though only the power
+/// button ever fires.
+const EN_WRITABLE: u16 = STS_TMR | STS_GBL | STS_PWRBTN | STS_RTC;
 const CNT_SCI_EN: u16 = 1 << 0;
 const CNT_SLP_EN: u16 = 1 << 13;
 
@@ -111,11 +120,11 @@ impl BusDevice for AcpiPm {
         match offset {
             // Write 1 to clear.
             0 => {
-                self.status &= !(value & (STS_TMR | STS_PWRBTN | STS_WAK));
+                self.status &= !(value & STS_CLEARABLE);
                 self.update_sci();
             }
             2 => {
-                self.enable = value & (STS_TMR | STS_PWRBTN);
+                self.enable = value & EN_WRITABLE;
                 self.update_sci();
             }
             4 => self.write_control(value),
@@ -179,6 +188,16 @@ mod tests {
             0,
             "SLP_EN reads 0"
         );
+    }
+
+    #[test]
+    fn fixed_event_enables_read_back() {
+        // Linux's ACPI core checks the global lock and RTC events exist this way.
+        let mut f = fixture();
+        f.pm.write(2, &(STS_GBL | STS_RTC).to_le_bytes());
+        assert_eq!(read_u32(&mut f.pm, 2) as u16, STS_GBL | STS_RTC);
+        f.pm.write(2, &0xffffu16.to_le_bytes());
+        assert_eq!(read_u32(&mut f.pm, 2) as u16, EN_WRITABLE);
     }
 
     #[test]

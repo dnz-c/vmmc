@@ -1,13 +1,13 @@
 //! The host terminal as the guest's serial console.
 //!
 //! Input goes to the guest byte for byte. Ctrl-A starts an escape: Ctrl-A x quits,
-//! Ctrl-A Ctrl-A sends a literal Ctrl-A.
+//! Ctrl-A p presses the ACPI power button, Ctrl-A Ctrl-A sends a literal Ctrl-A.
 
 use std::io::{self, Read, Write};
 use std::thread;
 use std::time::Duration;
 
-use machine::SerialInput;
+use machine::{PowerButton, SerialInput};
 use vm_core::{StopHandle, StopReason};
 
 const CTRL_A: u8 = 0x01;
@@ -15,37 +15,60 @@ const CTRL_A: u8 = 0x01;
 /// The stop code used when the user quits with Ctrl-A x.
 pub const QUIT_CODE: u32 = 0;
 
-/// Splits terminal input into bytes for the guest and the quit command.
+/// What a piece of terminal input means.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Input {
+    /// Bytes for the guest's serial port.
+    Guest(Vec<u8>),
+    PowerButton,
+    Quit,
+}
+
+/// Splits terminal input into bytes for the guest and escape commands, in order.
 #[derive(Debug, Default)]
 pub struct EscapeFilter {
     after_ctrl_a: bool,
 }
 
 impl EscapeFilter {
-    /// Returns the bytes to forward, and whether the user asked to quit.
-    pub fn filter(&mut self, input: &[u8]) -> (Vec<u8>, bool) {
-        let mut forward = Vec::with_capacity(input.len());
+    pub fn filter(&mut self, input: &[u8]) -> Vec<Input> {
+        let mut out = Vec::new();
+        let mut bytes = Vec::new();
+        let flush = |bytes: &mut Vec<u8>, out: &mut Vec<Input>| {
+            if !bytes.is_empty() {
+                out.push(Input::Guest(std::mem::take(bytes)));
+            }
+        };
         for &byte in input {
             if std::mem::take(&mut self.after_ctrl_a) {
                 match byte {
-                    b'x' | b'X' => return (forward, true),
-                    CTRL_A => forward.push(CTRL_A),
+                    b'x' | b'X' => {
+                        flush(&mut bytes, &mut out);
+                        out.push(Input::Quit);
+                        return out;
+                    }
+                    b'p' | b'P' => {
+                        flush(&mut bytes, &mut out);
+                        out.push(Input::PowerButton);
+                    }
+                    CTRL_A => bytes.push(CTRL_A),
                     // Unknown escapes are swallowed, like QEMU's.
                     _ => {}
                 }
             } else if byte == CTRL_A {
                 self.after_ctrl_a = true;
             } else {
-                forward.push(byte);
+                bytes.push(byte);
             }
         }
-        (forward, false)
+        flush(&mut bytes, &mut out);
+        out
     }
 }
 
 /// Forwards stdin to the guest on a background thread until the user quits or stdin
 /// closes. The thread is never joined: a blocked console read can't be interrupted.
-pub fn spawn_input(serial: SerialInput, stop: StopHandle) -> io::Result<()> {
+pub fn spawn_input(serial: SerialInput, power: PowerButton, stop: StopHandle) -> io::Result<()> {
     thread::Builder::new()
         .name("console-input".into())
         .spawn(move || {
@@ -57,21 +80,27 @@ pub fn spawn_input(serial: SerialInput, stop: StopHandle) -> io::Result<()> {
                     Ok(0) | Err(_) => return,
                     Ok(read) => read,
                 };
-                let (mut pending, quit) = filter.filter(&buffer[..read]);
-                while !pending.is_empty() {
-                    let sent = serial.send(&pending);
-                    pending.drain(..sent);
-                    if sent == 0 {
-                        // The guest hasn't drained the UART's FIFO yet.
-                        thread::sleep(Duration::from_millis(1));
+                for input in filter.filter(&buffer[..read]) {
+                    match input {
+                        Input::Guest(mut pending) => {
+                            while !pending.is_empty() {
+                                let sent = serial.send(&pending);
+                                pending.drain(..sent);
+                                if sent == 0 {
+                                    // The guest hasn't drained the UART's FIFO yet.
+                                    thread::sleep(Duration::from_millis(1));
+                                }
+                                if stop.reason().is_some() {
+                                    return;
+                                }
+                            }
+                        }
+                        Input::PowerButton => power.press(),
+                        Input::Quit => {
+                            stop.request_stop(StopReason::Requested(QUIT_CODE));
+                            return;
+                        }
                     }
-                    if stop.reason().is_some() {
-                        return;
-                    }
-                }
-                if quit {
-                    stop.request_stop(StopReason::Requested(QUIT_CODE));
-                    return;
                 }
             }
         })?;
@@ -176,25 +205,35 @@ mod windows_console {
 mod tests {
     use super::*;
 
+    fn guest(bytes: &[u8]) -> Input {
+        Input::Guest(bytes.to_vec())
+    }
+
     #[test]
     fn plain_input_passes_through() {
         let mut filter = EscapeFilter::default();
-        assert_eq!(filter.filter(b"ls -l\r"), (b"ls -l\r".to_vec(), false));
+        assert_eq!(filter.filter(b"ls -l\r"), [guest(b"ls -l\r")]);
     }
 
     #[test]
     fn ctrl_a_x_quits_even_across_reads() {
         let mut filter = EscapeFilter::default();
-        assert_eq!(filter.filter(b"ab\x01"), (b"ab".to_vec(), false));
-        assert_eq!(filter.filter(b"x"), (Vec::new(), true));
+        assert_eq!(filter.filter(b"ab\x01"), [guest(b"ab")]);
+        assert_eq!(filter.filter(b"x"), [Input::Quit]);
+    }
+
+    #[test]
+    fn ctrl_a_p_presses_the_power_button_in_order() {
+        let mut filter = EscapeFilter::default();
+        assert_eq!(
+            filter.filter(b"a\x01pb"),
+            [guest(b"a"), Input::PowerButton, guest(b"b")]
+        );
     }
 
     #[test]
     fn ctrl_a_ctrl_a_sends_one_ctrl_a_and_unknown_escapes_vanish() {
         let mut filter = EscapeFilter::default();
-        assert_eq!(
-            filter.filter(b"\x01\x01z\x01qy"),
-            (b"\x01zy".to_vec(), false)
-        );
+        assert_eq!(filter.filter(b"\x01\x01z\x01qy"), [guest(b"\x01zy")]);
     }
 }

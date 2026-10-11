@@ -14,7 +14,7 @@ use windows::Win32::System::Hypervisor::{
 use crate::api::check;
 use crate::emulator::{Context, Emulator};
 use crate::partition::PartitionInner;
-use crate::regs;
+use crate::regs::{self, Aligned16};
 
 /// `WHV_INTERNAL_ACTIVITY_REGISTER.StartupSuspend`: the processor waits for a SIPI.
 const STARTUP_SUSPEND: u64 = 1;
@@ -23,7 +23,7 @@ const STARTUP_SUSPEND: u64 = 1;
 pub struct WhpVcpu {
     partition: Arc<PartitionInner>,
     index: u32,
-    exit: WHV_RUN_VP_EXIT_CONTEXT,
+    exit: Aligned16<WHV_RUN_VP_EXIT_CONTEXT>,
     emulator: Emulator,
 }
 
@@ -37,7 +37,7 @@ impl WhpVcpu {
         Ok(Self {
             partition,
             index,
-            exit: WHV_RUN_VP_EXIT_CONTEXT::default(),
+            exit: Aligned16::default(),
             emulator,
         })
     }
@@ -46,8 +46,9 @@ impl WhpVcpu {
         &self,
         names: &[WHV_REGISTER_NAME; N],
     ) -> hv::Result<[WHV_REGISTER_VALUE; N]> {
-        let mut values = [WHV_REGISTER_VALUE::default(); N];
-        // SAFETY: `names` and `values` both hold N elements.
+        let mut values = Aligned16([WHV_REGISTER_VALUE::default(); N]);
+        // SAFETY: `names` and `values` both hold N elements, and `values` is 16-byte
+        // aligned as WHP requires.
         check("WHvGetVirtualProcessorRegisters", unsafe {
             (self.partition.api.WHvGetVirtualProcessorRegisters)(
                 self.partition.handle,
@@ -57,7 +58,7 @@ impl WhpVcpu {
                 values.as_mut_ptr(),
             )
         })?;
-        Ok(values)
+        Ok(values.0)
     }
 
     fn set_registers<const N: usize>(
@@ -65,7 +66,9 @@ impl WhpVcpu {
         names: &[WHV_REGISTER_NAME; N],
         values: &[WHV_REGISTER_VALUE; N],
     ) -> hv::Result<()> {
-        // SAFETY: `names` and `values` both hold N elements.
+        let values = Aligned16(*values);
+        // SAFETY: `names` and `values` both hold N elements, and `values` is 16-byte
+        // aligned as WHP requires.
         check("WHvSetVirtualProcessorRegisters", unsafe {
             (self.partition.api.WHvSetVirtualProcessorRegisters)(
                 self.partition.handle,
@@ -88,8 +91,11 @@ impl WhpVcpu {
             // INS/OUTS move data between ports and guest memory, so let the emulator
             // decode them.
             let context = Context::new(&self.partition, self.index, io);
+            // Hand the emulator WHP's own (aligned) exit context, not a stack copy.
+            // SAFETY: WHP fills the IoPortAccess member for this exit reason.
+            let access = unsafe { &self.exit.Anonymous.IoPortAccess };
             return Ok(
-                match self.emulator.io(&context, &self.exit.VpContext, &access)? {
+                match self.emulator.io(&context, &self.exit.VpContext, access)? {
                     Ok(()) => VcpuExit::Handled,
                     Err(reason) => VcpuExit::Unhandled(format!("port {port:#x}: {reason}")),
                 },
@@ -119,14 +125,12 @@ impl WhpVcpu {
     }
 
     fn memory_exit(&mut self, io: &dyn CpuIo) -> hv::Result<VcpuExit> {
-        // SAFETY: WHP fills the MemoryAccess member for this exit reason.
-        let access = unsafe { self.exit.Anonymous.MemoryAccess };
+        // SAFETY: WHP fills the MemoryAccess member for this exit reason. The emulator
+        // gets WHP's own (aligned) exit context, not a stack copy.
+        let access = unsafe { &self.exit.Anonymous.MemoryAccess };
         let context = Context::new(&self.partition, self.index, io);
         Ok(
-            match self
-                .emulator
-                .mmio(&context, &self.exit.VpContext, &access)?
-            {
+            match self.emulator.mmio(&context, &self.exit.VpContext, access)? {
                 Ok(()) => VcpuExit::Handled,
                 Err(reason) => VcpuExit::Unhandled(format!(
                     "GPA {:#x} at RIP {:#x}: {reason}",

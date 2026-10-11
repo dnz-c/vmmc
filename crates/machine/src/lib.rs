@@ -113,6 +113,19 @@ impl SerialInput {
     }
 }
 
+/// Presses the guest's ACPI power button. A guest with ACPI support shuts down cleanly.
+#[derive(Clone)]
+pub struct PowerButton(Arc<Mutex<AcpiPm>>);
+
+impl PowerButton {
+    pub fn press(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .press_power_button();
+    }
+}
+
 pub struct Machine<P: Partition> {
     vm: Vm<P>,
     layout: MemoryLayout,
@@ -298,12 +311,9 @@ impl<P: Partition> Machine<P> {
         SerialInput(self.serial.clone())
     }
 
-    /// Presses the ACPI power button; a guest with ACPI support shuts down cleanly.
-    pub fn press_power_button(&self) {
-        self.acpi_pm
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .press_power_button();
+    /// A handle that presses the guest's ACPI power button from any thread.
+    pub fn power_button(&self) -> PowerButton {
+        PowerButton(self.acpi_pm.clone())
     }
 
     /// Runs the guest until it powers off, resets or fails, or the host stops it.

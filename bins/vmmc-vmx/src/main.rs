@@ -5,7 +5,7 @@
 //! ```
 //!
 //! Exit status: 0 when the guest powers off (or the user quits with Ctrl-A x), 2 when it
-//! resets, 3 on a triple fault, 1 on any error.
+//! resets, 3 on a triple fault, 1 on any error. Ctrl-A p presses the ACPI power button.
 
 mod console;
 
@@ -114,7 +114,11 @@ fn run(args: RunArgs) -> Result<RunOutcome, Box<dyn Error>> {
     machine.load_linux(&kernel, initrd.as_deref(), &args.cmdline)?;
 
     let raw = console::RawConsole::enable();
-    console::spawn_input(machine.serial_input(), machine.stop_handle())?;
+    console::spawn_input(
+        machine.serial_input(),
+        machine.power_button(),
+        machine.stop_handle(),
+    )?;
     let outcome = machine.run();
     drop(raw);
     Ok(outcome?)

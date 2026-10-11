@@ -216,7 +216,7 @@ fn fadt(facs: u64, dsdt: u64) -> Vec<u8> {
     t.io_gas(116, RESET_PORT, 1);
     t.u8(128, RESET_VALUE);
     t.u8(131, 1); // FADT minor version (ACPI 6.1)
-    t.u64(132, facs);
+    // X_FIRMWARE_CTRL (132) stays 0: the spec requires it when FIRMWARE_CTRL is set.
     t.u64(140, dsdt);
     t.io_gas(148, PM1A_EVT, PM1A_EVT_LEN);
     t.io_gas(172, PM1A_CNT, PM1A_CNT_LEN);
@@ -497,8 +497,14 @@ mod tests {
         let dsdt = u64_at(fadt, 140);
         table(&tables, dsdt, b"DSDT");
         assert_eq!(u64::from(u32_at(fadt, 40)), dsdt);
-        assert_eq!(&at(&tables, u64_at(fadt, 132))[0..4], b"FACS");
-        assert_eq!(u64_at(fadt, 132) % 64, 0, "FACS is 64-byte aligned");
+        let facs = u64::from(u32_at(fadt, 36));
+        assert_eq!(&at(&tables, facs)[0..4], b"FACS");
+        assert_eq!(facs % 64, 0, "FACS is 64-byte aligned");
+        assert_eq!(
+            u64_at(fadt, 132),
+            0,
+            "X_FIRMWARE_CTRL must be 0 alongside FIRMWARE_CTRL"
+        );
 
         assert_eq!(u32_at(fadt, 48), 0, "no SMI command port");
         assert_eq!(u32_at(fadt, 56), u32::from(PM1A_EVT));

@@ -128,9 +128,9 @@ Rough effort estimates assume 1–2 strong developers and are expected to slip.
 4. Done: `vm-memory` 0.18 works on Windows, but only with `default-features = false`, because its default `rawfd` feature is Unix-only.
 5. Done: the `hv` traits (`Hypervisor`, `Partition`, `Vcpu`, `VcpuKicker`, `VcpuExit`). `vm-core` holds no WHP types, and its run loop is tested against a fake backend.
 
-### Phase 1: Boots Linux: code complete and unit-verified, WHP run pending
+### Phase 1: Boots Linux: done (verified on WHP, 2026-10-11)
 
-Built and tested on a fake hypervisor (no WHP host was available):
+What was built:
 
 - **`hv` API:** run with callbacks (`CpuIo`), interrupt injection, wait-for-SIPI, and weak kicker and interrupt handles.
 - **`hv-whp`:**
@@ -144,26 +144,34 @@ Built and tested on a fake hypervisor (no WHP host was available):
   - Q35-like memory map, e820, and ACPI (RSDP/XSDT/FADT/FACS/MADT/MCFG/DSDT);
   - direct 64-bit Linux boot (`linux-loader`);
   - vCPU threads with stop, reset, triple-fault and error handling.
-- **`vmmc-vmx`:** CLI, raw Windows console, Ctrl-A x to quit.
+- **`vmmc-vmx`:** CLI, raw Windows console, Ctrl-A x to quit, Ctrl-A p for the ACPI power button.
 - **Test guest:** Ubuntu 26.04 generic kernel + BusyBox initramfs (`cargo xtask fetch-guests`, pinned by SHA-256), and `cargo xtask boot-test` / `linux-shell`.
 
 Scope moved out of Phase 1:
 - virtio-console moves to Phase 4.
 - PIC interrupt delivery (ExtINT), PCI INTx, HPET, Hyper-V enlightenments and WHP doorbells wait for Phase 2 or a WHP host.
 
-**Exit criterion:** `cargo xtask boot-test` passes on a WHP host. The test kernel must boot on 4 vCPUs, format, mount and verify `/dev/vda`, and power off within 90 s.
+**Exit criterion: met.** `cargo xtask boot-test` passes on a WHP host (Windows 11, i7-13700K), 5 runs out of 5. Ubuntu 26.04's 7.0 kernel reaches `/init` in about 0.33 s on 4 vCPUs, formats, mounts and verifies `/dev/vda`, and powers off through ACPI S5.
 
-**First-run checklist.** These assumptions only a real WHP host can confirm:
+**First-run checklist results:**
 
-| # | Assumption | Fallback if wrong |
+| # | Assumption | Result |
 |---|---|---|
-| A1 | APs in StartupSuspend come up through hypervisor-handled INIT/SIPI | Enable the `X64ApicInitSipiExitTrap` exit; do INIT/SIPI in the VMM |
-| A2 | With xAPIC emulation, HLT with interrupts on is handled inside the hypervisor | Wait on interrupt-window exits in the VMM |
-| A3 | `ApicEoi` exits arrive for level-triggered requests | Use edge triggering for the SCI |
-| A4 | The WHP emulator handles Linux's MMIO instruction mix | Decode those instructions ourselves with iced-x86 |
-| A5 | IRQ0 through IOAPIC GSI2 passes Linux's `check_timer`; the PM timer keeps the LAPIC calibration sane | `no_timer_check`, then the Hyper-V frequency MSRs |
-| A6 | CPUID topology on hybrid Intel CPUs looks sane in the guest | Override with `WHvPartitionPropertyCodeCpuidResultList` |
-| A7 | Ubuntu's generic kernel has virtio-pci and virtio-blk built in | Pack the modules from Ubuntu's initrd into the test initramfs |
+| A1 | APs in StartupSuspend come up through hypervisor-handled INIT/SIPI | ✅ `smp: Brought up 1 node, 4 CPUs` |
+| A2 | With xAPIC emulation, HLT with interrupts on is handled inside the hypervisor | ✅ an idle 4-vCPU guest uses 0.16% of one host core |
+| A3 | `ApicEoi` exits arrive for level-triggered requests | ✅ two power-button presses raise the SCI (level-triggered) exactly twice |
+| A4 | The WHP emulator handles Linux's MMIO instruction mix | ✅ IOAPIC, ECAM, virtio and MSI-X MMIO all work |
+| A5 | IRQ0 through IOAPIC GSI2 passes `check_timer`; the PM timer keeps calibration sane | ✅ timer check passes; "PIT calibration matches PMTIMER"; the guest switches to the TSC clocksource |
+| A6 | CPUID topology on hybrid Intel CPUs looks sane in the guest | ✅ with harmless noise: no PMU ("software events only"), and one unchecked uncore MSR read (0x396) |
+| A7 | Ubuntu's generic kernel has virtio-pci and virtio-blk built in | ✅ |
+
+**What the first real run found and fixed:**
+- **Register buffer alignment:** WHP accesses `WHV_REGISTER_VALUE` arrays with `movaps`, which needs 16-byte alignment, but the `windows` crate only guarantees 8. All register buffers and the exit context now use a 16-byte-aligned wrapper. This was an access-violation crash.
+- **One VM per process:** Windows lets only one partition per process have guest memory mapped at a time. `WHvMapGpaRange` fails with a misleading status, 0xC0370008, which `hv-whp` now turns into a clear error. One VM per worker process was already the design; tests that boot VMs take turns.
+- **ACPI PM1 enable register:** it now keeps the Global Lock and RTC enable bits. ACPI checks they stick and had disabled the Global Lock otherwise.
+- **FADT:** `X_FIRMWARE_CTRL` is now 0, as the spec requires when `FIRMWARE_CTRL` is set.
+
+**Known guest-log noise to address with firmware boot in Phase 2:** no DMI/SMBIOS, MTRRs not set up, no `_OSC` on the PCI root, and no PS/2 mouse.
 
 ### Phase 2: Installs Windows 11 from ISO (MVP engine, about 3–5 months)
 

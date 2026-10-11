@@ -14,6 +14,12 @@ use crate::api::{Api, check};
 use crate::interrupts::WhpInterrupts;
 use crate::vcpu::WhpVcpu;
 
+/// What `WHvMapGpaRange` returns when another partition in this process already has
+/// guest memory mapped: only one may at a time. (The status's own text, about a VID
+/// partition name that already exists, is misleading.)
+const ANOTHER_PARTITION_HAS_MEMORY: windows::core::HRESULT =
+    windows::core::HRESULT(0xc037_0008_u32 as i32);
+
 /// Owns the WHP partition handle. The partition and its vCPUs hold it strongly, so the
 /// handle stays valid until the last of them is dropped. Kickers and interrupt handles
 /// hold it weakly: they must not keep the guest's memory mapping alive.
@@ -120,7 +126,7 @@ impl hv::Partition for WhpPartition {
         }
         // SAFETY: the caller guarantees `host` points to `size` bytes that outlive the
         // mapping (see `hv::Partition::map_memory`).
-        check("WHvMapGpaRange", unsafe {
+        let hr = unsafe {
             (self.inner.api.WHvMapGpaRange)(
                 self.inner.handle,
                 host.cast_const().cast::<c_void>(),
@@ -128,7 +134,16 @@ impl hv::Partition for WhpPartition {
                 size,
                 WHV_MAP_GPA_RANGE_FLAGS(flags),
             )
-        })
+        };
+        if hr == ANOTHER_PARTITION_HAS_MEMORY {
+            return Err(hv::Error::Backend {
+                op: "WHvMapGpaRange",
+                source: "another VM in this process already has guest memory; Windows allows \
+                         one per process, so run each VM in its own process"
+                    .into(),
+            });
+        }
+        check("WHvMapGpaRange", hr)
     }
 
     fn unmap_memory(&self, gpa: u64, size: u64) -> hv::Result<()> {

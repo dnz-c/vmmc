@@ -13,9 +13,10 @@ Workstation Pro for everyday VM users. `vmmc` is a working codename.
 
 ## Status
 
-Phase 1 of [the roadmap](docs/ROADMAP.md): booting Linux. It is code complete and
-verified with unit and end-to-end tests on a fake hypervisor. It has **not yet run on a
-real Windows hypervisor**: the first-run checklist in the roadmap does that.
+Phase 1 of [the roadmap](docs/ROADMAP.md) is done: **Linux boots on the Windows
+Hypervisor Platform**. Ubuntu 26.04's kernel reaches userspace in about a third of a
+second on 4 vCPUs, uses a virtio disk, and powers off cleanly. Phase 2 (installing
+Windows 11 from an ISO) is next.
 
 What exists:
 - **Platform:** a Q35-like PC with ACPI, SMP, an IOAPIC, PIT, RTC, 16550 serial console,
@@ -57,8 +58,9 @@ cargo run -p vmmc-vmx -- run --kernel bzImage --initrd initramfs.cpio `
     --disk disk.raw --cpus 4 --memory 1024 --cmdline "console=ttyS0"
 ```
 
-The guest's serial console is the terminal. **Ctrl-A x** quits, and **Ctrl-A Ctrl-A**
-sends a Ctrl-A to the guest. `VMMC_LOG=debug` turns on logging to stderr.
+The guest's serial console is the terminal. **Ctrl-A x** quits, **Ctrl-A p** presses the
+ACPI power button, and **Ctrl-A Ctrl-A** sends a Ctrl-A to the guest.
+`VMMC_LOG=debug` turns on logging to stderr.
 
 Exit status: 0 when the guest powers off (or you quit), 2 when it resets, 3 on a triple
 fault, 1 on an error.

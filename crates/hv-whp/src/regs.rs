@@ -1,5 +1,7 @@
 //! Conversion between the `hv` register structs and WHP register name/value arrays.
 
+use std::ops::{Deref, DerefMut};
+
 use hv::{DescriptorTable, Segment, SpecialRegisters, StandardRegisters};
 use windows::Win32::System::Hypervisor::{
     WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_X64_SEGMENT_REGISTER, WHV_X64_SEGMENT_REGISTER_0,
@@ -12,6 +14,30 @@ use windows::Win32::System::Hypervisor::{
     WHvX64RegisterRflags, WHvX64RegisterRip, WHvX64RegisterRsi, WHvX64RegisterRsp,
     WHvX64RegisterSs, WHvX64RegisterTr,
 };
+
+/// Forces 16-byte alignment on a buffer WHP reads or writes.
+///
+/// WHP copies register values with SSE instructions (`movaps`) that fault on anything
+/// less than 16-byte aligned. The Windows SDK declares `WHV_REGISTER_VALUE` with that
+/// alignment, but the `windows` crate's definition only has 8, so every register buffer
+/// we hand to WHP, and the exit context, goes through this wrapper.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Aligned16<T>(pub T);
+
+impl<T> Deref for Aligned16<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> DerefMut for Aligned16<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
 
 pub(crate) const STANDARD_NAMES: [WHV_REGISTER_NAME; 18] = [
     WHvX64RegisterRax,
@@ -187,6 +213,14 @@ fn segment_to_whp(s: &Segment) -> WHV_X64_SEGMENT_REGISTER {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_buffers_are_16_byte_aligned() {
+        // A u8 first, so an unaligned buffer would actually land unaligned.
+        let pair = (0u8, Aligned16([WHV_REGISTER_VALUE::default(); 3]));
+        assert_eq!(std::mem::align_of_val(&pair.1), 16);
+        assert_eq!((&raw const pair.1).addr() % 16, 0);
+    }
 
     #[test]
     fn standard_registers_round_trip() {
