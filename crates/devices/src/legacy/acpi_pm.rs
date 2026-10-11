@@ -9,20 +9,22 @@ use crate::clock::Clock;
 use crate::irq::IrqLine;
 use crate::{PowerEvent, PowerHandler};
 
-/// I/O base of the PM block, as on Q35/ICH9.
+/// I/O base of the PM block, as on Q35/ICH9 (and where OVMF puts it).
 pub const PM_BASE: u16 = 0x600;
-pub const PM_PORTS: u16 = 0x0c;
-/// PM1a_EVT_BLK: status (2 bytes) then enable (2 bytes).
-pub const PM1A_EVT: u16 = PM_BASE;
+/// ICH9's PM I/O block is 128 bytes; only the registers below are implemented.
+pub const PM_PORTS: u16 = 0x80;
+/// PM1a_EVT_BLK, at this offset in the block: status (2 bytes) then enable (2 bytes).
+pub const PM1A_EVT: u16 = 0;
 pub const PM1A_EVT_LEN: u8 = 4;
-/// PM1a_CNT_BLK.
-pub const PM1A_CNT: u16 = PM_BASE + 4;
+/// PM1a_CNT_BLK's offset in the block.
+pub const PM1A_CNT: u16 = 4;
 pub const PM1A_CNT_LEN: u8 = 2;
-/// PM_TMR_BLK: 24-bit free-running counter.
-pub const PM_TMR: u16 = PM_BASE + 8;
+/// PM_TMR_BLK's offset in the block: a 24-bit free-running counter.
+pub const PM_TMR: u16 = 8;
 pub const PM_TMR_LEN: u8 = 4;
-/// SLP_TYP value the DSDT's `_S5` object gives for soft-off.
-pub const S5_SLEEP_TYPE: u16 = 5;
+/// SLP_TYP value the DSDT's `_S5` object gives for soft-off. ICH9 uses 0, which is
+/// also what OVMF's reset library writes to power off.
+pub const S5_SLEEP_TYPE: u16 = 0;
 /// PM timer frequency in Hz.
 pub const PM_TIMER_HZ: u128 = 3_579_545;
 

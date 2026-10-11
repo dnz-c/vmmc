@@ -13,6 +13,8 @@ publish = false
 
 [workspace.dependencies]
 devices = { path = "crates/devices" }
+disk = { path = "crates/disk" }
+net = { path = "crates/net" }
 hv = { path = "crates/hv" }
 hv-whp = { path = "crates/hv-whp" }
 machine = { path = "crates/machine" }
@@ -20,8 +22,20 @@ vm-core = { path = "crates/vm-core" }
 
 acpi_tables = "0.2.1"
 clap = { version = "4.6.7", features = ["derive"] }
+# No chrono: file times come out as the FAT epoch, which keeps images reproducible.
+fatfs = { version = "0.3.6", default-features = false, features = ["std", "alloc"] }
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "intel"] }
 linux-loader = { version = "0.14.0", default-features = false, features = ["bzimage"] }
+png = "0.18.1"
+smoltcp = { version = "0.14.0", default-features = false, features = [
+    "std",
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-udp",
+    "auto-icmp-echo-reply",
+] }
+ruzstd = "0.9.0"
 sha2 = "0.11.0"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
@@ -43,6 +57,10 @@ windows = { version = "0.62.2", features = [
 [patch.crates-io]
 linux-loader = { path = "third_party/linux-loader" }
 virtio-queue = { path = "third_party/virtio-queue" }
+
+# Unpacking the test initrd is far too slow unoptimized.
+[profile.dev.package.ruzstd]
+opt-level = 3
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

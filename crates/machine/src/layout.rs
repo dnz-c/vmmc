@@ -1,15 +1,22 @@
-//! Guest-physical memory map of the vmmc PC (Q35-like, so firmware boot fits later).
+//! Guest-physical memory map of the vmmc PC (Q35-like, so UEFI firmware runs on it).
+//!
+//! Direct Linux boot uses the map below. Firmware boot ([`MemoryLayout::firmware`])
+//! makes everything below the low RAM end plain RAM, and the firmware flash sits
+//! just under 4 GiB.
 //!
 //! | Range                         | Use                                         |
 //! |-------------------------------|---------------------------------------------|
 //! | `0..0xA_0000`                 | RAM (top 1 KiB reserved as the EBDA)        |
 //! | `0xA_0000..0xE_0000`          | Hole: legacy VGA and option ROM space       |
 //! | `0xE_0000..0x10_0000`         | RAM marked reserved: RSDP and ACPI tables   |
-//! | `0x10_0000..low RAM end`      | RAM, up to `ECAM_BASE`                      |
+//! | `0x10_0000..low RAM end`      | RAM, up to `LOW_RAM_LIMIT`                  |
+//! | `max(low RAM end, 2 GiB)..`   | 32-bit PCI BARs, up to the ECAM window      |
 //! | `ECAM_BASE` (256 MiB)         | PCIe ECAM                                   |
-//! | `PCI_MMIO32` window           | 32-bit PCI BARs                             |
 //! | `0xFEC0_0000` / `0xFEE0_0000` | IOAPIC / local APICs                        |
 //! | `4 GiB..`                     | The rest of RAM, then the 64-bit PCI window |
+//!
+//! The ECAM base and the 32-bit window are where OVMF puts them on Q35, so direct boot
+//! and firmware boot describe the same platform.
 
 pub const MIB: u64 = 1 << 20;
 pub const GIB: u64 = 1 << 30;
@@ -19,13 +26,17 @@ pub const LOW_RAM_END: u64 = 0xa_0000;
 /// The BIOS area: RSDP and ACPI tables live here.
 pub const BIOS_AREA_START: u64 = 0xe_0000;
 pub const HIGH_MEMORY_START: u64 = MIB;
-pub const ECAM_BASE: u64 = 0xb000_0000;
+/// RAM below 4 GiB stops here at most, leaving room for 32-bit BARs below the ECAM.
+pub const LOW_RAM_LIMIT: u64 = 0xb000_0000;
+pub const ECAM_BASE: u64 = 0xe000_0000;
 pub const ECAM_SIZE: u64 = 256 * MIB;
-pub const PCI_MMIO32_START: u64 = 0xc000_0000;
-pub const PCI_MMIO32_END: u64 = 0xfec0_0000;
+/// The 32-bit PCI window starts at the end of low RAM, but not below this.
+pub const PCI_MMIO32_FLOOR: u64 = 0x8000_0000;
 pub const RAM_ABOVE_4G_START: u64 = 4 * GIB;
 /// Size of the 64-bit PCI window placed after the last RAM.
 pub const PCI_MMIO64_SIZE: u64 = 32 * GIB;
+/// Firmware flash ends at 4 GiB and may take up to this much below it.
+pub const FLASH_MAX: u64 = 16 * MIB;
 /// Smallest VM we build.
 pub const MIN_MEMORY: u64 = 32 * MIB;
 
@@ -64,7 +75,7 @@ impl MemoryLayout {
             memory >= MIN_MEMORY && memory.is_multiple_of(MIB),
             "memory {memory:#x}"
         );
-        let below_4g = memory.min(ECAM_BASE);
+        let below_4g = memory.min(LOW_RAM_LIMIT);
         let above_4g = memory - below_4g;
 
         // The BIOS area is mapped as RAM so the ACPI tables can live there; it runs
@@ -121,26 +132,68 @@ impl MemoryLayout {
     }
 }
 
+impl MemoryLayout {
+    /// Lays out `memory` bytes for UEFI firmware, which decides itself what to reserve:
+    /// RAM runs unbroken from 0 to the low RAM end, then continues at 4 GiB. The e820
+    /// map (handed over through fw_cfg) lists just those two ranges.
+    pub fn firmware(memory: u64) -> Self {
+        let mut layout = Self::new(memory);
+        let below_4g = layout.low_ram_end;
+        layout.ram = vec![(0, below_4g as usize)];
+        layout.e820 = vec![E820Entry {
+            address: 0,
+            size: below_4g,
+            kind: E820Type::Ram,
+        }];
+        let above_4g = memory - below_4g;
+        if above_4g > 0 {
+            layout.ram.push((RAM_ABOVE_4G_START, above_4g as usize));
+            layout.e820.push(E820Entry {
+                address: RAM_ABOVE_4G_START,
+                size: above_4g,
+                kind: E820Type::Ram,
+            });
+        }
+        layout
+    }
+
+    /// The e820 map in the 20-byte little-endian entry format of fw_cfg's `etc/e820`.
+    pub fn e820_bytes(&self) -> Vec<u8> {
+        self.e820
+            .iter()
+            .flat_map(|entry| {
+                let mut bytes = entry.address.to_le_bytes().to_vec();
+                bytes.extend_from_slice(&entry.size.to_le_bytes());
+                bytes.extend_from_slice(&(entry.kind as u32).to_le_bytes());
+                bytes
+            })
+            .collect()
+    }
+}
+
+/// The 32-bit PCI window, `[start, end)`, for a machine whose low RAM ends at
+/// `low_ram_end` and whose ECAM window starts at `ecam_base`.
+pub fn mmio32_window(low_ram_end: u64, ecam_base: u64) -> (u64, u64) {
+    (low_ram_end.max(PCI_MMIO32_FLOOR), ecam_base)
+}
+
 /// Hands out BAR addresses in the 32-bit PCI window.
 #[derive(Debug)]
 pub struct Mmio32Allocator {
     next: u64,
-}
-
-impl Default for Mmio32Allocator {
-    fn default() -> Self {
-        Self {
-            next: PCI_MMIO32_START,
-        }
-    }
+    end: u64,
 }
 
 impl Mmio32Allocator {
+    pub fn new((start, end): (u64, u64)) -> Self {
+        Self { next: start, end }
+    }
+
     /// A naturally aligned range of `size` (a power of two) bytes.
     pub fn allocate(&mut self, size: u64) -> Option<u64> {
         let address = self.next.next_multiple_of(size);
         let end = address.checked_add(size)?;
-        (end <= PCI_MMIO32_END).then(|| {
+        (end <= self.end).then(|| {
             self.next = end;
             address
         })
@@ -166,12 +219,16 @@ mod tests {
                 .iter()
                 .all(|e| e.address + e.size <= ECAM_BASE + ECAM_SIZE)
         );
+        assert_eq!(
+            mmio32_window(layout.low_ram_end, ECAM_BASE),
+            (0x8000_0000, 0xe000_0000)
+        );
     }
 
     #[test]
     fn large_vm_splits_around_the_pci_hole() {
         let layout = MemoryLayout::new(4 * GIB);
-        let above = 4 * GIB - ECAM_BASE;
+        let above = 4 * GIB - LOW_RAM_LIMIT;
         assert_eq!(layout.ram[2], (4 * GIB, above as usize));
         let total: u64 = layout
             .e820
@@ -199,11 +256,34 @@ mod tests {
     }
 
     #[test]
+    fn firmware_layout_has_no_holes_below_the_low_ram_end() {
+        let layout = MemoryLayout::firmware(4 * GIB);
+        let above = 4 * GIB - LOW_RAM_LIMIT;
+        assert_eq!(
+            layout.ram,
+            [(0, LOW_RAM_LIMIT as usize), (4 * GIB, above as usize)]
+        );
+        let bytes = layout.e820_bytes();
+        assert_eq!(bytes.len(), 40);
+        assert_eq!(&bytes[8..16], &LOW_RAM_LIMIT.to_le_bytes());
+        assert_eq!(&bytes[16..20], &1u32.to_le_bytes(), "RAM");
+        assert_eq!(&bytes[20..28], &(4 * GIB).to_le_bytes());
+
+        let small = MemoryLayout::firmware(512 * MIB);
+        assert_eq!(small.ram, [(0, (512 * MIB) as usize)]);
+        assert_eq!(small.e820.len(), 1);
+    }
+
+    #[test]
     fn mmio32_allocations_are_aligned_and_bounded() {
-        let mut alloc = Mmio32Allocator::default();
-        assert_eq!(alloc.allocate(0x1000), Some(0xc000_0000));
-        assert_eq!(alloc.allocate(0x4000), Some(0xc000_4000));
-        assert_eq!(alloc.allocate(0x2000), Some(0xc000_8000));
-        assert_eq!(alloc.allocate(GIB), None, "doesn't fit below the IOAPIC");
+        let mut alloc = Mmio32Allocator::new(mmio32_window(LOW_RAM_LIMIT, ECAM_BASE));
+        assert_eq!(alloc.allocate(0x1000), Some(0xb000_0000));
+        assert_eq!(alloc.allocate(0x4000), Some(0xb000_4000));
+        assert_eq!(alloc.allocate(0x2000), Some(0xb000_8000));
+        assert_eq!(
+            alloc.allocate(GIB),
+            None,
+            "doesn't fit below the ECAM window"
+        );
     }
 }

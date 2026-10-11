@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 acpi_tables.workspace = true
 devices.workspace = true
+disk.workspace = true
+net.workspace = true
 hv.workspace = true
 linux-loader.workspace = true
 thiserror.workspace = true

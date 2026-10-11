@@ -4,9 +4,12 @@
 //! runs on WHP today and KVM later.
 
 mod bus;
+pub mod ram;
 mod vm;
 
 pub use bus::{Bus, BusDevice, SharedDevice};
+pub use hv::MemoryAccess;
+pub use ram::{RamMapper, RamRegion};
 pub use vm::{StopHandle, StopReason, Vm, VmExit, VmVcpu};
 pub use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
@@ -22,4 +25,6 @@ pub enum Error {
     GuestMemory(#[from] vm_memory::GuestMemoryError),
     #[error("bus range {base:#x}+{len:#x} is empty, wraps around, or overlaps another device")]
     BusRange { base: u64, len: u64 },
+    #[error("the VM is gone")]
+    VmGone,
 }

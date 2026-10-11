@@ -16,12 +16,16 @@ Workstation Pro for everyday VM users. `vmmc` is a working codename.
 Phase 1 of [the roadmap](docs/ROADMAP.md) is done: **Linux boots on the Windows
 Hypervisor Platform**. Ubuntu 26.04's kernel reaches userspace in about a third of a
 second on 4 vCPUs, uses a virtio disk, and powers off cleanly. Phase 2 (installing
-Windows 11 from an ISO) is next.
+Windows 11 from an ISO) is under way: **UEFI firmware (OVMF) boots**, keeps its
+variables per VM, and runs its shell.
 
 What exists:
-- **Platform:** a Q35-like PC with ACPI, SMP, an IOAPIC, PIT, RTC, 16550 serial console,
-  PCIe (port I/O and ECAM) and virtio-blk with MSI-X.
-- **Boot:** direct Linux boot (bzImage + initramfs) in 64-bit mode.
+- **Platform:** a Q35 PC (MCH host bridge, ICH9 LPC) with ACPI, SMP, an IOAPIC, PIT,
+  RTC, 16550 serial console, PCIe (port I/O and ECAM), NVMe and virtio-blk disks, and
+  an AHCI controller for SATA disks and DVD drives, a linear-framebuffer display
+  adapter, and virtio-net or Intel e1000e network adapters on user-mode NAT.
+- **Boot:** UEFI firmware from flash (fw_cfg, ACPI through the table loader, SMBIOS), or
+  direct Linux boot (bzImage + initramfs) in 64-bit mode.
 - **Worker:** `vmmc-vmx`, which puts the guest's serial console on your terminal.
 
 ## Requirements
@@ -45,13 +49,43 @@ What exists:
 cargo test --workspace                          # unit and fake-hypervisor tests
 cargo xtask ci                                  # fmt, clippy, tests, cargo-deny
 cargo xtask fetch-guests                        # test kernel, BusyBox initramfs, disk
-cargo xtask boot-test                           # boots the test guests on WHP
+cargo xtask fetch-native                        # CI-built OVMF (needs `gh auth login`)
+cargo xtask boot-test                           # every WHP boot test below
+cargo xtask linux-test                          # test Linux, booted directly
+cargo xtask firmware-test                       # OVMF's shell and variable store
+cargo xtask uefi-linux-test                     # test Linux through OVMF, from NVMe
+cargo xtask uefi-cd-test                        # test Linux through OVMF, from an ISO
+cargo xtask win11-test                          # unattended Windows 11 install (needs VMMC_WIN11_ISO)
 cargo xtask linux-shell                         # test Linux with a shell on this terminal
 ```
 
 `cargo xtask ci` needs `cargo-deny` (`cargo install cargo-deny --locked`).
+`fetch-native` and `firmware-test` download OVMF from this repository's releases with the
+GitHub CLI, so they need an account with access to it.
 
 ## Running a VM
+
+With UEFI firmware, after `cargo xtask fetch-native`:
+
+```powershell
+cargo run -p vmmc-vmx -- run --firmware target\native\OVMF_CODE.fd `
+    --vm-dir my-vm --disk disk.raw --cpus 4 --memory 4096
+```
+
+`--disk PATH,nvme` attaches a disk as a namespace of the NVMe controller, which UEFI,
+Windows and Linux all have drivers for. `--disk PATH,sata` puts it on the AHCI
+controller, and plain `--disk PATH` makes it virtio-blk. `--cdrom ISO` adds a DVD drive
+with that disc.
+`--vm-dir` holds what the VM keeps between runs: its UEFI variable store (`nvram.fd`,
+copied from `OVMF_VARS.fd` next to the firmware on first use; `--vars-template` picks
+another, such as `OVMF_VARS.secboot.fd` for Secure Boot) and its SMBIOS UUID.
+`--firmware-log FILE` saves the firmware's debug output when it's a debug build.
+`--nic e1000e` (or `virtio`) adds a network adapter behind a user-mode NAT: DHCP gives the
+guest 10.0.2.15, DNS uses the host's resolver, and 10.0.2.2 reaches the host itself.
+`--screenshot DIR` saves the screen as PNG when the VM stops and on each Ctrl-A s;
+add `--screenshot-every SECS` for a timed series.
+
+Or a Linux kernel, booted directly:
 
 ```powershell
 cargo run -p vmmc-vmx -- run --kernel bzImage --initrd initramfs.cpio `
@@ -62,8 +96,9 @@ The guest's serial console is the terminal. **Ctrl-A x** quits, **Ctrl-A p** pre
 ACPI power button, and **Ctrl-A Ctrl-A** sends a Ctrl-A to the guest.
 `VMMC_LOG=debug` turns on logging to stderr.
 
-Exit status: 0 when the guest powers off (or you quit), 2 when it resets, 3 on a triple
-fault, 1 on an error.
+When the guest resets, the VM restarts; `--no-reboot` makes it exit instead. Exit
+status: 0 when the guest powers off (or you quit), 2 when it resets with `--no-reboot`,
+3 on a triple fault, 1 on an error.
 
 ## Layout
 
@@ -72,8 +107,10 @@ fault, 1 on an error.
 | `crates/hv` | Backend-neutral hypervisor traits: partition, vCPU, exits, interrupts |
 | `crates/hv-whp` | Windows Hypervisor Platform backend, including its instruction emulator |
 | `crates/vm-core` | Guest memory, port/MMIO buses and the vCPU run loop |
-| `crates/devices` | Device models: chipset, PCI, virtio |
-| `crates/machine` | The x86 PC platform: memory map, ACPI, Linux boot, vCPU threads |
+| `crates/devices` | Device models: chipset, firmware interfaces (fw_cfg, flash), PCI, NVMe, AHCI/ATAPI, virtio |
+| `crates/disk` | Disk images: the block backend trait, raw (sparse) image files |
+| `crates/net` | User-mode NAT networking (smoltcp): DHCP, DNS, TCP/UDP to host sockets |
+| `crates/machine` | The x86 PC platform: memory map, ACPI, SMBIOS, firmware and Linux boot, vCPU threads |
 | `bins/vmmc-vmx` | Runs one VM with its console on the terminal |
 | `xtask` | Developer tasks and test guest artifacts |
 | `third_party` | Upstream crates with small Windows-build patches (see each `VMMC-PATCH.md`) |

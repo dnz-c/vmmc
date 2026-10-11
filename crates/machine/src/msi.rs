@@ -42,6 +42,7 @@ pub fn decode(message: MsiMessage) -> Option<Interrupt> {
 
 impl<I: InterruptController> MsiSink for HvMsiSink<I> {
     fn send(&self, message: MsiMessage) {
+        tracing::trace!(?message, "MSI");
         let Some(interrupt) = decode(message) else {
             tracing::debug!(?message, "dropped an MSI this platform can't deliver");
             return;

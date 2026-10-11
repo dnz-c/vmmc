@@ -1,4 +1,5 @@
-//! Writes cpio archives in the "newc" format the Linux kernel unpacks as an initramfs.
+//! Writes cpio archives in the "newc" format the Linux kernel unpacks as an initramfs,
+//! and reads them back (to take files out of a distribution's initrd).
 
 const MAGIC: &str = "070701";
 const TRAILER: &str = "TRAILER!!!";
@@ -98,9 +99,63 @@ pub fn archive(entries: &[Entry<'_>]) -> Vec<u8> {
     out
 }
 
+/// Every regular file in `bytes`, which may hold several archives back to back (with
+/// zero padding between them), as `(path, contents)`.
+pub fn files(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let mut files = Vec::new();
+    let mut at = 0;
+    let field = |header: &[u8], index: usize| -> Result<usize, String> {
+        let text = std::str::from_utf8(&header[6 + 8 * index..14 + 8 * index])
+            .map_err(|_| "bad cpio header")?;
+        usize::from_str_radix(text, 16).map_err(|_| "bad cpio header".into())
+    };
+    loop {
+        while at < bytes.len() && bytes[at] == 0 {
+            at += 1;
+        }
+        if at >= bytes.len() {
+            return Ok(files);
+        }
+        let header = bytes.get(at..at + 110).ok_or("truncated cpio header")?;
+        if &header[..6] != MAGIC.as_bytes() {
+            return Err(format!("not a newc cpio archive at byte {at}"));
+        }
+        let (mode, size, name_size) = (field(header, 1)?, field(header, 6)?, field(header, 11)?);
+        let name_end = at + 110 + name_size;
+        let name = bytes
+            .get(at + 110..name_end.saturating_sub(1))
+            .ok_or("truncated cpio name")?;
+        let name = String::from_utf8_lossy(name).into_owned();
+        let data_start = (name_end - at).next_multiple_of(4) + at;
+        let data = bytes
+            .get(data_start..data_start + size)
+            .ok_or("truncated cpio file")?;
+        at = (data_start + size - at).next_multiple_of(4) + at;
+        if name != TRAILER && mode as u32 & 0o170000 == S_IFREG {
+            files.push((name, data.to_vec()));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_files_back_across_concatenated_archives() {
+        let mut bytes = archive(&[Entry::dir("lib"), Entry::file("lib/a.ko", 0o644, b"first")]);
+        bytes.extend_from_slice(&[0; 512]);
+        bytes.extend(archive(&[Entry::file("b", 0o644, b"second!")]));
+        let files = files(&bytes).unwrap();
+        assert_eq!(
+            files,
+            [
+                ("lib/a.ko".to_owned(), b"first".to_vec()),
+                ("b".to_owned(), b"second!".to_vec())
+            ]
+        );
+        assert!(super::files(&bytes[..200]).is_err(), "truncated");
+    }
 
     /// An entry read back from an archive.
     struct Parsed {

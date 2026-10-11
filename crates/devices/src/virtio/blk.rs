@@ -4,13 +4,12 @@
 //! up. Every sector number and length comes from the guest and is checked against the
 //! disk before any I/O happens.
 
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
-use std::path::Path;
+use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
+use disk::BlockBackend;
 use virtio_bindings::virtio_blk::{
     VIRTIO_BLK_F_BLK_SIZE, VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_BLK_F_SEG_MAX,
     VIRTIO_BLK_ID_BYTES, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP,
@@ -31,101 +30,6 @@ const SEG_MAX: u32 = QUEUE_SIZE as u32 - 2;
 /// Requests larger than this fail rather than allocate without bound.
 const MAX_REQUEST_BYTES: usize = 64 << 20;
 const ID_BYTES: usize = VIRTIO_BLK_ID_BYTES as usize;
-
-/// Where a block device's data lives.
-pub trait BlockBackend: Send + Sync {
-    /// Size in bytes.
-    fn len(&self) -> u64;
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-    fn is_read_only(&self) -> bool;
-    /// Fills `buf` from `offset`. The caller has checked the range is inside the disk.
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()>;
-    /// Writes `buf` at `offset`. The caller has checked the range is inside the disk.
-    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()>;
-    fn flush(&self) -> io::Result<()>;
-}
-
-/// A raw disk image file: byte N of the disk is byte N of the file.
-#[derive(Debug)]
-pub struct RawFile {
-    file: File,
-    len: u64,
-    read_only: bool,
-}
-
-impl RawFile {
-    pub fn open(path: &Path, read_only: bool) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(!read_only).open(path)?;
-        let len = file.metadata()?.len();
-        Ok(Self {
-            file,
-            len,
-            read_only,
-        })
-    }
-}
-
-#[cfg(windows)]
-fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-    std::os::windows::fs::FileExt::seek_read(file, buf, offset)
-}
-
-#[cfg(windows)]
-fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
-    std::os::windows::fs::FileExt::seek_write(file, buf, offset)
-}
-
-#[cfg(unix)]
-fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-    std::os::unix::fs::FileExt::read_at(file, buf, offset)
-}
-
-#[cfg(unix)]
-fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
-    std::os::unix::fs::FileExt::write_at(file, buf, offset)
-}
-
-impl BlockBackend for RawFile {
-    fn len(&self) -> u64 {
-        self.len
-    }
-
-    fn is_read_only(&self) -> bool {
-        self.read_only
-    }
-
-    fn read_at(&self, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
-        while !buf.is_empty() {
-            match read_at(&self.file, buf, offset)? {
-                0 => return Err(io::ErrorKind::UnexpectedEof.into()),
-                n => {
-                    buf = &mut buf[n..];
-                    offset += n as u64;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn write_at(&self, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
-        while !buf.is_empty() {
-            match write_at(&self.file, buf, offset)? {
-                0 => return Err(io::ErrorKind::WriteZero.into()),
-                n => {
-                    buf = &buf[n..];
-                    offset += n as u64;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn flush(&self) -> io::Result<()> {
-        self.file.sync_data()
-    }
-}
 
 enum Message {
     Notify,
@@ -401,55 +305,15 @@ impl Available for virtio_queue::Writer<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use virtio_bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
     use virtio_queue::desc::RawDescriptor;
     use virtio_queue::desc::split::Descriptor;
     use virtio_queue::mock::MockSplitQueue;
     use vm_memory::{Bytes, GuestAddress};
 
+    use disk::MemDisk;
+
     use super::*;
-
-    /// A disk held in memory.
-    struct MemDisk {
-        data: Mutex<Vec<u8>>,
-        read_only: bool,
-        flushes: Mutex<u32>,
-    }
-
-    impl MemDisk {
-        fn new(sectors: usize, read_only: bool) -> Self {
-            Self {
-                data: Mutex::new(vec![0; sectors * SECTOR_SIZE as usize]),
-                read_only,
-                flushes: Mutex::new(0),
-            }
-        }
-    }
-
-    impl BlockBackend for MemDisk {
-        fn len(&self) -> u64 {
-            self.data.lock().unwrap().len() as u64
-        }
-        fn is_read_only(&self) -> bool {
-            self.read_only
-        }
-        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-            let data = self.data.lock().unwrap();
-            buf.copy_from_slice(&data[offset as usize..offset as usize + buf.len()]);
-            Ok(())
-        }
-        fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-            let mut data = self.data.lock().unwrap();
-            data[offset as usize..offset as usize + buf.len()].copy_from_slice(buf);
-            Ok(())
-        }
-        fn flush(&self) -> io::Result<()> {
-            *self.flushes.lock().unwrap() += 1;
-            Ok(())
-        }
-    }
 
     const HEADER: u64 = 0x10_0000;
     const DATA: u64 = 0x20_0000;
@@ -498,7 +362,7 @@ mod tests {
 
     #[test]
     fn write_then_read_back() {
-        let disk = MemDisk::new(16, false);
+        let disk = MemDisk::new(16 * SECTOR_SIZE as usize, false);
         let memory = memory();
         memory
             .write_slice(&[0xab; 1024], GuestAddress(DATA))
@@ -520,10 +384,7 @@ mod tests {
         let mut queue: Queue = mock.create_queue().unwrap();
         process_queue(&memory, &mut queue, &disk, SERIAL).unwrap();
         assert_eq!(memory.read_obj::<u8>(GuestAddress(STATUS)).unwrap(), 0);
-        assert_eq!(
-            &disk.data.lock().unwrap()[3 * 512..5 * 512],
-            &[0xab; 1024][..]
-        );
+        assert_eq!(&disk.bytes(3 * 512, 2 * 512)[..], &[0xab; 1024][..]);
 
         let (memory, status, used) = submit(&disk, VIRTIO_BLK_T_IN, 3, 1024, true);
         assert_eq!(status, VIRTIO_BLK_S_OK as u8);
@@ -535,7 +396,7 @@ mod tests {
 
     #[test]
     fn reads_past_the_end_fail_without_touching_memory() {
-        let disk = MemDisk::new(4, false);
+        let disk = MemDisk::new(4 * SECTOR_SIZE as usize, false);
         let (_, status, used) = submit(&disk, VIRTIO_BLK_T_IN, 3, 1024, true);
         assert_eq!(status, VIRTIO_BLK_S_IOERR as u8);
         assert_eq!(used, 1);
@@ -546,17 +407,17 @@ mod tests {
 
     #[test]
     fn read_only_disks_refuse_writes() {
-        let disk = MemDisk::new(4, true);
+        let disk = MemDisk::new(4 * SECTOR_SIZE as usize, true);
         let (_, status, _) = submit(&disk, VIRTIO_BLK_T_OUT, 0, 512, false);
         assert_eq!(status, VIRTIO_BLK_S_IOERR as u8);
     }
 
     #[test]
     fn flush_get_id_and_unsupported_requests() {
-        let disk = MemDisk::new(4, false);
+        let disk = MemDisk::new(4 * SECTOR_SIZE as usize, false);
         let (_, status, _) = submit(&disk, VIRTIO_BLK_T_FLUSH, 0, 0, false);
         assert_eq!(status, VIRTIO_BLK_S_OK as u8);
-        assert_eq!(*disk.flushes.lock().unwrap(), 1);
+        assert_eq!(disk.flushes(), 1);
 
         let (memory, status, used) = submit(&disk, VIRTIO_BLK_T_GET_ID, 0, 20, true);
         assert_eq!(status, VIRTIO_BLK_S_OK as u8);
@@ -571,7 +432,10 @@ mod tests {
 
     #[test]
     fn config_space_reports_capacity_and_block_size() {
-        let blk = VirtioBlk::new(Arc::new(MemDisk::new(2048, false)), "x");
+        let blk = VirtioBlk::new(
+            Arc::new(MemDisk::new(2048 * SECTOR_SIZE as usize, false)),
+            "x",
+        );
         let mut capacity = [0u8; 8];
         blk.read_config(0, &mut capacity);
         assert_eq!(u64::from_le_bytes(capacity), 2048);
@@ -579,18 +443,5 @@ mod tests {
         blk.read_config(20, &mut block_size);
         assert_eq!(u32::from_le_bytes(block_size), 512);
         assert_eq!(blk.features() & (1 << VIRTIO_BLK_F_RO), 0);
-    }
-
-    #[test]
-    fn raw_file_backend_round_trips() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        file.as_file().set_len(8 * SECTOR_SIZE).unwrap();
-        let raw = RawFile::open(file.path(), false).unwrap();
-        assert_eq!(raw.len(), 8 * SECTOR_SIZE);
-        raw.write_at(b"vmmc", 1000).unwrap();
-        let mut back = [0u8; 4];
-        raw.read_at(&mut back, 1000).unwrap();
-        assert_eq!(&back, b"vmmc");
-        raw.flush().unwrap();
     }
 }

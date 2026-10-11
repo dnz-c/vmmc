@@ -1,7 +1,13 @@
 //! Developer tasks: `cargo xtask <task>`.
 
 mod cpio;
+mod esp;
+mod firmware;
 mod guests;
+mod iso;
+mod modules;
+mod native;
+mod windows;
 
 use std::env;
 use std::io::{Read, Write};
@@ -16,19 +22,32 @@ usage: cargo xtask <task>
 tasks:
   ci            format check, clippy, tests and cargo-deny, as CI runs them
   fetch-guests  download the test kernel and BusyBox, and build the test initramfs
-  boot-test     boot the test guests on WHP; fails if the Windows hypervisor isn't running
+  fetch-native  download the CI-built OVMF into target/native (needs `gh auth login`)
+  boot-test     every WHP test below, plus the hypervisor backend's own; fails if the
+                Windows hypervisor isn't running
+  linux-test    boot the test Linux directly on WHP (virtio disk)
+  firmware-test boot OVMF on WHP to its shell, check variables persist and it powers off
+  uefi-linux-test
+                boot the test Linux through OVMF from an EFI system partition on NVMe
+  uefi-cd-test  boot the test Linux through OVMF from an ISO in the AHCI DVD drive
+  win11-test    install Windows 11 unattended from $VMMC_WIN11_ISO (20-60 minutes)
   linux-shell   boot the test Linux guest with a shell on this terminal";
 
 /// How long the Linux test guest gets to boot, test its disk and power off.
 const LINUX_TIMEOUT: Duration = Duration::from_secs(90);
 const LINUX_CPUS: &str = "4";
 /// What the test guest's init prints when everything works, in order.
-const LINUX_MARKERS: [&str; 4] = [
+const LINUX_MARKERS: [&str; 7] = [
     "VMMC-TEST: booted",
     "VMMC-TEST: cpus=4",
-    "VMMC-TEST: disk=ok",
+    "VMMC-TEST: efi=no",
+    "VMMC-TEST: disk=ok vda",
+    "VMMC-TEST: net=ok",
+    "VMMC-TEST: dns=ok",
     "VMMC-TEST: done",
 ];
+/// What the host's test web server answers, and the guest checks for.
+const HTTP_BODY: &str = "vmmc net ok";
 
 fn main() -> ExitCode {
     let result = match env::args().nth(1).as_deref() {
@@ -39,7 +58,15 @@ fn main() -> ExitCode {
                 guest.kernel.parent().unwrap().display()
             );
         }),
+        Some("fetch-native") => native::fetch(&workspace()).map(|dir| {
+            eprintln!("native dependencies ready in {}", dir.display());
+        }),
         Some("boot-test") => boot_test(),
+        Some("linux-test") => linux_boot_test(),
+        Some("firmware-test") => firmware::test(),
+        Some("uefi-linux-test") => firmware::linux_test(),
+        Some("uefi-cd-test") => firmware::cd_test(),
+        Some("win11-test") => windows::test(),
         Some("linux-shell") => linux_shell(),
         _ => {
             eprintln!("{USAGE}");
@@ -60,6 +87,18 @@ fn workspace() -> PathBuf {
         .parent()
         .expect("xtask is in the workspace")
         .to_owned()
+}
+
+/// Where the disk images guests write to go: `VMMC_TEST_IMAGES`, or a folder in the
+/// system temp directory. Some volumes (antivirus or sync filters) rescan a whole file
+/// whenever it's modified, which turns a guest's first write into a minutes-long stall,
+/// so these stay off the workspace's volume by default.
+fn image_dir() -> Result<PathBuf, String> {
+    let dir = env::var_os("VMMC_TEST_IMAGES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| env::temp_dir().join("vmmc-test-images"));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("can't create {}: {e}", dir.display()))?;
+    Ok(dir)
 }
 
 fn ci() -> Result<(), String> {
@@ -88,7 +127,10 @@ fn boot_test() -> Result<(), String> {
             "--nocapture",
         ])
         .env("VMMC_REQUIRE_WHP", "1"))?;
-    linux_boot_test()
+    linux_boot_test()?;
+    firmware::test()?;
+    firmware::linux_test()?;
+    firmware::cd_test()
 }
 
 /// Boots the test Linux guest headless and checks it reports a working SMP boot and
@@ -98,7 +140,13 @@ fn linux_boot_test() -> Result<(), String> {
     let guest = guests::prepare(&workspace)?;
     let exe = build_vmmc_vmx(&workspace)?;
 
-    let mut command = vmmc_vmx_command(&exe, &guest, "console=ttyS0 panic=-1");
+    let http = serve_http()?;
+    let mut command = vmmc_vmx_command(
+        &exe,
+        &guest,
+        &format!("console=ttyS0 panic=-1 vmmc.http={http}"),
+    );
+    command.args(["--nic", "virtio"]);
     command.stdin(Stdio::null()).stdout(Stdio::piped());
     eprintln!("$ {command:?}");
     let mut child = command
@@ -157,6 +205,26 @@ fn linux_shell() -> Result<(), String> {
         &guest,
         "console=ttyS0 vmmc.interactive",
     ))
+}
+
+/// A web server on the host's loopback that answers every request with [`HTTP_BODY`],
+/// for the guest to reach through the NAT. Returns its port.
+pub(crate) fn serve_http() -> Result<u16, String> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| format!("can't start the test web server: {e}"))?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{HTTP_BODY}",
+                HTTP_BODY.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    Ok(port)
 }
 
 fn vmmc_vmx_command(exe: &Path, guest: &guests::Guest, cmdline: &str) -> Command {

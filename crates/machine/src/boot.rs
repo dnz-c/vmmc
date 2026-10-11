@@ -245,10 +245,71 @@ pub fn boot_cpu_registers(
     (regs, sregs)
 }
 
+/// The architectural reset state (Intel SDM vol. 3, "Processor State After Reset"):
+/// real mode, about to fetch from 0xffff_fff0. Firmware starts here. WHP doesn't
+/// create vCPUs in this state, so it has to be set explicitly.
+pub fn reset_registers() -> (StandardRegisters, SpecialRegisters) {
+    let regs = StandardRegisters {
+        rip: 0xfff0,
+        rflags: 0x2,
+        ..Default::default()
+    };
+    let data = Segment::real_mode_data(0);
+    let sregs = SpecialRegisters {
+        cs: Segment {
+            base: 0xffff_0000,
+            ..Segment::real_mode_code(0xf000)
+        },
+        ds: data,
+        es: data,
+        fs: data,
+        gs: data,
+        ss: data,
+        // Present; a busy 32-bit TSS and an LDT, as VMX requires of TR and LDTR.
+        tr: Segment {
+            base: 0,
+            limit: 0xffff,
+            selector: 0,
+            attributes: 0x8b,
+        },
+        ldt: Segment {
+            base: 0,
+            limit: 0xffff,
+            selector: 0,
+            attributes: 0x82,
+        },
+        gdt: DescriptorTable {
+            base: 0,
+            limit: 0xffff,
+        },
+        idt: DescriptorTable {
+            base: 0,
+            limit: 0xffff,
+        },
+        // CD | NW | ET.
+        cr0: 0x6000_0010,
+        cr2: 0,
+        cr3: 0,
+        cr4: 0,
+        cr8: 0,
+        efer: 0,
+    };
+    (regs, sregs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::layout::MIB;
+
+    #[test]
+    fn reset_state_fetches_from_the_top_of_4g() {
+        let (regs, sregs) = reset_registers();
+        assert_eq!(sregs.cs.base + regs.rip, 0xffff_fff0);
+        assert_eq!(sregs.cs.selector, 0xf000);
+        assert_eq!(sregs.cr0 & 1, 0, "real mode");
+        assert_eq!(regs.rflags, 2);
+    }
 
     /// A minimal bzImage: a setup header the loader accepts, then `payload`.
     fn fake_bzimage(payload: &[u8], init_size: u32) -> Vec<u8> {

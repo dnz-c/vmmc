@@ -8,6 +8,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+disk.workspace = true
+net.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 virtio-bindings.workspace = true

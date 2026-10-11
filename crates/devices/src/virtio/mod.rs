@@ -1,6 +1,7 @@
 //! virtio devices and their PCI transport (virtio 1.2, modern devices only).
 
 pub mod blk;
+pub mod net;
 pub mod pci;
 
 use std::sync::Arc;

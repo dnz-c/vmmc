@@ -1,23 +1,36 @@
-//! The vmmc x86 PC platform: memory layout, ACPI tables, Linux boot and vCPU threads.
+//! The vmmc x86 PC platform: memory layout, ACPI and SMBIOS tables, firmware and Linux
+//! boot, and vCPU threads.
 //!
-//! [`Machine::new`] builds the VM and its devices; [`Machine::load_linux`] prepares a
-//! direct kernel boot; [`Machine::run`] runs one thread per vCPU until the guest powers
-//! off, resets, or fails.
+//! [`Machine::new`] builds the VM and its devices. A machine either boots UEFI firmware
+//! ([`MachineConfig::firmware`]) or a kernel prepared with [`Machine::load_linux`].
+//! [`Machine::run`] runs one thread per vCPU until the guest powers off, resets, or
+//! fails.
 
 pub mod acpi;
 pub mod boot;
 pub mod layout;
 mod msi;
+pub mod smbios;
 
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
+use devices::chipset::lpc::{Ich9Lpc, LPC_FUNCTION, LPC_SLOT};
+use devices::chipset::mch::{MCH_SLOT, Mch};
 use devices::clock::{Clock, HostClock};
+use devices::display::bochs::{
+    BochsDisplay, FRAMEBUFFER_BAR, FRAMEBUFFER_SIZE, MMIO_BAR, MMIO_SIZE,
+};
+pub use devices::display::bochs::{Display, Frame};
+use devices::firmware::fw_cfg::{self, FW_CFG_BASE, FW_CFG_PORTS, FwCfg};
+use devices::firmware::pflash::Pflash;
 use devices::irq::{IrqLine, MsiSink};
 use devices::legacy::acpi_pm::{AcpiPm, PM_BASE, PM_PORTS};
+use devices::legacy::debugcon::{DebugConsole, OVMF_DEBUG_PORT};
 use devices::legacy::i8042::{I8042, I8042_COMMAND, I8042_DATA, I8042CommandPort};
 use devices::legacy::ioapic::{IOAPIC_BASE, IOAPIC_SIZE, IoApic};
 use devices::legacy::pic::{
@@ -27,22 +40,32 @@ use devices::legacy::pit::{PIT_BASE, PIT_PORTS, PORT_61, Pit, Port61};
 use devices::legacy::port80::{POST_PORT, PostPort};
 use devices::legacy::rtc::{RTC_BASE, RTC_PORTS, Rtc};
 use devices::legacy::serial::{COM1_BASE, COM1_IRQ, SERIAL_PORTS, Serial};
-use devices::pci::host_bridge::{HOST_BRIDGE_SLOT, HostBridge};
-use devices::pci::root::{
-    CONFIG_IO_BASE, CONFIG_IO_PORTS, ECAM_SIZE, PciConfigIo, PciEcam, PciRoot,
+use devices::nic::e1000e::{
+    E1000e, REGISTER_BAR as E1000E_BAR, REGISTER_BAR_SIZE as E1000E_BAR_SIZE,
 };
+use devices::pci::root::{CONFIG_IO_BASE, CONFIG_IO_PORTS, PciConfigIo, PciEcam, PciRoot};
 use devices::pci::{PciDevice, SharedPciDevice};
+use devices::storage::ahci::{
+    ABAR, ABAR_SIZE, AHCI_FUNCTION, AHCI_SLOT, Ahci, Drive, PORTS as AHCI_PORTS,
+};
+use devices::storage::ata::AtaDisk;
+use devices::storage::atapi::Cdrom;
+use devices::storage::nvme::{NVME_BAR, NVME_BAR_SIZE, Namespace, Nvme};
 use devices::timer::ThreadTicker;
-use devices::virtio::blk::{RawFile, VirtioBlk};
+use devices::virtio::blk::VirtioBlk;
+use devices::virtio::net::VirtioNet;
 use devices::virtio::pci::{CONFIG_BAR, CONFIG_BAR_SIZE, MSIX_BAR, MSIX_BAR_SIZE, VirtioPci};
 use devices::{PowerEvent, PowerHandler};
+use disk::RawFile;
 use hv::{Hypervisor, LocalApicMode, Partition, PartitionConfig};
+use net::{Nat, NatConfig};
 use vm_core::{BusDevice, StopHandle, StopReason, Vm, VmExit, VmVcpu};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 pub use crate::boot::BootEntry;
 use crate::layout::{
-    BIOS_AREA_START, ECAM_BASE, HIGH_MEMORY_START, MIB, MIN_MEMORY, MemoryLayout, Mmio32Allocator,
+    BIOS_AREA_START, ECAM_BASE, ECAM_SIZE, FLASH_MAX, GIB, HIGH_MEMORY_START, MIB, MIN_MEMORY,
+    MemoryLayout, Mmio32Allocator, RAM_ABOVE_4G_START, mmio32_window,
 };
 pub use crate::msi::HvMsiSink;
 
@@ -51,8 +74,15 @@ pub const MAX_CPUS: u8 = 32;
 /// The PIT's IRQ 0 reaches IOAPIC pin 2 (see the MADT override).
 const PIT_IOAPIC_PIN: u8 = 2;
 const KEYBOARD_IRQ: u8 = 1;
-/// PCI slot of the first disk.
-const FIRST_DISK_SLOT: u8 = 1;
+/// PCI slot of the display adapter.
+pub const DISPLAY_SLOT: u8 = 1;
+/// PCI slot of the NVMe controller.
+pub const NVME_SLOT: u8 = 2;
+/// PCI slot of the e1000e network adapter.
+pub const E1000E_SLOT: u8 = 3;
+/// PCI slot of the first virtio disk. Slots 1 to 4 are for the display, NVMe, network
+/// and USB controllers.
+pub const FIRST_VIRTIO_SLOT: u8 = 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -66,16 +96,71 @@ pub enum Error {
     Boot(String),
     #[error("disk {path}: {source}")]
     Disk { path: PathBuf, source: io::Error },
+    #[error("firmware variable store {path}: {source}")]
+    FirmwareVars { path: PathBuf, source: io::Error },
+    #[error("firmware flash: {0}")]
+    Flash(io::Error),
+    #[error("display memory: {0}")]
+    Display(io::Error),
     #[error("can't start a thread: {0}")]
     Thread(io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// How a disk is attached.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DiskInterface {
+    /// Its own virtio-blk device (slots 5 and up). Linux has the driver built in;
+    /// Windows needs one installed.
+    #[default]
+    Virtio,
+    /// A namespace of the machine's NVMe controller (slot 2). Every OS and the firmware
+    /// have the driver.
+    Nvme,
+    /// An ATA disk on a port of the AHCI controller (00:1f.2).
+    Sata,
+    /// A DVD-ROM drive on a port of the AHCI controller, with this image (ISO 9660 or
+    /// UDF, 2048-byte sectors) as its disc. Always read-only.
+    Cdrom,
+}
+
 pub struct DiskConfig {
     /// A raw disk image.
     pub path: PathBuf,
     pub read_only: bool,
+    pub interface: DiskInterface,
+}
+
+/// UEFI firmware to boot (OVMF built for the Q35 platform).
+pub struct FirmwareConfig {
+    /// The firmware code volume (`OVMF_CODE.fd`).
+    pub code: Vec<u8>,
+    /// The variable store: this VM's copy of `OVMF_VARS.fd`. It's opened read-write,
+    /// and the guest's variable writes go straight back to it.
+    pub vars: PathBuf,
+    /// Where the firmware's debug log (port 0x402) goes. Without it the firmware sees
+    /// no debug port and stays quiet.
+    pub debug_log: Option<Box<dyn Write + Send>>,
+    /// The SMBIOS system UUID, in RFC 4122 byte order. It should stay the same for the
+    /// life of the VM.
+    pub uuid: [u8; 16],
+}
+
+/// Which network adapter the guest sees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NicModel {
+    /// virtio-net (slots after the virtio disks). Linux has the driver built in.
+    Virtio,
+    /// An Intel 82574L (slot 3). Windows and Linux have drivers for it.
+    E1000e,
+}
+
+/// A network adapter, connected to its own user-mode NAT (10.0.2.0/24).
+#[derive(Clone, Debug)]
+pub struct NicConfig {
+    pub model: NicModel,
+    pub mac: [u8; 6],
 }
 
 pub struct MachineConfig {
@@ -84,8 +169,11 @@ pub struct MachineConfig {
     pub memory: u64,
     /// Disks, attached as virtio-blk devices in order.
     pub disks: Vec<DiskConfig>,
+    pub nics: Vec<NicConfig>,
     /// Where the guest's serial console output goes.
     pub serial_output: Box<dyn Write + Send>,
+    /// Boot this firmware. Without it, load a kernel with [`Machine::load_linux`].
+    pub firmware: Option<FirmwareConfig>,
 }
 
 /// How a run ended.
@@ -130,9 +218,12 @@ pub struct Machine<P: Partition> {
     vm: Vm<P>,
     layout: MemoryLayout,
     cpus: u8,
-    rsdp: u64,
+    /// Where the ACPI tables were placed for direct boot; `None` with firmware, which
+    /// installs them itself.
+    rsdp: Option<u64>,
     serial: Arc<Mutex<Serial>>,
     acpi_pm: Arc<Mutex<AcpiPm>>,
+    display: Display,
     boot: Option<BootEntry>,
     /// What went wrong, if a vCPU stopped the machine with an error.
     error: Arc<Mutex<Option<String>>>,
@@ -142,8 +233,8 @@ fn shared<T: BusDevice + 'static>(device: T) -> Arc<Mutex<T>> {
     Arc::new(Mutex::new(device))
 }
 
-impl<P: Partition> Machine<P> {
-    pub fn new<H>(hypervisor: &H, config: MachineConfig) -> Result<Self>
+impl<P: Partition + 'static> Machine<P> {
+    pub fn new<H>(hypervisor: &H, mut config: MachineConfig) -> Result<Self>
     where
         H: Hypervisor<Partition = P>,
     {
@@ -156,7 +247,13 @@ impl<P: Partition> Machine<P> {
                 MIN_MEMORY / MIB
             )));
         }
-        let layout = MemoryLayout::new(config.memory);
+        let firmware = config.firmware.take();
+        let direct_boot = firmware.is_none();
+        let layout = if direct_boot {
+            MemoryLayout::new(config.memory)
+        } else {
+            MemoryLayout::firmware(config.memory)
+        };
         let mut vm = Vm::new(
             hypervisor,
             &PartitionConfig {
@@ -207,14 +304,11 @@ impl<P: Partition> Machine<P> {
             shared(Pic8259::default()),
         )?;
         pio.insert(ELCR_BASE.into(), ELCR_PORTS.into(), shared(Elcr::default()))?;
-        pio.insert(
-            RTC_BASE.into(),
-            RTC_PORTS.into(),
-            shared(Rtc::new(clock.clone())),
-        )?;
+        let rtc = shared(Rtc::new(clock.clone()));
+        pio.insert(RTC_BASE.into(), RTC_PORTS.into(), rtc.clone())?;
 
+        // The ACPI PM block decodes wherever the LPC bridge puts it.
         let acpi_pm = shared(AcpiPm::new(clock, irq(acpi::SCI_IRQ), power.clone()));
-        pio.insert(PM_BASE.into(), PM_PORTS.into(), acpi_pm.clone())?;
 
         let i8042 = shared(I8042::new(irq(KEYBOARD_IRQ), power.clone()));
         pio.insert(I8042_DATA.into(), 1, i8042.clone())?;
@@ -225,57 +319,206 @@ impl<P: Partition> Machine<P> {
         pio.insert(POST_PORT.into(), 1, shared(PostPort::default()))?;
 
         let root = Arc::new(Mutex::new(PciRoot::new(vm.mmio().clone())));
+        let display;
         pio.insert(
             CONFIG_IO_BASE.into(),
             CONFIG_IO_PORTS.into(),
             shared(PciConfigIo::new(root.clone(), power)),
         )?;
-        vm.mmio()
-            .insert(ECAM_BASE, ECAM_SIZE, shared(PciEcam(root.clone())))?;
+        // ECAM starts where firmware would put it; firmware may move it, and the PM
+        // block too.
+        let ecam = shared(PciEcam(Arc::downgrade(&root)));
+        let mch = Arc::new(Mutex::new(Mch::new(vm.mmio(), ecam, Some(ECAM_BASE))));
+        let lpc = Arc::new(Mutex::new(Ich9Lpc::new(
+            &pio,
+            acpi_pm.clone(),
+            PM_PORTS,
+            direct_boot.then_some(PM_BASE),
+        )));
         {
             let mut root = root.lock().unwrap();
-            root.add_device(HOST_BRIDGE_SLOT, Arc::new(Mutex::new(HostBridge::new())));
-            let mut mmio32 = Mmio32Allocator::default();
-            for (index, disk) in config.disks.iter().enumerate() {
+            root.add_device(MCH_SLOT, mch.clone());
+            root.add_function(LPC_SLOT, LPC_FUNCTION, lpc.clone());
+            let mut mmio32 = Mmio32Allocator::new(mmio32_window(layout.low_ram_end, ECAM_BASE));
+            let mut allocate = |size| {
+                mmio32
+                    .allocate(size)
+                    .ok_or_else(|| Error::Config("out of PCI address space".into()))
+            };
+
+            let mut adapter = BochsDisplay::new(vm.ram_mapper()).map_err(Error::Display)?;
+            display = adapter.display();
+            if direct_boot {
+                for (bar, size) in [(FRAMEBUFFER_BAR, FRAMEBUFFER_SIZE), (MMIO_BAR, MMIO_SIZE)] {
+                    let address = allocate(size)?;
+                    adapter.config_mut().set_bar_address(bar.into(), address);
+                }
+            }
+            root.add_device(DISPLAY_SLOT, Arc::new(Mutex::new(adapter)));
+
+            let mut namespaces = Vec::new();
+            let mut virtio_disks = Vec::new();
+            let mut sata_drives = Vec::new();
+            for disk in &config.disks {
+                let read_only = disk.read_only || disk.interface == DiskInterface::Cdrom;
                 let backend =
-                    RawFile::open(&disk.path, disk.read_only).map_err(|source| Error::Disk {
+                    RawFile::open(&disk.path, read_only).map_err(|source| Error::Disk {
                         path: disk.path.clone(),
                         source,
                     })?;
+                let id = disk_id(&disk.path);
+                let serial: String = id[..6].iter().map(|b| format!("{b:02X}")).collect();
+                match disk.interface {
+                    DiskInterface::Nvme => namespaces.push(Namespace {
+                        backend: Arc::new(backend),
+                        nguid: id,
+                    }),
+                    DiskInterface::Virtio => virtio_disks.push(backend),
+                    DiskInterface::Sata => sata_drives.push(Drive::Disk(AtaDisk {
+                        backend: Arc::new(backend),
+                        serial: format!("VMMC{serial}"),
+                    })),
+                    DiskInterface::Cdrom => sata_drives.push(Drive::Cdrom(Cdrom::new(
+                        Some(Arc::new(backend)),
+                        &format!("VMMC{serial}"),
+                    ))),
+                }
+            }
+            if sata_drives.len() > AHCI_PORTS {
+                return Err(Error::Config(format!(
+                    "at most {AHCI_PORTS} SATA disks and CD-ROMs"
+                )));
+            }
+            // The ICH9 AHCI controller is always there, as on a real Q35 board.
+            let intx = irq(acpi::intx_gsi(AHCI_SLOT, 0) as u8);
+            let mut ahci = Ahci::new(sata_drives, vm.memory().clone(), sink.clone(), Some(intx))
+                .map_err(Error::Thread)?;
+            if direct_boot {
+                ahci.config_mut()
+                    .set_bar_address(ABAR.into(), allocate(ABAR_SIZE)?);
+            }
+            root.add_function(AHCI_SLOT, AHCI_FUNCTION, Arc::new(Mutex::new(ahci)));
+            if let Some(first) = config
+                .disks
+                .iter()
+                .find(|d| d.interface == DiskInterface::Nvme)
+            {
+                let id = disk_id(&first.path);
+                let serial: String = id[..8].iter().map(|b| format!("{b:02X}")).collect();
+                let mut nvme = Nvme::new(
+                    namespaces,
+                    &format!("VMMC{serial}"),
+                    vm.memory().clone(),
+                    sink.clone(),
+                );
+                if direct_boot {
+                    nvme.config_mut()
+                        .set_bar_address(NVME_BAR.into(), allocate(NVME_BAR_SIZE)?);
+                }
+                root.add_device(NVME_SLOT, Arc::new(Mutex::new(nvme)));
+            }
+            let mut next_virtio_slot = FIRST_VIRTIO_SLOT;
+            for (index, backend) in virtio_disks.into_iter().enumerate() {
                 let blk = VirtioBlk::new(Arc::new(backend), &format!("vmmc-disk{index}"));
                 let mut pci = VirtioPci::new(Box::new(blk), vm.memory().clone(), sink.clone());
-                for (bar, size) in [(CONFIG_BAR, CONFIG_BAR_SIZE), (MSIX_BAR, MSIX_BAR_SIZE)] {
-                    let address = mmio32
-                        .allocate(size)
-                        .ok_or_else(|| Error::Config("out of PCI address space".into()))?;
-                    pci.config_mut().set_bar_address(bar.into(), address);
+                // Firmware assigns BARs itself; for direct boot, we do it the same way.
+                if direct_boot {
+                    for (bar, size) in [(CONFIG_BAR, CONFIG_BAR_SIZE), (MSIX_BAR, MSIX_BAR_SIZE)] {
+                        pci.config_mut()
+                            .set_bar_address(bar.into(), allocate(size)?);
+                    }
                 }
-                let slot = FIRST_DISK_SLOT + index as u8;
+                let slot = FIRST_VIRTIO_SLOT + index as u8;
                 let device: SharedPciDevice = Arc::new(Mutex::new(pci));
                 root.add_device(slot, device);
+                next_virtio_slot = slot + 1;
+            }
+            let mut e1000e_added = false;
+            for nic in &config.nics {
+                match nic.model {
+                    NicModel::Virtio => {
+                        let mut device = VirtioNet::new(nic.mac);
+                        let receiver = device.receiver();
+                        let nat = Nat::start(
+                            NatConfig::default(),
+                            Arc::new(move |frame: &[u8]| receiver.deliver(frame)),
+                        )
+                        .map_err(Error::Thread)?;
+                        device.set_backend(Arc::new(nat));
+                        let mut pci =
+                            VirtioPci::new(Box::new(device), vm.memory().clone(), sink.clone());
+                        if direct_boot {
+                            for (bar, size) in
+                                [(CONFIG_BAR, CONFIG_BAR_SIZE), (MSIX_BAR, MSIX_BAR_SIZE)]
+                            {
+                                pci.config_mut()
+                                    .set_bar_address(bar.into(), allocate(size)?);
+                            }
+                        }
+                        if next_virtio_slot >= LPC_SLOT {
+                            return Err(Error::Config("too many virtio devices".into()));
+                        }
+                        root.add_device(next_virtio_slot, Arc::new(Mutex::new(pci)));
+                        next_virtio_slot += 1;
+                    }
+                    NicModel::E1000e => {
+                        if e1000e_added {
+                            return Err(Error::Config("one e1000e adapter at most".into()));
+                        }
+                        e1000e_added = true;
+                        let intx = irq(acpi::intx_gsi(E1000E_SLOT, 0) as u8);
+                        let mut device =
+                            E1000e::new(nic.mac, vm.memory().clone(), sink.clone(), Some(intx));
+                        let receiver = device.receiver();
+                        let nat = Nat::start(
+                            NatConfig::default(),
+                            Arc::new(move |frame: &[u8]| receiver.deliver(frame)),
+                        )
+                        .map_err(Error::Thread)?;
+                        device.set_backend(Arc::new(nat));
+                        if direct_boot {
+                            device
+                                .config_mut()
+                                .set_bar_address(E1000E_BAR.into(), allocate(E1000E_BAR_SIZE)?);
+                        }
+                        root.add_device(E1000E_SLOT, Arc::new(Mutex::new(device)));
+                    }
+                }
             }
         }
 
-        let tables = acpi::build(
-            &acpi::AcpiConfig {
-                cpus: config.cpus,
-                mmio64: layout.mmio64,
-            },
-            BIOS_AREA_START,
-        );
-        if BIOS_AREA_START + tables.bytes.len() as u64 > HIGH_MEMORY_START {
-            return Err(Error::Config("ACPI tables don't fit the BIOS area".into()));
-        }
-        vm.memory()
-            .write_slice(&tables.bytes, GuestAddress(BIOS_AREA_START))?;
+        let platform = Arc::new(PlatformState {
+            cpus: config.cpus,
+            low_ram_end: layout.low_ram_end,
+            mmio64: layout.mmio64,
+            root,
+            mch,
+            lpc,
+        });
+        let rsdp = match firmware {
+            None => {
+                let tables = acpi::build(&platform.acpi_config()).place(BIOS_AREA_START);
+                if BIOS_AREA_START + tables.bytes.len() as u64 > HIGH_MEMORY_START {
+                    return Err(Error::Config("ACPI tables don't fit the BIOS area".into()));
+                }
+                vm.memory()
+                    .write_slice(&tables.bytes, GuestAddress(BIOS_AREA_START))?;
+                Some(tables.rsdp)
+            }
+            Some(firmware) => {
+                add_firmware(&vm, &layout, &rtc, &platform, firmware)?;
+                None
+            }
+        };
 
         Ok(Self {
             vm,
             layout,
             cpus: config.cpus,
-            rsdp: tables.rsdp,
+            rsdp,
             serial,
             acpi_pm,
+            display,
             boot: None,
             error: Arc::default(),
         })
@@ -288,13 +531,16 @@ impl<P: Partition> Machine<P> {
         initrd: Option<&[u8]>,
         cmdline: &str,
     ) -> Result<()> {
+        let rsdp = self
+            .rsdp
+            .ok_or_else(|| Error::Boot("this machine boots firmware, not a kernel".into()))?;
         self.boot = Some(boot::load_linux(
             self.vm.memory(),
             &self.layout,
             kernel,
             initrd,
             cmdline,
-            self.rsdp,
+            rsdp,
         )?);
         Ok(())
     }
@@ -312,6 +558,11 @@ impl<P: Partition> Machine<P> {
     }
 
     /// A handle that presses the guest's ACPI power button from any thread.
+    /// A handle that reads what the display adapter shows, from any thread.
+    pub fn display(&self) -> Display {
+        self.display.clone()
+    }
+
     pub fn power_button(&self) -> PowerButton {
         PowerButton(self.acpi_pm.clone())
     }
@@ -323,12 +574,12 @@ impl<P: Partition> Machine<P> {
         for index in 0..u32::from(self.cpus) {
             let mut vcpu = self.vm.create_vcpu(index)?;
             if index == 0 {
-                if let Some(entry) = &self.boot {
-                    let reset = vcpu.sregs()?;
-                    let (regs, sregs) = boot::boot_cpu_registers(entry, &reset);
-                    vcpu.set_sregs(&sregs)?;
-                    vcpu.set_regs(&regs)?;
-                }
+                let (regs, sregs) = match &self.boot {
+                    Some(entry) => boot::boot_cpu_registers(entry, &vcpu.sregs()?),
+                    None => boot::reset_registers(),
+                };
+                vcpu.set_sregs(&sregs)?;
+                vcpu.set_regs(&regs)?;
             } else {
                 vcpu.set_waiting_for_sipi()?;
             }
@@ -385,6 +636,197 @@ impl<P: Partition> Machine<P> {
     }
 }
 
+/// The parts of the platform the ACPI tables describe that the guest can change.
+struct PlatformState {
+    cpus: u8,
+    low_ram_end: u64,
+    /// The default 64-bit PCI window.
+    mmio64: (u64, u64),
+    root: Arc<Mutex<PciRoot>>,
+    mch: Arc<Mutex<Mch>>,
+    lpc: Arc<Mutex<Ich9Lpc>>,
+}
+
+impl PlatformState {
+    /// The ACPI description of the platform as it is now. Firmware moves the ECAM
+    /// window and the PM block, and assigns BARs, before it reads the tables.
+    fn acpi_config(&self) -> acpi::AcpiConfig {
+        let ecam = lock(&self.mch)
+            .ecam_window()
+            .unwrap_or((ECAM_BASE, ECAM_SIZE));
+        let pm_base = lock(&self.lpc).pm_base().unwrap_or(PM_BASE);
+        // The 32-bit window runs from the end of low RAM (or 2 GiB) up to the ECAM
+        // window, as OVMF's does; the 64-bit one covers the default range. Each also
+        // stretches over any BAR the firmware put outside it (in whole MiB or GiB).
+        let mut mmio32 = mmio32_window(self.low_ram_end, ecam.0.min(RAM_ABOVE_4G_START));
+        let (mut start, mut end) = self.mmio64;
+        for (address, size) in lock(&self.root).assigned_bar_ranges() {
+            if address >= RAM_ABOVE_4G_START {
+                start = start.min(address - address % GIB);
+                end = end.max((address + size).next_multiple_of(GIB));
+            } else if address >= self.low_ram_end && address + size <= ecam.0 {
+                mmio32.0 = mmio32.0.min(address - address % MIB);
+                mmio32.1 = mmio32.1.max((address + size).next_multiple_of(MIB));
+            }
+        }
+        acpi::AcpiConfig {
+            cpus: self.cpus,
+            mmio32,
+            mmio64: (start, end),
+            ecam,
+            pm_base,
+        }
+    }
+}
+
+/// A stable 16-byte ID for the disk image at `path` (FNV-1a over the path, twice), used
+/// for the NVMe NGUID and serial number. It stays the same as long as the path does.
+fn disk_id(path: &std::path::Path) -> [u8; 16] {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let bytes = path.to_string_lossy().into_owned().into_bytes();
+    let fnv = |seed: u64| {
+        bytes.iter().fold(seed, |hash, &byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    };
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(&fnv(0xcbf2_9ce4_8422_2325).to_be_bytes());
+    id[8..].copy_from_slice(&fnv(0x6c62_272e_07bb_0142).to_be_bytes());
+    id
+}
+
+fn lock<T: ?Sized>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Adds what UEFI firmware needs: its flash, fw_cfg (memory map, CPU count, ACPI and
+/// SMBIOS tables), the CMOS memory size bytes and, optionally, the debug port.
+fn add_firmware<P: Partition + 'static>(
+    vm: &Vm<P>,
+    layout: &MemoryLayout,
+    rtc: &Mutex<Rtc>,
+    platform: &Arc<PlatformState>,
+    firmware: FirmwareConfig,
+) -> Result<()> {
+    let vars_error = |source| Error::FirmwareVars {
+        path: firmware.vars.clone(),
+        source,
+    };
+    let mut vars_file = File::options()
+        .read(true)
+        .write(true)
+        .open(&firmware.vars)
+        .map_err(vars_error)?;
+    let mut vars = Vec::new();
+    vars_file.read_to_end(&mut vars).map_err(vars_error)?;
+
+    // Code at the top of 4 GiB, so the reset vector is its last 16 bytes, and the
+    // variable store right below it.
+    for (what, len) in [
+        ("code", firmware.code.len()),
+        ("variable store", vars.len()),
+    ] {
+        if len == 0 || len % 0x1000 != 0 {
+            return Err(Error::Config(format!(
+                "firmware {what} size {len:#x} isn't a whole number of 4 KiB blocks"
+            )));
+        }
+    }
+    let flash_len = (firmware.code.len() + vars.len()) as u64;
+    if flash_len > FLASH_MAX {
+        return Err(Error::Config(format!(
+            "firmware is {flash_len:#x} bytes; at most {FLASH_MAX:#x} fit below 4 GiB"
+        )));
+    }
+    let code_base = RAM_ABOVE_4G_START - firmware.code.len() as u64;
+    let vars_base = code_base - vars.len() as u64;
+    let mapper = vm.ram_mapper();
+    let vars_flash =
+        Pflash::new(vars_base, &vars, mapper.clone(), Some(vars_file)).map_err(Error::Flash)?;
+    vm.mmio()
+        .insert(vars_base, vars.len() as u64, shared(vars_flash))?;
+    let code_flash = Pflash::read_only(code_base, &firmware.code, mapper).map_err(Error::Flash)?;
+    vm.mmio()
+        .insert(code_base, firmware.code.len() as u64, shared(code_flash))?;
+
+    if let Some(log) = firmware.debug_log {
+        vm.pio()
+            .insert(OVMF_DEBUG_PORT.into(), 1, shared(DebugConsole::new(log)))?;
+    }
+
+    // CMOS memory size bytes, the way firmware has always read them.
+    {
+        let below_4g = layout.low_ram_end;
+        let above_4g: u64 = layout
+            .ram
+            .iter()
+            .filter(|&&(address, _)| address >= RAM_ABOVE_4G_START)
+            .map(|&(_, size)| size as u64)
+            .sum();
+        let mut rtc = lock(rtc);
+        let mut set16 = |index: u8, value: u64| {
+            let value = value.min(0xffff) as u16;
+            rtc.set_cmos_byte(index, value as u8);
+            rtc.set_cmos_byte(index + 1, (value >> 8) as u8);
+        };
+        // Base memory in KiB, then extended memory (1 MiB to 64 MiB) in KiB, twice.
+        set16(0x15, 640);
+        set16(0x17, (below_4g - MIB) >> 10);
+        set16(0x30, (below_4g - MIB) >> 10);
+        // RAM between 16 MiB and the low RAM end, in 64 KiB units.
+        set16(0x34, below_4g.saturating_sub(16 * MIB) >> 16);
+        let high = above_4g >> 16;
+        rtc.set_cmos_byte(0x5b, high as u8);
+        rtc.set_cmos_byte(0x5c, (high >> 8) as u8);
+        rtc.set_cmos_byte(0x5d, (high >> 16) as u8);
+        rtc.set_cmos_byte(0x5f, platform.cpus - 1);
+    }
+
+    let mut fw_cfg = FwCfg::new(vm.memory().clone());
+    let total: u64 = layout.ram.iter().map(|&(_, size)| size as u64).sum();
+    fw_cfg.add_item(fw_cfg::RAM_SIZE, total.to_le_bytes().to_vec());
+    let cpus = u16::from(platform.cpus).to_le_bytes().to_vec();
+    fw_cfg.add_item(fw_cfg::NB_CPUS, cpus.clone());
+    fw_cfg.add_item(fw_cfg::MAX_CPUS, cpus);
+    fw_cfg.add_file("etc/e820", layout.e820_bytes());
+
+    // ACPI: generated when firmware reads it, which is after it has assigned BARs.
+    for (name, part) in [
+        (acpi::RSDP_FILE, 0),
+        (acpi::TABLES_FILE, 1),
+        (acpi::LOADER_FILE, 2),
+    ] {
+        let platform = platform.clone();
+        fw_cfg.add_generated_file(
+            name,
+            Arc::new(move || {
+                let files = acpi::build(&platform.acpi_config()).loader();
+                match part {
+                    0 => files.rsdp,
+                    1 => files.tables,
+                    _ => files.script,
+                }
+            }),
+        );
+    }
+
+    let smbios = smbios::build(&smbios::SmbiosConfig {
+        uuid: firmware.uuid,
+        cpus: platform.cpus,
+        ram: layout
+            .ram
+            .iter()
+            .map(|&(address, size)| (address, size as u64))
+            .collect(),
+    });
+    fw_cfg.add_file(smbios::ANCHOR_FILE, smbios.anchor);
+    fw_cfg.add_file(smbios::TABLES_FILE, smbios.tables);
+
+    vm.pio()
+        .insert(FW_CFG_BASE.into(), FW_CFG_PORTS.into(), shared(fw_cfg))?;
+    Ok(())
+}
+
 fn record_error(slot: &Mutex<Option<String>>, message: String) {
     tracing::error!("{message}");
     slot.lock()
@@ -400,7 +842,22 @@ fn run_vcpu<P: Partition>(
 ) {
     let index = vcpu.index();
     match vcpu.run() {
-        Ok(VmExit::Stopped(_)) => {}
+        Ok(VmExit::Stopped(_)) => {
+            // Where the guest was, for debugging hangs.
+            if tracing::enabled!(tracing::Level::DEBUG)
+                && let (Ok(regs), Ok(sregs)) = (vcpu.regs(), vcpu.sregs())
+            {
+                tracing::debug!(
+                    index,
+                    rip = format_args!("{:#x}", regs.rip),
+                    rflags = format_args!("{:#x}", regs.rflags),
+                    cs = format_args!("{:#x}/{:#x}", sregs.cs.selector, sregs.cs.base),
+                    cr0 = format_args!("{:#x}", sregs.cr0),
+                    efer = format_args!("{:#x}", sregs.efer),
+                    "vCPU stopped"
+                );
+            }
+        }
         Ok(VmExit::Halt) => {
             // Halted with interrupts off: only INIT or NMI could wake it, and nothing
             // sends those. Wait for the rest of the machine to stop.

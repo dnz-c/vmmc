@@ -35,6 +35,10 @@ jobs:
     # labelled `whp`. Turn on by setting the repository variable WHP_RUNNER to `true`.
     if: vars.WHP_RUNNER == 'true'
     runs-on: [self-hosted, windows, whp]
+    env:
+      # `cargo xtask fetch-native` downloads OVMF from this repo's releases.
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
+      # Direct and UEFI Linux boots, and the firmware shell test.
       - run: cargo xtask boot-test

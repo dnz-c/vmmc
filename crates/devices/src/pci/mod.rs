@@ -1,7 +1,7 @@
 //! PCI: configuration space, the root complex on bus 0, and MSI-X.
 
 pub mod config;
-pub mod host_bridge;
+pub mod msi;
 pub mod msix;
 pub mod root;
 

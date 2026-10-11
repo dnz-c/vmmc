@@ -1,13 +1,18 @@
 //! The host terminal as the guest's serial console.
 //!
 //! Input goes to the guest byte for byte. Ctrl-A starts an escape: Ctrl-A x quits,
-//! Ctrl-A p presses the ACPI power button, Ctrl-A Ctrl-A sends a literal Ctrl-A.
+//! Ctrl-A p presses the ACPI power button, Ctrl-A s saves a screenshot (with
+//! `--screenshot`), Ctrl-A Ctrl-A sends a literal Ctrl-A.
 
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
-use machine::{PowerButton, SerialInput};
+use machine::{Display, PowerButton, SerialInput};
+
+use crate::screenshot::Screenshots;
 use vm_core::{StopHandle, StopReason};
 
 const CTRL_A: u8 = 0x01;
@@ -21,6 +26,7 @@ pub enum Input {
     /// Bytes for the guest's serial port.
     Guest(Vec<u8>),
     PowerButton,
+    Screenshot,
     Quit,
 }
 
@@ -51,6 +57,10 @@ impl EscapeFilter {
                         flush(&mut bytes, &mut out);
                         out.push(Input::PowerButton);
                     }
+                    b's' | b'S' => {
+                        flush(&mut bytes, &mut out);
+                        out.push(Input::Screenshot);
+                    }
                     CTRL_A => bytes.push(CTRL_A),
                     // Unknown escapes are swallowed, like QEMU's.
                     _ => {}
@@ -66,9 +76,59 @@ impl EscapeFilter {
     }
 }
 
-/// Forwards stdin to the guest on a background thread until the user quits or stdin
-/// closes. The thread is never joined: a blocked console read can't be interrupted.
-pub fn spawn_input(serial: SerialInput, power: PowerButton, stop: StopHandle) -> io::Result<()> {
+/// The input handles of the machine that's running now.
+#[derive(Clone)]
+pub struct Target {
+    pub serial: SerialInput,
+    pub power: PowerButton,
+    pub stop: StopHandle,
+    pub display: Display,
+}
+
+/// Where console input goes. A guest reset rebuilds the machine, so the target changes
+/// over the life of the process.
+#[derive(Clone, Default)]
+pub struct Targets {
+    current: Arc<Mutex<Option<Target>>>,
+    quit: Arc<AtomicBool>,
+    screenshots: Option<Arc<Screenshots>>,
+}
+
+impl Targets {
+    /// Targets that save Ctrl-A s screenshots with `screenshots`, if given.
+    pub fn new(screenshots: Option<Arc<Screenshots>>) -> Self {
+        Self {
+            screenshots,
+            ..Self::default()
+        }
+    }
+
+    /// The display of the machine running now.
+    pub fn display(&self) -> Option<Display> {
+        self.get().map(|target| target.display)
+    }
+
+    pub fn set(&self, target: Option<Target>) {
+        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = target;
+    }
+
+    pub fn get(&self) -> Option<Target> {
+        self.current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Whether the user asked to quit, so the VM must not be restarted.
+    pub fn quitting(&self) -> bool {
+        self.quit.load(Ordering::Relaxed)
+    }
+}
+
+/// Forwards stdin to the current machine on a background thread until the user quits
+/// or stdin closes. The thread is never joined: a blocked console read can't be
+/// interrupted.
+pub fn spawn_input(targets: Targets) -> io::Result<()> {
     thread::Builder::new()
         .name("console-input".into())
         .spawn(move || {
@@ -82,22 +142,30 @@ pub fn spawn_input(serial: SerialInput, power: PowerButton, stop: StopHandle) ->
                 };
                 for input in filter.filter(&buffer[..read]) {
                     match input {
-                        Input::Guest(mut pending) => {
-                            while !pending.is_empty() {
-                                let sent = serial.send(&pending);
-                                pending.drain(..sent);
-                                if sent == 0 {
-                                    // The guest hasn't drained the UART's FIFO yet.
-                                    thread::sleep(Duration::from_millis(1));
-                                }
-                                if stop.reason().is_some() {
-                                    return;
+                        Input::Guest(pending) => send(&targets, pending),
+                        Input::Screenshot => {
+                            if let (Some(screenshots), Some(display)) =
+                                (&targets.screenshots, targets.display())
+                            {
+                                match screenshots.save(&display, "screenshot", true) {
+                                    Ok(Some(path)) => {
+                                        eprint!("\r\nvmmc-vmx: saved {}\r\n", path.display());
+                                    }
+                                    Ok(None) => eprint!("\r\nvmmc-vmx: no picture to save\r\n"),
+                                    Err(e) => eprint!("\r\nvmmc-vmx: screenshot failed: {e}\r\n"),
                                 }
                             }
                         }
-                        Input::PowerButton => power.press(),
+                        Input::PowerButton => {
+                            if let Some(target) = targets.get() {
+                                target.power.press();
+                            }
+                        }
                         Input::Quit => {
-                            stop.request_stop(StopReason::Requested(QUIT_CODE));
+                            targets.quit.store(true, Ordering::Relaxed);
+                            if let Some(target) = targets.get() {
+                                target.stop.request_stop(StopReason::Requested(QUIT_CODE));
+                            }
                             return;
                         }
                     }
@@ -105,6 +173,23 @@ pub fn spawn_input(serial: SerialInput, power: PowerButton, stop: StopHandle) ->
             }
         })?;
     Ok(())
+}
+
+/// Feeds `pending` to the guest's UART as fast as it drains. Input typed while the
+/// machine is stopping or restarting is dropped.
+fn send(targets: &Targets, mut pending: Vec<u8>) {
+    let Some(target) = targets.get() else { return };
+    while !pending.is_empty() {
+        let sent = target.serial.send(&pending);
+        pending.drain(..sent);
+        if sent == 0 {
+            // The guest hasn't drained the UART's FIFO yet.
+            thread::sleep(Duration::from_millis(1));
+        }
+        if target.stop.reason().is_some() {
+            return;
+        }
+    }
 }
 
 /// Guest console output, written straight through to stdout.

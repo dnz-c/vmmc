@@ -1,0 +1,20 @@
+[package]
+name = "disk"
+description = "Disk images for vmmc's block devices"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_System_IO", "Win32_System_Ioctl"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

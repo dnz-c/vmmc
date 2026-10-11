@@ -171,17 +171,116 @@ Scope moved out of Phase 1:
 - **ACPI PM1 enable register:** it now keeps the Global Lock and RTC enable bits. ACPI checks they stick and had disabled the Global Lock otherwise.
 - **FADT:** `X_FIRMWARE_CTRL` is now 0, as the spec requires when `FIRMWARE_CTRL` is set.
 
-**Known guest-log noise to address with firmware boot in Phase 2:** no DMI/SMBIOS, MTRRs not set up, no `_OSC` on the PCI root, and no PS/2 mouse.
+**Known guest-log noise to address with firmware boot in Phase 2:** no DMI/SMBIOS, MTRRs not set up, no `_OSC` on the PCI root, and no PS/2 mouse. (`_OSC` is done in M1; SMBIOS and MTRRs come with firmware boot.)
 
-### Phase 2: Installs Windows 11 from ISO (MVP engine, about 3–5 months)
+### Phase 2: Installs Windows 11 from ISO (MVP engine, about 3–5 months): in progress
 
 - **Firmware:** `fw_cfg` + table-loader, ACPI (DSDT/MADT/FADT/MCFG/HPET), and the pinned OVMF build with Secure Boot and MS keys enrolled. UEFI variables persist per VM.
-- **Devices:** AHCI (HDD + ATAPI CD-ROM for ISOs), NVMe, bochs-display (GOP), PS/2, xHCI + USB tablet, e1000e, TPM 2.0 CRB and HDA audio.
-- **Disk and network:** `disk` crate with VMDK + raw and IOCP async I/O; `net-nat` with DHCP and DNS.
+- **Devices:** AHCI (HDD + ATAPI CD-ROM for ISOs), NVMe, bochs-display (GOP), PS/2, xHCI + USB tablet, e1000e and TPM 2.0 CRB. HDA audio moved to Phase 3.
+- **Disk and network:** `disk` crate with raw images and sparse files; `net-nat` with DHCP and DNS. VMDK moved to Phase 3.
 - **Console:** a minimal Slint console window (framebuffer + input) as the dev UI.
 - **Exit criteria:**
   - Windows 11 (current ISO) installs unattended onto NVMe and reaches the desktop with NAT internet. `msinfo32` shows Secure Boot On and TPM 2.0.
   - Ubuntu 26.04 Desktop installs from ISO.
+
+**Milestones done so far (verified on WHP, 2026-10-11):**
+
+- **M0, repo and native dependencies:** the private GitHub repo, and the `native-deps` workflow. It builds OVMF from `edk2-stable202608` (SMM off, TPM 2.0) as three variants: release with Secure Boot (what VMs run), the same as a debug build, and a debug test build without Secure Boot. The test build exists because edk2 leaves the UEFI shell out of Secure Boot builds. Key enrollment uses `virt-fw-vars`: a generated vmmc platform key plus Microsoft's 2011 and 2023 KEK and db certificates. `cargo xtask fetch-native` downloads the release through `gh` and checks pinned SHA-256s. The builds are reproducible: a rebuild gave byte-identical code volumes.
+- **M1, OVMF boots to the UEFI shell:** `cargo xtask firmware-test` passes in about 13 s. It boots to the shell, writes a non-volatile variable, and warm-resets, which rebuilds the machine. The second boot reads the variable back from `nvram.fd`, then `reset -s` powers the VM off through ACPI. The debug log has no ASSERT.
+  - **New devices:**
+    - `fw_cfg` with DMA and a file directory;
+    - the Q35 MCH, where PCIEXBAR moves the ECAM window (OVMF puts it at 0xE0000000);
+    - the ICH9 LPC, where PMBASE and ACPI_CNTL move the ACPI PM block;
+    - CFI pflash for the variable store, mapped as read-only RAM in read-array mode and written through to `nvram.fd`. The code flash is read-only, and OVMF's HSTI check confirms it.
+    - the debug port 0x402.
+  - PCI functions 1 to 7 with the multifunction bit.
+  - **ACPI:** one table model, either placed at a fixed address (direct Linux boot) or handed over as `etc/acpi/*` files with a QEMU-style table-loader script. It is generated when the firmware reads it, so the ECAM, PM-block and PCI windows match what the firmware set up. New content:
+    - processor objects;
+    - `_PRT` routing INTx to GSIs 16 to 23;
+    - an `_OSC` that grants native PCIe control (Linux now takes PCIe hotplug, PME, AER and the capability structure);
+    - S5 as SLP_TYP 0, as on ICH9 and in OVMF's reset library.
+  - **SMBIOS 3.0** types 1, 3, 4, 16, 17, 19, 32 and 127, with a UUID kept per VM. OVMF adds type 0.
+  - **Firmware mode:** the CMOS memory-size bytes and `etc/e820`.
+  - **vmmc-vmx:** `run --firmware --vm-dir` (the VM directory holds `nvram.fd` and `uuid`), `--firmware-log`, and `--no-reboot`. A guest reset now rebuilds the machine and keeps the console attached.
+  - **Bugs found on WHP:**
+    - WHP creates vCPUs with CS base 0 rather than the architectural 0xFFFF0000, so the boot vCPU is now put in the reset state explicitly.
+    - OVMF only treats the flash as writable if "clear status" leaves the status register at 0, as QEMU's does.
+    - The PCI ECAM window held its root strongly, a reference cycle that would have leaked every machine on reset.
+- **M2, NVMe and Linux through UEFI:** `cargo xtask uefi-linux-test` passes.
+  - **The test:** OVMF reads a FAT EFI system partition (built by xtask with `fatfs`) over NVMe. The shell's `startup.nsh` starts the EFI-stub kernel with its initramfs. Linux then:
+    - reports EFI, and the DMI product name from our SMBIOS;
+    - does the disk round trip on the second NVMe namespace;
+    - powers off through S5.
+  - It also checks the firmware-placed resources: ECAM at 0xE0000000, a 32-bit window from 0xF0000000, and the 64-bit BAR high in the dynamic window. All of them show up correctly in the root bridge's `_CRS`.
+  - **The NVMe controller** (`devices::storage::nvme`) is written from the NVMe 1.4 base specification:
+    - admin queue on the vCPU, one worker thread per I/O submission queue;
+    - shared completion queues, each with its own MSI-X vector;
+    - PRP lists, including chained list pages, with loop protection;
+    - Identify (controller, namespace, active list, descriptors);
+    - queue creation and deletion with the spec's error codes;
+    - Features: number of queues, volatile write cache, plus storage for the rest;
+    - log pages: error, SMART and firmware slot;
+    - asynchronous event requests held outstanding, and Abort;
+    - Read, Write (with FUA), Flush, Write Zeroes and Dataset Management;
+    - shutdown notifications flush the disks.
+
+    It passes 11 unit tests and Linux's own driver: 4 I/O queues, two namespaces.
+  - **Disks:** the `disk` crate now holds the block backend that virtio-blk and NVMe share. New raw images are NTFS sparse files. `vmmc-vmx run --disk PATH,nvme` attaches a disk to the NVMe controller.
+  - **Test guest:** this Ubuntu kernel builds NVMe as a module. xtask takes it (and its four dependencies, in `modules.dep` order) from the same release's initrd, which is SHA-256 pinned and decompressed with `ruzstd`. The init script loads them with `insmod`.
+  - **Known:** we borrow QEMU's NVMe PCI IDs (1b36:0010). Linux then applies its QEMU quirk and ignores our namespace GUIDs. That's harmless, but vmmc needs a PCI vendor ID of its own before release.
+- **M3, AHCI, ATAPI and booting from an ISO:** `cargo xtask uefi-cd-test` passes.
+  - **The test:** xtask writes an ISO (ISO 9660 with Joliet names and an El Torito EFI entry) holding a FAT boot image with the kernel, initramfs and `startup.nsh`. OVMF boots it from the AHCI DVD drive. Linux's `ahci` driver finds the DVD drive and a SATA disk. It mounts the disc as ISO 9660 and reads a file back (`cd=ok`), and does the round trip on `sda`.
+  - **AHCI** (`devices::storage::ahci`, ICH9 8086:2922 at 00:1f.2, six ports): written from the AHCI 1.3.1 specification.
+    - command lists and tables, with the PRDT;
+    - one worker thread per port;
+    - received-FIS area with D2H and PIO setup FISes;
+    - TFES halting the port until it's restarted;
+    - COMRESET and HBA reset;
+    - MSI (a new plain MSI capability, `pci::msi`) or INTA through the `_PRT`.
+  - **ATA disk** (`storage::ata`): IDENTIFY, which reports a solid-state disk with TRIM; DMA, PIO and multiple reads and writes, in 28- and 48-bit forms; FLUSH; DATA SET MANAGEMENT (TRIM); and the power commands.
+  - **ATAPI DVD-ROM** (`storage::atapi`): the MMC commands Windows' cdrom.sys and Linux's sr use, with sense data and unit attentions:
+    - INQUIRY, TEST UNIT READY, REQUEST SENSE;
+    - READ CAPACITY, READ(10)/(12);
+    - READ TOC (LBA and MSF, sessions);
+    - GET CONFIGURATION (the CD or DVD profile by disc size);
+    - GET EVENT STATUS NOTIFICATION, MODE SENSE (capabilities page);
+    - disc and track information, and the rest.
+  - **vmmc-vmx:** `--cdrom ISO` and `--disk PATH,sata`.
+  - **Tests:** 30 storage unit tests, and the test initramfs now carries `ahci`, `libahci` and `isofs` (skipping drivers the kernel has built in).
+- **M4, display and screenshots:**
+  - **The adapter:** bochs-display (`devices::display::bochs`, 1234:1111, class "other display"). Its 16 MiB framebuffer BAR is mapped into the guest as RAM, and remapped whenever the BAR moves. The DISPI registers sit at BAR2+0x500, with QEMU's byte-order register at 0x600. OVMF's QemuVideoDxe drives it and sets 1280x800, which becomes the GOP framebuffer Windows' basic display driver uses.
+  - **Screenshots:** `vmmc-vmx run --screenshot DIR` saves PNGs: `exit.png` when the VM stops, one per Ctrl-A s, and one every N seconds with `--screenshot-every N`. The firmware test checks the shell's last screen: 1280x800, with text on it.
+  - **Platform fix:** direct boot now uses OVMF's Q35 layout as well:
+    - ECAM at 0xE0000000;
+    - 32-bit BARs from max(low RAM, 2 GiB) up to the ECAM, with low RAM capped at 0xB0000000.
+
+    Before this, the ACPI 32-bit window started above the ECAM while OVMF put its BARs below it. Both boot paths now report 0x80000000-0xDFFFFFFF, and the window stretches over any BAR the firmware puts elsewhere.
+- **M5, the Windows 11 install test (harness ready; not run yet):** `cargo xtask win11-test` needs `VMMC_WIN11_ISO`.
+  - **Answer disc:** an ISO with `autounattend.xml` (GPT on the NVMe disk, the edition's public generic key, a local administrator, no online-account OOBE, and LabConfig bypasses until M7) and a first-logon PowerShell script. The script reports to COM1: CPUs, Secure Boot, TPM, disk bus, network, and any device without a working driver. Then it shuts down.
+  - **The run:** a 64 GiB sparse disk, a screenshot every 30 s, and a key press for the disc's "Press any key to boot from CD or DVD" prompt.
+- **M6, networking (verified with Linux; Windows waits for M5):**
+  - **NAT** (`crates/net`, on smoltcp, 0BSD):
+    - the guest is 10.0.2.15 behind gateway .2, with DNS at .3;
+    - a DHCP server, and DNS answered with the host's own resolver;
+    - TCP terminated in smoltcp (AnyIP) and proxied to host sockets, with backpressure;
+    - UDP flows through host sockets;
+    - the gateway address reaches the host's loopback.
+
+    10 tests run with a second smoltcp stack as the guest: DHCP, a 300 KB TCP echo, connection refused, DNS, and UDP.
+  - **virtio-net**, with no offloads.
+  - **e1000e (82574L)**, written from the datasheet:
+    - EEPROM with a valid checksum, PHY over MDIC;
+    - legacy and extended receive descriptors;
+    - transmit with context descriptors, checksum insertion and TSO in software;
+    - MSI or INTA, with ICR auto-mask.
+
+    Linux's own `e1000e` driver identifies it ("MAC: 3, PHY: 8"), brings the link up at 1 Gb/s, and passes its MSI self-test.
+  - **vmmc-vmx:** `--nic virtio|e1000e[,mac=...]`. The MAC is kept in the VM directory.
+  - **Tests:** the direct Linux test runs DHCP, HTTP and DNS over virtio-net; the UEFI Linux test runs the same over e1000e.
+  - **Bugs found:**
+    - The NAT treated SYN-RECEIVED as "guest closed" and shut the host side.
+    - The e1000e raised a link change when the driver unmasked it, rather than latching it at link-up. That broke Linux's MSI self-test half the time.
+  - **Host note:** the workspace's A: volume rescans a whole file on its first write after it's opened, at about 1 MB/s. Guest disk writes stalled 30-60 s and looked like lost interrupts. xtask now keeps guest-written images in `%TEMP%mmc-test-images` (or `VMMC_TEST_IMAGES`).
 
 ### Phase 3: Desktop app alpha + VMware migration (about 3–4 months)
 

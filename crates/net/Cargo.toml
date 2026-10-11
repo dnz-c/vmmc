@@ -1,0 +1,18 @@
+[package]
+name = "net"
+description = "Networking for vmmc guests: user-mode NAT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+smoltcp.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+smoltcp = { workspace = true, features = ["proto-dhcpv4", "socket-dhcpv4"] }
+
+[lints]
+workspace = true

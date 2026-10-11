@@ -4,7 +4,7 @@
 //! mapping on the MMIO bus to match.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use vm_core::{Bus, BusDevice};
 
@@ -18,49 +18,96 @@ pub const CONFIG_IO_PORTS: u16 = 8;
 pub const ECAM_SIZE: u64 = 256 << 20;
 pub const NUM_SLOTS: u8 = 32;
 
-struct Slot {
+pub const NUM_FUNCTIONS: u8 = 8;
+/// Header type register; bit 7 marks a multi-function device.
+const HEADER_TYPE: u16 = 0x0e;
+const MULTI_FUNCTION: u8 = 0x80;
+
+struct Function {
     device: SharedPciDevice,
     /// The BAR mappings currently on the MMIO bus.
     mapped: Vec<BarMapping>,
 }
 
 pub struct PciRoot {
-    slots: BTreeMap<u8, Slot>,
+    /// Keyed by (slot, function).
+    functions: BTreeMap<(u8, u8), Function>,
     mmio: Arc<Bus>,
 }
 
 impl PciRoot {
     pub fn new(mmio: Arc<Bus>) -> Self {
         Self {
-            slots: BTreeMap::new(),
+            functions: BTreeMap::new(),
             mmio,
         }
     }
 
-    /// Plugs `device` in as function 0 of `slot` on bus 0, and maps any BARs it already
-    /// has decoding.
+    /// Plugs `device` in as function 0 of `slot` on bus 0.
     pub fn add_device(&mut self, slot: u8, device: SharedPciDevice) {
-        assert!(slot < NUM_SLOTS, "PCI slot {slot}");
-        assert!(!self.slots.contains_key(&slot), "PCI slot {slot} taken");
-        self.slots.insert(
-            slot,
-            Slot {
+        self.add_function(slot, 0, device);
+    }
+
+    /// Plugs `device` in as `function` of `slot` on bus 0, and maps any BARs it already
+    /// has decoding.
+    pub fn add_function(&mut self, slot: u8, function: u8, device: SharedPciDevice) {
+        assert!(
+            slot < NUM_SLOTS && function < NUM_FUNCTIONS,
+            "PCI {slot}.{function}"
+        );
+        let key = (slot, function);
+        assert!(
+            !self.functions.contains_key(&key),
+            "PCI {slot}.{function} taken"
+        );
+        self.functions.insert(
+            key,
+            Function {
                 device,
                 mapped: Vec::new(),
             },
         );
-        self.sync_bars(slot);
+        self.sync_bars(key);
+    }
+
+    /// Every memory range a device's BARs currently claim, decoding or not.
+    pub fn assigned_bar_ranges(&self) -> Vec<(u64, u64)> {
+        self.functions
+            .values()
+            .flat_map(|function| {
+                function
+                    .device
+                    .lock()
+                    .expect("a PCI device panicked")
+                    .config()
+                    .assigned_bars()
+            })
+            .map(|bar| (bar.address, bar.size))
+            .collect()
     }
 
     pub fn config_read(&self, bus: u8, slot: u8, function: u8, offset: u16, data: &mut [u8]) {
-        match self.function(bus, slot, function) {
-            Some(slot) => slot
-                .device
-                .lock()
-                .expect("a PCI device panicked")
-                .config_read(offset, data),
+        let Some(entry) = self.function(bus, slot, function) else {
             // Nothing there: reads float high, which is how guests detect empty slots.
-            None => data.fill(0xff),
+            data.fill(0xff);
+            return;
+        };
+        entry
+            .device
+            .lock()
+            .expect("a PCI device panicked")
+            .config_read(offset, data);
+        // Function 0 of a slot with more functions advertises them in its header type.
+        let header = usize::from(HEADER_TYPE.wrapping_sub(offset));
+        if function == 0
+            && (offset..offset + data.len() as u16).contains(&HEADER_TYPE)
+            && self
+                .functions
+                .range((slot, 1)..=(slot, NUM_FUNCTIONS - 1))
+                .next()
+                .is_some()
+        {
+            data[header] |= MULTI_FUNCTION;
         }
     }
 
@@ -73,19 +120,20 @@ impl PciRoot {
             .lock()
             .expect("a PCI device panicked")
             .config_write(offset, data);
-        self.sync_bars(slot);
+        self.sync_bars((slot, function));
     }
 
-    fn function(&self, bus: u8, slot: u8, function: u8) -> Option<&Slot> {
-        if bus != 0 || function != 0 {
+    fn function(&self, bus: u8, slot: u8, function: u8) -> Option<&Function> {
+        if bus != 0 {
             return None;
         }
-        self.slots.get(&slot)
+        self.functions.get(&(slot, function))
     }
 
-    /// Makes the MMIO bus match the BARs the device in `slot` is decoding.
-    fn sync_bars(&mut self, slot: u8) {
-        let entry = self.slots.get_mut(&slot).expect("slot exists");
+    /// Makes the MMIO bus match the BARs the function at `key` is decoding.
+    fn sync_bars(&mut self, key: (u8, u8)) {
+        let entry = self.functions.get_mut(&key).expect("function exists");
+        let (slot, _) = key;
         let wanted = entry
             .device
             .lock()
@@ -232,7 +280,10 @@ impl BusDevice for PciConfigIo {
 }
 
 /// The PCIe enhanced configuration access mechanism (ECAM) window.
-pub struct PciEcam(pub Arc<Mutex<PciRoot>>);
+///
+/// It holds the root weakly: the root owns the MMIO bus this window sits on, so a
+/// strong reference would keep the whole machine alive forever.
+pub struct PciEcam(pub Weak<Mutex<PciRoot>>);
 
 /// (bus, slot, function, register) for an offset into the ECAM window.
 fn ecam_target(offset: u64) -> (u8, u8, u8, u16) {
@@ -247,18 +298,22 @@ fn ecam_target(offset: u64) -> (u8, u8, u8, u16) {
 impl BusDevice for PciEcam {
     fn read(&mut self, offset: u64, data: &mut [u8]) {
         let (bus, slot, function, register) = ecam_target(offset);
-        self.0
-            .lock()
-            .unwrap()
-            .config_read(bus, slot, function, register, data);
+        match self.0.upgrade() {
+            Some(root) => root
+                .lock()
+                .unwrap()
+                .config_read(bus, slot, function, register, data),
+            None => data.fill(0xff),
+        }
     }
 
     fn write(&mut self, offset: u64, data: &[u8]) {
         let (bus, slot, function, register) = ecam_target(offset);
-        self.0
-            .lock()
-            .unwrap()
-            .config_write(bus, slot, function, register, data);
+        if let Some(root) = self.0.upgrade() {
+            root.lock()
+                .unwrap()
+                .config_write(bus, slot, function, register, data);
+        }
     }
 }
 
@@ -308,6 +363,7 @@ mod tests {
 
     struct Fixture {
         io: PciConfigIo,
+        root: Arc<Mutex<PciRoot>>,
         ecam: PciEcam,
         mmio: Arc<Bus>,
         probe: Arc<Mutex<Probe>>,
@@ -329,7 +385,8 @@ mod tests {
         });
         Fixture {
             io: PciConfigIo::new(root.clone(), power),
-            ecam: PciEcam(root),
+            root: root.clone(),
+            ecam: PciEcam(Arc::downgrade(&root)),
             mmio,
             probe,
             resets,
@@ -365,6 +422,29 @@ mod tests {
         assert_eq!(u32::from_le_bytes(data), 0x5678_1234);
         f.ecam.read((1 << 20) | ecam_offset(3, 0), &mut data);
         assert_eq!(data, [0xff; 4], "nothing behind bus 1");
+    }
+
+    #[test]
+    fn function_zero_advertises_further_functions() {
+        let mut f = fixture();
+        let header = |ecam: &mut PciEcam, function: u64| {
+            let mut data = [0u8; 4];
+            ecam.read(ecam_offset(3, 0x0c) | (function << 12), &mut data);
+            data[2]
+        };
+        assert_eq!(header(&mut f.ecam, 0), 0, "single-function so far");
+
+        f.root
+            .lock()
+            .unwrap()
+            .add_function(3, 2, Arc::new(Mutex::new(Probe::new())));
+        assert_eq!(header(&mut f.ecam, 0), MULTI_FUNCTION);
+        assert_eq!(header(&mut f.ecam, 2), 0, "only function 0 carries the bit");
+        let mut id = [0u8; 2];
+        f.ecam.read(ecam_offset(3, 0) | (2 << 12), &mut id);
+        assert_eq!(u16::from_le_bytes(id), 0x1234);
+        f.ecam.read(ecam_offset(3, 0) | (1 << 12), &mut id);
+        assert_eq!(id, [0xff; 2], "function 1 is empty");
     }
 
     #[test]

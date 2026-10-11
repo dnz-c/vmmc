@@ -1,3 +1,5 @@
 /target
 *.pdb
 /boot-test.log
+# Guest install media (Windows ISOs and the like) never belong in the repo.
+/*.iso

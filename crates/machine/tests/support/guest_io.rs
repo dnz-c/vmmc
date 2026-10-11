@@ -98,9 +98,48 @@ impl Guest<'_> {
         self.inl(0xcfc)
     }
 
-    /// Powers the machine off through ACPI (S5 in PM1a_CNT).
+    /// Powers the machine off through ACPI: SLP_TYP 0 (S5 on ICH9) with SLP_EN, in
+    /// PM1a_CNT at the PM block's usual base.
     pub fn acpi_power_off(&self) {
-        self.outw(0x604, (5 << 10) | (1 << 13));
+        self.outw(0x604, 1 << 13);
+    }
+
+    /// Writes a config dword through ports 0xcf8/0xcfc.
+    pub fn config_write32_io(&self, slot: u8, function: u8, register: u8, value: u32) {
+        self.outl(
+            0xcf8,
+            0x8000_0000
+                | (u32::from(slot) << 11)
+                | (u32::from(function) << 8)
+                | u32::from(register & 0xfc),
+        );
+        self.outl(0xcfc, value);
+    }
+
+    /// Selects fw_cfg item `key` and reads `len` bytes of it through the data port.
+    pub fn fw_cfg_read(&self, key: u16, len: usize) -> Vec<u8> {
+        self.outw(0x510, key);
+        (0..len).map(|_| self.inb(0x511)).collect()
+    }
+
+    /// Finds a fw_cfg file by name: `(selector, size)`.
+    pub fn fw_cfg_file(&self, name: &str) -> Option<(u16, usize)> {
+        let count = u32::from_be_bytes(self.fw_cfg_read(0x19, 4).try_into().unwrap());
+        let directory = self.fw_cfg_read(0x19, 4 + 64 * count as usize);
+        directory[4..].chunks(64).find_map(|entry| {
+            let end = entry[8..].iter().position(|&b| b == 0).unwrap_or(56);
+            (&entry[8..8 + end] == name.as_bytes()).then(|| {
+                (
+                    u16::from_be_bytes([entry[4], entry[5]]),
+                    u32::from_be_bytes(entry[0..4].try_into().unwrap()) as usize,
+                )
+            })
+        })
+    }
+
+    pub fn cmos(&self, index: u8) -> u8 {
+        self.outb(0x70, index);
+        self.inb(0x71)
     }
 
     /// Polls `condition` until it holds or `timeout` passes.

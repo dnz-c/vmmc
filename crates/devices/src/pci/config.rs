@@ -202,6 +202,12 @@ impl ConfigSpace {
         if self.command() & COMMAND_MEMORY == 0 {
             return Vec::new();
         }
+        self.assigned_bars()
+    }
+
+    /// The BARs that have an address assigned (and aren't mid-probe), whether or not
+    /// memory decode is on.
+    pub fn assigned_bars(&self) -> Vec<BarMapping> {
         (0..NUM_BARS)
             .filter_map(|index| {
                 let bar = self.bars[index]?;

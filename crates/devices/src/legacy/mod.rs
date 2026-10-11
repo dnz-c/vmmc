@@ -1,6 +1,7 @@
 //! The legacy PC devices every x86 guest expects.
 
 pub mod acpi_pm;
+pub mod debugcon;
 pub mod i8042;
 pub mod ioapic;
 pub mod pic;

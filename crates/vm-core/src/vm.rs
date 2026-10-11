@@ -1,4 +1,4 @@
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
 use hv::{
@@ -7,6 +7,7 @@ use hv::{
 };
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
 
+use crate::ram::{MapRegions, RamMapper, Shared};
 use crate::{Bus, Result};
 
 /// Why a VM stopped.
@@ -109,9 +110,10 @@ type EoiHandler = Box<dyn Fn(u8) + Send + Sync>;
 
 /// A VM: its RAM, its hypervisor partition and the buses its devices sit on.
 pub struct Vm<P: Partition> {
-    // Field order matters: `partition` is dropped before `memory`. Devices may hold
-    // clones of `memory`, which only keeps the host memory alive longer.
-    partition: P,
+    // Field order matters: `shared` (the partition) is dropped before `memory`. Devices
+    // may hold clones of `memory`, which only keeps the host memory alive longer, and
+    // `RamMapper`s, which hold `shared` only weakly.
+    shared: Arc<Shared<P>>,
     memory: GuestMemoryMmap,
     pio: Arc<Bus>,
     mmio: Arc<Bus>,
@@ -134,9 +136,9 @@ impl<P: Partition> Vm<P> {
         let partition = hypervisor.create_partition(config)?;
         for region in memory.iter() {
             // SAFETY: the region's host memory is reference-counted by `memory`, which
-            // this Vm owns. `partition` is dropped before `memory` (field order above),
-            // and vCPUs borrow the Vm, so the memory outlives the partition and every
-            // vCPU.
+            // this Vm owns. The partition is dropped before `memory` (field order
+            // above), and vCPUs borrow the Vm, so the memory outlives the partition and
+            // every vCPU.
             unsafe {
                 partition.map_memory(
                     region.start_addr().0,
@@ -147,7 +149,7 @@ impl<P: Partition> Vm<P> {
             }
         }
         Ok(Self {
-            partition,
+            shared: Arc::new(Shared::new(partition)),
             memory,
             pio: Arc::default(),
             mmio: Arc::default(),
@@ -173,7 +175,16 @@ impl<P: Partition> Vm<P> {
 
     /// A handle that injects interrupts into the guest from any thread.
     pub fn interrupts(&self) -> P::Interrupts {
-        self.partition.interrupts()
+        self.shared.partition.interrupts()
+    }
+
+    /// A handle devices use to map their own host memory into the guest at runtime.
+    pub fn ram_mapper(&self) -> RamMapper
+    where
+        P: 'static,
+    {
+        let target: Weak<dyn MapRegions> = Arc::downgrade(&self.shared) as Weak<dyn MapRegions>;
+        RamMapper::new(target)
     }
 
     pub fn stop_handle(&self) -> StopHandle {
@@ -187,7 +198,7 @@ impl<P: Partition> Vm<P> {
 
     /// Creates the vCPU with the given index. It borrows the VM, so it can't outlive it.
     pub fn create_vcpu(&self, index: u32) -> Result<VmVcpu<'_, P>> {
-        let vcpu = self.partition.create_vcpu(index)?;
+        let vcpu = self.shared.partition.create_vcpu(index)?;
         let kicker = vcpu.kicker();
         self.stop.add_kicker(Box::new(move || kicker.kick()));
         Ok(VmVcpu { vm: self, vcpu })
@@ -544,6 +555,37 @@ mod tests {
         let (mut vcpu, _) = scripted(&vm, &[Step::Eoi(0x31), Step::Eoi(0x40), Step::Halt]);
         assert_eq!(vcpu.run().unwrap(), VmExit::Halt);
         assert_eq!(*seen.lock().unwrap(), [0x31, 0x40]);
+    }
+
+    #[test]
+    fn ram_mapper_tracks_mappings_and_outliving_the_vm_is_safe() {
+        use crate::{Error, RamRegion};
+        let vm = vm();
+        let mapper = vm.ram_mapper();
+        let flash = RamRegion::new(0x2000).unwrap();
+        mapper
+            .map(0xffc0_0000, flash.clone(), MemoryAccess::READ)
+            .unwrap();
+        assert!(
+            mapper
+                .map(
+                    0xffc0_1000,
+                    RamRegion::new(0x1000).unwrap(),
+                    MemoryAccess::READ
+                )
+                .is_err(),
+            "overlaps"
+        );
+        mapper.unmap(0xffc0_0000).unwrap();
+        mapper
+            .map(0xffc0_0000, flash, MemoryAccess::ALL)
+            .expect("remapping after unmap works");
+
+        drop(vm);
+        assert!(matches!(
+            mapper.map(0x1000, RamRegion::new(0x1000).unwrap(), MemoryAccess::READ),
+            Err(Error::VmGone)
+        ));
     }
 
     #[test]
