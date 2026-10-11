@@ -127,6 +127,25 @@ jobs:
           }
           Set-Content -NoNewline -Path $file -Value $text
 
+      # The OpenSSL glue reads OpenSSL's private bignum_st and refuses versions from 3.1
+      # on as untested. Check the layout in the OpenSSL source vcpkg built, then let it
+      # build against this version (below 3.7).
+      - name: Check OpenSSL's bignum layout
+        run: |
+          $source = Get-ChildItem vcpkg/buildtrees/openssl -Recurse -Filter bn_local.h |
+            Where-Object { $_.FullName -match '[\\/]crypto[\\/]bn[\\/]' } | Select-Object -First 1
+          if (-not $source) { throw 'bn_local.h not found in the OpenSSL build tree' }
+          $text = Get-Content -Raw $source.FullName
+          $struct = [regex]::Match($text, '(?s)struct bignum_st \{(.*?)\};').Groups[1].Value
+          $fields = ($struct -replace '(?s)/\*.*?\*/', '') -replace '\s', ''
+          if ($fields -ne 'BN_ULONG*d;inttop;intdmax;intneg;intflags;') {
+            throw "bignum_st changed: $fields"
+          }
+          $glue = 'ms-tpm-20-ref/TPMCmd/tpm/cryptolibs/Ossl/include/Ossl/BnToOsslMath.h'
+          $header = Get-Content -Raw $glue
+          if ($header -notmatch '0x30100000L') { throw 'version check not found' }
+          Set-Content -NoNewline -Path $glue -Value ($header -replace '0x30100000L', '0x30700000L')
+
       # Ninja with one build type, as the project's own scripts build it (its
       # Visual Studio projects have no Release|x64 configuration).
       - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
