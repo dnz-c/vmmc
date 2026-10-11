@@ -131,10 +131,13 @@ jobs:
       # tpm-state.bin, rather than the reference platform writing ./NVChip.
       - name: Build
         run: |
-          $ossl = Join-Path $PWD 'vcpkg/installed/x64-windows-static-md'
+          # The project looks for OpenSSL's headers in TPMCmd/OsslInclude/x64, as its
+          # scripts/getossl.cmd lays them out.
+          $headers = 'ms-tpm-20-ref/TPMCmd/OsslInclude/x64'
+          New-Item -ItemType Directory -Force $headers | Out-Null
+          Copy-Item -Recurse 'vcpkg/installed/x64-windows-static-md/include/openssl' $headers
           $env:CL = '/DFILE_BACKED_NV=0'
-          cmake -S ms-tpm-20-ref/TPMCmd -B build -G 'Visual Studio 17 2022' -A x64 `
-            "-DOSSL_INCLUDE_SUBDIR=$ossl/include"
+          cmake -S ms-tpm-20-ref/TPMCmd -B build -G 'Visual Studio 17 2022' -A x64
           cmake --build build --config Release --parallel `
             --target Tpm_PlatformLib Tpm_CoreLib Tpm_CryptoLib_Math_Ossl
 
