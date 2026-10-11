@@ -127,6 +127,12 @@ jobs:
           }
           Set-Content -NoNewline -Path $file -Value $text
 
+      # Ninja with one build type, as the project's own scripts build it (its
+      # Visual Studio projects have no Release|x64 configuration).
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+
       # FILE_BACKED_NV=0 keeps the NV image in memory: vmmc saves it to the VM's
       # tpm-state.bin, rather than the reference platform writing ./NVChip.
       - name: Build
@@ -137,8 +143,8 @@ jobs:
           New-Item -ItemType Directory -Force $headers | Out-Null
           Copy-Item -Recurse 'vcpkg/installed/x64-windows-static-md/include/openssl' $headers
           $env:CL = '/DFILE_BACKED_NV=0'
-          cmake -S ms-tpm-20-ref/TPMCmd -B build -G 'Visual Studio 17 2022' -A x64
-          cmake --build build --config Release --parallel `
+          cmake -S ms-tpm-20-ref/TPMCmd -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel `
             --target Tpm_PlatformLib Tpm_CoreLib Tpm_CryptoLib_Math_Ossl
 
       - name: Package
@@ -146,7 +152,6 @@ jobs:
           $ossl = 'vcpkg/installed/x64-windows-static-md'
           New-Item -ItemType Directory dist | Out-Null
           Get-ChildItem build -Recurse -Filter *.lib |
-            Where-Object { $_.FullName -match '\\Release\\' } |
             ForEach-Object { Copy-Item $_.FullName (Join-Path dist ("tpm-" + $_.Name)) }
           Copy-Item "$ossl/lib/libcrypto.lib" dist/tpm-libcrypto.lib
           Copy-Item ms-tpm-20-ref/LICENSE dist/TPM-REF-LICENSE.txt
