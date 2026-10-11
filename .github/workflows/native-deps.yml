@@ -1,0 +1,104 @@
+# Builds the native (C) dependencies vmmc can't build with cargo, and publishes them as a
+# GitHub release that `cargo xtask fetch-native` downloads by pinned SHA-256.
+#
+# Run it from the Actions tab (or `gh workflow run native-deps.yml -f release=native-deps-N`),
+# then pin the new SHA256SUMS in xtask/src/native.rs.
+name: native-deps
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Release tag to create, e.g. native-deps-1
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  EDK2_TAG: edk2-stable202608
+  VIRT_FIRMWARE_VERSION: "26.9"
+
+jobs:
+  ovmf:
+    name: OVMF (Secure Boot, no SMM, TPM 2.0)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential uuid-dev acpica-tools nasm python3 python3-venv
+
+      - name: Fetch edk2 ${{ env.EDK2_TAG }}
+        run: |
+          git clone --depth 1 --branch "$EDK2_TAG" https://github.com/tianocore/edk2.git
+          git -C edk2 submodule update --init --depth 1 --recommend-shallow
+
+      # SMM stays off: WHP can't emulate it. Secure Boot then works, but the variable
+      # store isn't protected from the guest OS kernel. The debug build logs to I/O port
+      # 0x402 (DEBUG_ON_SERIAL_PORT left undefined).
+      - name: Build
+        working-directory: edk2
+        run: |
+          make -C BaseTools -j"$(nproc)"
+          source edksetup.sh
+          flags="-a X64 -t GCC -p OvmfPkg/OvmfPkgX64.dsc -n $(nproc)
+                 -D SECURE_BOOT_ENABLE=TRUE -D SMM_REQUIRE=FALSE -D TPM2_ENABLE=TRUE
+                 -D FD_SIZE_4MB -D NETWORK_HTTP_BOOT_ENABLE=FALSE -D NETWORK_TLS_ENABLE=FALSE"
+          build $flags -b RELEASE
+          build $flags -b DEBUG
+
+      - name: Package and enroll Secure Boot keys
+        run: |
+          python3 -m venv venv
+          venv/bin/pip install "virt-firmware==$VIRT_FIRMWARE_VERSION"
+          release=edk2/Build/OvmfX64/RELEASE_GCC/FV
+          debug=edk2/Build/OvmfX64/DEBUG_GCC/FV
+          mkdir dist
+          cp "$release/OVMF_CODE.fd" dist/OVMF_CODE.fd
+          cp "$debug/OVMF_CODE.fd" dist/OVMF_CODE.debug.fd
+          # Variable store templates: empty (Secure Boot off), and with a generated
+          # vmmc platform key plus Microsoft's 2011 and 2023 KEK and db certificates.
+          cp "$release/OVMF_VARS.fd" dist/OVMF_VARS.fd
+          venv/bin/virt-fw-vars --input "$release/OVMF_VARS.fd" \
+            --output dist/OVMF_VARS.secboot.fd \
+            --enroll-generate "vmmc Platform Key" \
+            --microsoft-kek all --microsoft-db all --secure-boot
+          venv/bin/virt-fw-vars --input dist/OVMF_VARS.secboot.fd --print > dist/OVMF_VARS.secboot.txt
+          cp edk2/License.txt dist/OVMF-LICENSE.txt
+          {
+            echo "edk2 tag: $EDK2_TAG"
+            echo "edk2 commit: $(git -C edk2 rev-parse HEAD)"
+            echo "platform: OvmfPkg/OvmfPkgX64.dsc, toolchain GCC"
+            echo "defines: SECURE_BOOT_ENABLE=TRUE SMM_REQUIRE=FALSE TPM2_ENABLE=TRUE FD_SIZE_4MB"
+            echo "         NETWORK_HTTP_BOOT_ENABLE=FALSE NETWORK_TLS_ENABLE=FALSE"
+            echo "keys: virt-firmware $VIRT_FIRMWARE_VERSION --enroll-generate --microsoft-kek all --microsoft-db all"
+          } > dist/OVMF-BUILD-INFO.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ovmf
+          path: dist/
+
+  publish:
+    name: Publish release
+    needs: [ovmf]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release }}
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "Native dependencies ($TAG)" \
+            --notes "OVMF from $EDK2_TAG (Secure Boot on, SMM off, TPM 2.0). See OVMF-BUILD-INFO.txt." \
+            *
