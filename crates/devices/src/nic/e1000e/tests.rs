@@ -248,6 +248,38 @@ fn tso_splits_into_mss_segments_with_valid_checksums() {
 }
 
 #[test]
+fn ip_checksum_offload_without_the_ipv4_context_bit() {
+    // What Windows' driver sends for a UDP datagram: a context with TUCMD.IP clear
+    // (it only matters for TSO) and a data descriptor asking for the IP checksum.
+    let mut nic = Nic::new();
+    nic.setup_tx();
+    let mut packet = tcp_packet(30);
+    packet[23] = 17; // UDP
+    packet[24..26].copy_from_slice(&[0xde, 0xad]); // stale IP checksum
+    nic.memory
+        .write_slice(&packet, GuestAddress(TX_DATA))
+        .unwrap();
+    let mut context = [0u8; 16];
+    context[0] = 14;
+    context[1] = 24;
+    context[2..4].copy_from_slice(&33u16.to_le_bytes());
+    context[11] = TX_CMD_DEXT; // DTYP 0, TUCMD: UDP, IP bit clear, no TSE
+    nic.put_descriptor(0, context);
+    let mut data = [0u8; 16];
+    data[..8].copy_from_slice(&TX_DATA.to_le_bytes());
+    data[8..12].copy_from_slice(&(packet.len() as u32 | (1 << 20)).to_le_bytes());
+    data[11] = TX_CMD_DEXT | TX_CMD_EOP | (1 << 3);
+    data[13] = TX_POPTS_IXSM;
+    nic.put_descriptor(1, data);
+    nic.write(TDT, 2);
+
+    let sent = nic.sent.0.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(fold(sum16(&sent[0][14..34], 0)), 0xffff, "IP checksum");
+    assert_eq!(sent[0][34..], packet[34..], "UDP untouched");
+}
+
+#[test]
 fn receives_into_legacy_and_extended_descriptors() {
     for extended in [false, true] {
         let mut nic = Nic::new();

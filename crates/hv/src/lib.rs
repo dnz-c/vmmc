@@ -213,6 +213,12 @@ pub trait Vcpu: Send {
 
     /// Returns a handle that can interrupt [`Vcpu::run`] from another thread.
     fn kicker(&self) -> Self::Kicker;
+
+    /// The local APIC's registers as its 4 KiB xAPIC register page, for debugging.
+    /// `None` when the backend can't read them.
+    fn local_apic(&self) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
 }
 
 /// Interrupts a running vCPU from another thread.

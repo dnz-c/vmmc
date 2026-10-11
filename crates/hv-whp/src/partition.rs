@@ -6,13 +6,18 @@ use hv::{LocalApicMode, MemoryAccess, PartitionConfig};
 use windows::Win32::System::Hypervisor::{
     WHV_MAP_GPA_RANGE_FLAGS, WHV_PARTITION_HANDLE, WHV_PARTITION_PROPERTY_CODE,
     WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite,
+    WHvPartitionPropertyCodeCpuidExitList, WHvPartitionPropertyCodeExtendedVmExits,
     WHvPartitionPropertyCodeLocalApicEmulationMode, WHvPartitionPropertyCodeProcessorCount,
     WHvX64LocalApicEmulationModeX2Apic, WHvX64LocalApicEmulationModeXApic,
 };
 
 use crate::api::{Api, check};
+use crate::cpuid;
 use crate::interrupts::WhpInterrupts;
 use crate::vcpu::WhpVcpu;
+
+/// `WHV_EXTENDED_VM_EXITS` with only `X64CpuidExit` (bit 0) set.
+const CPUID_EXIT: u64 = 1;
 
 /// What `WHvMapGpaRange` returns when another partition in this process already has
 /// guest memory mapped: only one may at a time. (The status's own text, about a VID
@@ -26,6 +31,8 @@ const ANOTHER_PARTITION_HAS_MEMORY: windows::core::HRESULT =
 pub(crate) struct PartitionInner {
     pub api: Arc<Api>,
     pub handle: WHV_PARTITION_HANDLE,
+    /// How many vCPUs the partition has.
+    pub vcpus: u32,
 }
 
 impl PartitionInner {
@@ -83,7 +90,11 @@ impl WhpPartition {
             (api.WHvCreatePartition)(&mut handle)
         })?;
         // From here on, dropping `inner` deletes the partition, including on error paths.
-        let inner = Arc::new(PartitionInner { api, handle });
+        let inner = Arc::new(PartitionInner {
+            api,
+            handle,
+            vcpus: config.vcpu_count,
+        });
 
         inner.set_property(WHvPartitionPropertyCodeProcessorCount, &config.vcpu_count)?;
         let apic_mode = match config.local_apic {
@@ -94,6 +105,10 @@ impl WhpPartition {
         if let Some(mode) = apic_mode {
             inner.set_property(WHvPartitionPropertyCodeLocalApicEmulationMode, &mode)?;
         }
+
+        // The VMM answers a few CPUID leaves itself (see `cpuid`).
+        inner.set_property(WHvPartitionPropertyCodeExtendedVmExits, &CPUID_EXIT)?;
+        inner.set_property(WHvPartitionPropertyCodeCpuidExitList, &cpuid::LEAVES)?;
 
         // SAFETY: the handle is valid and configured.
         check("WHvSetupPartition", unsafe {

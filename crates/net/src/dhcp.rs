@@ -52,6 +52,7 @@ pub fn reply(config: &NatConfig, request: &[u8]) -> Option<Vec<u8>> {
         _ => return None,
     };
 
+    tracing::debug!(request = message_type, reply = reply_type, %address, "DHCP");
     let mut reply = vec![0u8; HEADER];
     reply[0] = BOOTREPLY;
     reply[1] = 1; // Ethernet

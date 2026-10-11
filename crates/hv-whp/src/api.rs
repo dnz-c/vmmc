@@ -90,6 +90,13 @@ whp_api! {
             exit_context_size: u32,
         );
         WHvCancelRunVirtualProcessor(partition: WHV_PARTITION_HANDLE, index: u32, flags: u32);
+        WHvGetVirtualProcessorInterruptControllerState2(
+            partition: WHV_PARTITION_HANDLE,
+            index: u32,
+            state: *mut c_void,
+            state_size: u32,
+            written_size: *mut u32,
+        );
         WHvGetVirtualProcessorRegisters(
             partition: WHV_PARTITION_HANDLE,
             index: u32,

@@ -495,8 +495,11 @@ fn parse_context(descriptor: &[u8; 16]) -> Context {
 /// Inserts the IP and TCP/UDP checksums `popts` asks for. For TSO segments,
 /// `l4_length` is the segment's TCP length, which the device adds to the
 /// pseudo-header sum the driver left in the checksum field.
+///
+/// IXSM alone asks for the IP checksum: the context's IPv4 bit only matters for TSO,
+/// and Windows' driver leaves it clear when it just offloads checksums.
 fn apply_checksums(packet: &mut [u8], context: &Context, popts: u8, l4_length: Option<usize>) {
-    if popts & TX_POPTS_IXSM != 0 && context.ipv4 {
+    if popts & TX_POPTS_IXSM != 0 {
         let start = context.ipcss;
         let header_len = packet.get(start).map_or(0, |b| usize::from(b & 0xf) * 4);
         let at = context.ipcso;

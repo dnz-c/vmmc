@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
@@ -27,6 +28,8 @@ pub enum StopReason {
 
 type Kick = Box<dyn Fn() + Send + Sync>;
 
+type Report = Arc<dyn Fn(String) + Send + Sync>;
+
 #[derive(Default)]
 struct StopState {
     reason: OnceLock<StopReason>,
@@ -34,6 +37,9 @@ struct StopState {
     lock: Mutex<()>,
     stopped: Condvar,
     kickers: Mutex<Vec<Kick>>,
+    /// Counts state-dump requests; each vCPU reports once per new count.
+    dumps: AtomicU32,
+    report: Mutex<Option<Report>>,
 }
 
 /// Lets devices or the host stop a VM. The first request's reason wins.
@@ -64,6 +70,27 @@ impl StopHandle {
             .wait_timeout_while(guard, timeout, |_| self.reason().is_none())
             .unwrap_or_else(PoisonError::into_inner);
         self.reason()
+    }
+
+    /// Makes every vCPU pass a description of its state (see [`crate::debug::describe`])
+    /// to `report`, from its own thread, and carry on running. A vCPU that the kick
+    /// misses reports at its next exit.
+    pub fn request_state_dump(&self, report: impl Fn(String) + Send + Sync + 'static) {
+        *self.0.report.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(report));
+        self.0.dumps.fetch_add(1, Ordering::AcqRel);
+        self.kick_all();
+    }
+
+    fn dump_count(&self) -> u32 {
+        self.0.dumps.load(Ordering::Acquire)
+    }
+
+    fn reporter(&self) -> Option<Report> {
+        self.0
+            .report
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Interrupts every running vCPU so it notices a stop request. Callers that must be
@@ -201,7 +228,11 @@ impl<P: Partition> Vm<P> {
         let vcpu = self.shared.partition.create_vcpu(index)?;
         let kicker = vcpu.kicker();
         self.stop.add_kicker(Box::new(move || kicker.kick()));
-        Ok(VmVcpu { vm: self, vcpu })
+        Ok(VmVcpu {
+            vm: self,
+            vcpu,
+            dumps_seen: self.stop.dump_count(),
+        })
     }
 }
 
@@ -211,6 +242,8 @@ pub struct VmVcpu<'vm, P: Partition> {
     // Deliberately never handed out as `&mut P::Vcpu`: swapping vCPUs between VMs would
     // let one outlive the memory its partition maps.
     vcpu: P::Vcpu,
+    /// The state-dump requests this vCPU has answered.
+    dumps_seen: u32,
 }
 
 impl<P: Partition> VmVcpu<'_, P> {
@@ -242,6 +275,20 @@ impl<P: Partition> VmVcpu<'_, P> {
         self.vcpu.kicker()
     }
 
+    fn report_state(&self) {
+        let Some(report) = self.vm.stop.reporter() else {
+            return;
+        };
+        let index = self.index();
+        report(match (self.vcpu.regs(), self.vcpu.sregs()) {
+            (Ok(regs), Ok(sregs)) => {
+                let apic = self.vcpu.local_apic().ok().flatten();
+                crate::debug::describe(index, &regs, &sregs, apic.as_deref(), &self.vm.memory)
+            }
+            (Err(e), _) | (_, Err(e)) => format!("vCPU {index}: can't read its registers: {e}"),
+        });
+    }
+
     /// Runs the guest, handing port and memory accesses to the VM's memory and buses,
     /// until the guest does something only the caller can handle or a stop is
     /// requested.
@@ -250,6 +297,11 @@ impl<P: Partition> VmVcpu<'_, P> {
         loop {
             if let Some(reason) = self.vm.stop.reason() {
                 return Ok(VmExit::Stopped(reason));
+            }
+            let dumps = self.vm.stop.dump_count();
+            if dumps != self.dumps_seen {
+                self.dumps_seen = dumps;
+                self.report_state();
             }
             match self.vcpu.run(&io)? {
                 // A kick with no stop request behind it just re-enters the guest.

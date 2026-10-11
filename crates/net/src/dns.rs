@@ -81,6 +81,13 @@ pub fn respond(packet: &[u8], lookup: impl Fn(&str) -> Option<Vec<IpAddr>>) -> O
             None => rcode = 3, // NXDOMAIN
         }
     }
+    tracing::debug!(
+        name = %query.name,
+        kind = query.kind,
+        rcode,
+        answers = answers.len(),
+        "DNS answer"
+    );
     let mut response = Vec::with_capacity(512);
     response.extend_from_slice(&query.id);
     // Response, recursion desired (echoed) and available.

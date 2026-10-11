@@ -26,13 +26,25 @@ try {
     $disk = Get-Disk -Number 0
     Mark "disk=$($disk.BusType) $([math]::Round($disk.Size / 1GB))GB"
 
-    $adapters = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object Status -eq 'Up'
-    if ($adapters) {
-        $online = Test-NetConnection -ComputerName www.microsoft.com -Port 443 -InformationLevel Quiet
-        Mark "net=$online"
-    } else {
-        Mark 'net=no-adapter'
+    # The NAT: fetch xtask's page on the host through the gateway. Right after setup
+    # DHCP may still be going, so keep trying for a minute.
+    $net = 'failed'
+    for ($try = 0; $try -lt 12; $try++) {
+        try {
+            $page = Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 'http://10.0.2.2:@@HTTP_PORT@@/'
+            # RawContent is always text; Content is bytes unless the type says text.
+            if ($page.RawContent.EndsWith('@@HTTP_BODY@@')) { $net = 'ok'; break }
+            $net = 'wrong-page'
+        } catch {
+            $net = "failed ($($_.Exception.Message))"
+        }
+        Start-Sleep -Seconds 5
     }
+    $address = (Get-NetIPAddress -AddressFamily IPv4 -PrefixOrigin Dhcp -ErrorAction SilentlyContinue).IPAddress -join ','
+    Mark "net=$net address=$address"
+    # The internet, if the host has it. Informational only.
+    $online = Test-NetConnection -ComputerName www.microsoft.com -Port 443 -InformationLevel Quiet -WarningAction SilentlyContinue
+    Mark "internet=$online"
 
     # Devices without a working driver.
     $broken = Get-PnpDevice -PresentOnly | Where-Object { $_.Status -ne 'OK' }

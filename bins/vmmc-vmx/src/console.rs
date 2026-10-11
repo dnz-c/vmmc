@@ -2,7 +2,8 @@
 //!
 //! Input goes to the guest byte for byte. Ctrl-A starts an escape: Ctrl-A x quits,
 //! Ctrl-A p presses the ACPI power button, Ctrl-A s saves a screenshot (with
-//! `--screenshot`), Ctrl-A Ctrl-A sends a literal Ctrl-A.
+//! `--screenshot`), Ctrl-A r prints each vCPU's registers, Ctrl-A m saves guest RAM
+//! and vCPU state to a temp directory, Ctrl-A Ctrl-A sends a literal Ctrl-A.
 
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +14,7 @@ use std::time::Duration;
 use machine::{Display, PowerButton, SerialInput};
 
 use crate::screenshot::Screenshots;
-use vm_core::{StopHandle, StopReason};
+use vm_core::{GuestMemoryMmap, StopHandle, StopReason};
 
 const CTRL_A: u8 = 0x01;
 
@@ -27,6 +28,8 @@ pub enum Input {
     Guest(Vec<u8>),
     PowerButton,
     Screenshot,
+    DumpState,
+    SaveMemory,
     Quit,
 }
 
@@ -61,6 +64,14 @@ impl EscapeFilter {
                         flush(&mut bytes, &mut out);
                         out.push(Input::Screenshot);
                     }
+                    b'r' | b'R' => {
+                        flush(&mut bytes, &mut out);
+                        out.push(Input::DumpState);
+                    }
+                    b'm' | b'M' => {
+                        flush(&mut bytes, &mut out);
+                        out.push(Input::SaveMemory);
+                    }
                     CTRL_A => bytes.push(CTRL_A),
                     // Unknown escapes are swallowed, like QEMU's.
                     _ => {}
@@ -83,6 +94,7 @@ pub struct Target {
     pub power: PowerButton,
     pub stop: StopHandle,
     pub display: Display,
+    pub memory: GuestMemoryMmap,
 }
 
 /// Where console input goes. A guest reset rebuilds the machine, so the target changes
@@ -153,6 +165,25 @@ pub fn spawn_input(targets: Targets) -> io::Result<()> {
                                     }
                                     Ok(None) => eprint!("\r\nvmmc-vmx: no picture to save\r\n"),
                                     Err(e) => eprint!("\r\nvmmc-vmx: screenshot failed: {e}\r\n"),
+                                }
+                            }
+                        }
+                        Input::DumpState => {
+                            if let Some(target) = targets.get() {
+                                // The console is in raw mode, so lines need a CR.
+                                target.stop.request_state_dump(|state| {
+                                    eprint!("\r\n{}\r\n", state.replace('\n', "\r\n"));
+                                });
+                            }
+                        }
+                        Input::SaveMemory => {
+                            if let Some(target) = targets.get() {
+                                match crate::memdump::save(&target.memory, &target.stop) {
+                                    Ok(dir) => eprint!(
+                                        "\r\nvmmc-vmx: saved guest RAM to {}\r\n",
+                                        dir.display()
+                                    ),
+                                    Err(e) => eprint!("\r\nvmmc-vmx: saving RAM failed: {e}\r\n"),
                                 }
                             }
                         }
@@ -314,6 +345,12 @@ mod tests {
             filter.filter(b"a\x01pb"),
             [guest(b"a"), Input::PowerButton, guest(b"b")]
         );
+    }
+
+    #[test]
+    fn ctrl_a_r_dumps_state() {
+        let mut filter = EscapeFilter::default();
+        assert_eq!(filter.filter(b"\x01R"), [Input::DumpState]);
     }
 
     #[test]

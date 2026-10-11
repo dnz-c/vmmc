@@ -6,6 +6,7 @@
 #![cfg(windows)]
 
 mod api;
+mod cpuid;
 mod emulator;
 mod interrupts;
 mod partition;

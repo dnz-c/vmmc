@@ -17,7 +17,8 @@ Phase 1 of [the roadmap](docs/ROADMAP.md) is done: **Linux boots on the Windows
 Hypervisor Platform**. Ubuntu 26.04's kernel reaches userspace in about a third of a
 second on 4 vCPUs, uses a virtio disk, and powers off cleanly. Phase 2 (installing
 Windows 11 from an ISO) is under way: **UEFI firmware (OVMF) boots**, keeps its
-variables per VM, and runs its shell.
+variables per VM, and runs its shell, and **Windows installs unattended** from an ISO onto
+NVMe (verified with Windows 10 22H2).
 
 What exists:
 - **Platform:** a Q35 PC (MCH host bridge, ICH9 LPC) with ACPI, SMP, an IOAPIC, PIT,
@@ -93,7 +94,10 @@ cargo run -p vmmc-vmx -- run --kernel bzImage --initrd initramfs.cpio `
 ```
 
 The guest's serial console is the terminal. **Ctrl-A x** quits, **Ctrl-A p** presses the
-ACPI power button, and **Ctrl-A Ctrl-A** sends a Ctrl-A to the guest.
+ACPI power button, **Ctrl-A r** prints each vCPU's registers and the code at its RIP
+(for finding where a hung guest is stuck), **Ctrl-A m** saves guest RAM and every vCPU's
+state to a new `vmmc-memory-*` directory in the temp directory, and **Ctrl-A Ctrl-A**
+sends a Ctrl-A to the guest.
 `VMMC_LOG=debug` turns on logging to stderr.
 
 When the guest resets, the VM restarts; `--no-reboot` makes it exit instead. Exit

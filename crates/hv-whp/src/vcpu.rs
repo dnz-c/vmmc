@@ -7,11 +7,12 @@ use windows::Win32::System::Hypervisor::{
     WHvRegisterInternalActivityState, WHvRunVpExitReasonCanceled,
     WHvRunVpExitReasonInvalidVpRegisterValue, WHvRunVpExitReasonMemoryAccess,
     WHvRunVpExitReasonUnrecoverableException, WHvRunVpExitReasonX64ApicEoi,
-    WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64IoPortAccess, WHvX64RegisterRax,
-    WHvX64RegisterRip,
+    WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64IoPortAccess,
+    WHvX64RegisterRax, WHvX64RegisterRbx, WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRip,
 };
 
 use crate::api::check;
+use crate::cpuid;
 use crate::emulator::{Context, Emulator};
 use crate::partition::PartitionInner;
 use crate::regs::{self, Aligned16};
@@ -124,6 +125,44 @@ impl WhpVcpu {
         Ok(VcpuExit::Handled)
     }
 
+    /// Answers CPUID for the leaves in `cpuid::LEAVES`, from WHP's own results.
+    fn cpuid_exit(&mut self) -> hv::Result<VcpuExit> {
+        // SAFETY: WHP fills the CpuidAccess member for this exit reason.
+        let access = unsafe { self.exit.Anonymous.CpuidAccess };
+        let default = [
+            access.DefaultResultRax as u32,
+            access.DefaultResultRbx as u32,
+            access.DefaultResultRcx as u32,
+            access.DefaultResultRdx as u32,
+        ];
+        // WHP's initial APIC IDs are the vCPU indexes.
+        let [eax, ebx, ecx, edx] = cpuid::adjust(
+            access.Rax as u32,
+            access.Rcx as u32,
+            default,
+            self.index,
+            self.partition.vcpus,
+        );
+        let next_rip = self.exit.VpContext.Rip + instruction_length(&self.exit.VpContext);
+        self.set_registers(
+            &[
+                WHvX64RegisterRax,
+                WHvX64RegisterRbx,
+                WHvX64RegisterRcx,
+                WHvX64RegisterRdx,
+                WHvX64RegisterRip,
+            ],
+            &[
+                regs::reg64(eax.into()),
+                regs::reg64(ebx.into()),
+                regs::reg64(ecx.into()),
+                regs::reg64(edx.into()),
+                regs::reg64(next_rip),
+            ],
+        )?;
+        Ok(VcpuExit::Handled)
+    }
+
     fn memory_exit(&mut self, io: &dyn CpuIo) -> hv::Result<VcpuExit> {
         // SAFETY: WHP fills the MemoryAccess member for this exit reason. The emulator
         // gets WHP's own (aligned) exit context, not a stack copy.
@@ -168,6 +207,27 @@ impl hv::Vcpu for WhpVcpu {
         self.set_registers(&regs::SPECIAL_NAMES, &regs::special_to_values(s))
     }
 
+    fn local_apic(&self) -> hv::Result<Option<Vec<u8>>> {
+        let mut page = vec![0u8; 4096];
+        let mut written = 0u32;
+        // SAFETY: `page` is a writable buffer of the size passed, and `written` a valid
+        // out-pointer.
+        check("WHvGetVirtualProcessorInterruptControllerState2", unsafe {
+            (self
+                .partition
+                .api
+                .WHvGetVirtualProcessorInterruptControllerState2)(
+                self.partition.handle,
+                self.index,
+                page.as_mut_ptr().cast(),
+                page.len() as u32,
+                &mut written,
+            )
+        })?;
+        page.truncate(written as usize);
+        Ok(Some(page))
+    }
+
     fn set_waiting_for_sipi(&mut self) -> hv::Result<()> {
         let mut value = WHV_REGISTER_VALUE::default();
         value.InternalActivity.AsUINT64 = STARTUP_SUSPEND;
@@ -196,6 +256,7 @@ impl hv::Vcpu for WhpVcpu {
                 io.eoi(vector as u8);
                 Ok(VcpuExit::Handled)
             }
+            WHvRunVpExitReasonX64Cpuid => self.cpuid_exit(),
             WHvRunVpExitReasonX64Halt => Ok(VcpuExit::Halt),
             WHvRunVpExitReasonCanceled => Ok(VcpuExit::Canceled),
             WHvRunVpExitReasonUnrecoverableException => Ok(VcpuExit::Shutdown),

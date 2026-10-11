@@ -38,7 +38,7 @@ use devices::legacy::pic::{
 };
 use devices::legacy::pit::{PIT_BASE, PIT_PORTS, PORT_61, Pit, Port61};
 use devices::legacy::port80::{POST_PORT, PostPort};
-use devices::legacy::rtc::{RTC_BASE, RTC_PORTS, Rtc};
+use devices::legacy::rtc::{RTC_BASE, RTC_IRQ, RTC_PORTS, Rtc, RtcInterrupt};
 use devices::legacy::serial::{COM1_BASE, COM1_IRQ, SERIAL_PORTS, Serial};
 use devices::nic::e1000e::{
     E1000e, REGISTER_BAR as E1000E_BAR, REGISTER_BAR_SIZE as E1000E_BAR_SIZE,
@@ -304,7 +304,13 @@ impl<P: Partition + 'static> Machine<P> {
             shared(Pic8259::default()),
         )?;
         pio.insert(ELCR_BASE.into(), ELCR_PORTS.into(), shared(Elcr::default()))?;
-        let rtc = shared(Rtc::new(clock.clone()));
+        let rtc_interrupt = RtcInterrupt::new(irq(RTC_IRQ));
+        let rtc_ticker = ThreadTicker::new("rtc-irq8", {
+            let interrupt = rtc_interrupt.clone();
+            move || interrupt.periodic_tick()
+        })
+        .map_err(Error::Thread)?;
+        let rtc = shared(Rtc::new(clock.clone(), rtc_interrupt, Box::new(rtc_ticker)));
         pio.insert(RTC_BASE.into(), RTC_PORTS.into(), rtc.clone())?;
 
         // The ACPI PM block decodes wherever the LPC bridge puts it.

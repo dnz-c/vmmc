@@ -255,10 +255,18 @@ Scope moved out of Phase 1:
     - 32-bit BARs from max(low RAM, 2 GiB) up to the ECAM, with low RAM capped at 0xB0000000.
 
     Before this, the ACPI 32-bit window started above the ECAM while OVMF put its BARs below it. Both boot paths now report 0x80000000-0xDFFFFFFF, and the window stretches over any BAR the firmware puts elsewhere.
-- **M5, the Windows 11 install test (harness ready; not run yet):** `cargo xtask win11-test` needs `VMMC_WIN11_ISO`.
+- **M5, the unattended Windows install (passes with Windows 10 22H2; a Windows 11 ISO is still to be tried):** `cargo xtask win11-test` needs `VMMC_WIN11_ISO`, and `VMMC_WIN11_IMAGE` for an edition other than Windows 11 Pro.
   - **Answer disc:** an ISO with `autounattend.xml` (GPT on the NVMe disk, the edition's public generic key, a local administrator, no online-account OOBE, and LabConfig bypasses until M7) and a first-logon PowerShell script. The script reports to COM1: CPUs, Secure Boot, TPM, disk bus, network, and any device without a working driver. Then it shuts down.
-  - **The run:** a 64 GiB sparse disk, a screenshot every 30 s, and a key press for the disc's "Press any key to boot from CD or DVD" prompt.
-- **M6, networking (verified with Linux; Windows waits for M5):**
+  - **The run:** a 64 GiB sparse disk on NVMe, an e1000e NIC, a screenshot every 30 s, and a key press for the disc's "Press any key to boot from CD or DVD" prompt. Setup runs in the ISO's language, read from its `sources/lang.ini` (or `VMMC_WIN11_LANG`).
+  - **Result:** Windows 10 Pro 22H2 (German ISO) installs in about 4 minutes and reports 4 CPUs, 8 GB, NVMe, the vmmc SMBIOS model, and a DHCP address; it fetches a page from xtask through the NAT gateway (`net=ok`, a required marker). An internet check (www.microsoft.com:443) is reported too but not required: it depends on the host. Open item: the display adapter has no Windows driver (Windows draws through the firmware framebuffer instead).
+  - **Platform fixes Windows needed:**
+    - **RTC periodic interrupt on IRQ 8.** With no HPET, Windows builds its clock on it; without it the HAL stopped with HAL_INITIALIZATION_FAILED (0x5C).
+    - **Legacy devices behind the LPC bridge.** COM1, the keyboard controller and the RTC moved to `\_SB.PCI0.ISA_`. As siblings of PCI0 their ports overlapped its I/O window, and Windows refused to start the root bridge (problem 12), so no PCI device got a driver.
+    - **CPU topology.** WHP's CPUID makes every vCPU its own package, and Windows Pro licenses two sockets. vmmc now answers leaves 1, 4, 0xB and 0x1F itself: one package with every vCPU a core. It also sets ARAT in leaf 6.
+    - **e1000e IP checksum offload.** Windows asks for the IPv4 header checksum (POPTS.IXSM) with the context's IPv4 bit clear; the device only honored IXSM with that bit set, so every packet Windows sent had a bad checksum and the NAT dropped it, DHCP included.
+    - **TCP to the DNS address.** Windows also tries DNS over TCP. The NAT used to forward that to the real 10.0.2.3; it now resets it at once, and the guest stays with UDP.
+  - **Debugging aids:** Ctrl-A r prints each vCPU's registers, local APIC and code around RIP; Ctrl-A m saves guest RAM and vCPU state for offline analysis.
+- **M6, networking (verified with Linux and Windows):**
   - **NAT** (`crates/net`, on smoltcp, 0BSD):
     - the guest is 10.0.2.15 behind gateway .2, with DNS at .3;
     - a DHCP server, and DNS answered with the host's own resolver;

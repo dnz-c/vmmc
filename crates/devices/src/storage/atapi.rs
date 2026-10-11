@@ -152,6 +152,7 @@ impl Cdrom {
         self.sense = Sense::NONE;
         // After a medium change, the first command (other than ones that only describe
         // the drive) reports it.
+        tracing::trace!(opcode, "ATAPI command");
         if self.unit_attention && !matches!(opcode, INQUIRY | GET_CONFIGURATION | GET_EVENT_STATUS)
         {
             self.unit_attention = false;

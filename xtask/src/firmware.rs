@@ -16,6 +16,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -365,6 +366,8 @@ pub(crate) struct Session {
     child: Child,
     stdin: ChildStdin,
     output: Arc<Mutex<String>>,
+    /// Set once vmmc-vmx's output has ended, which is when it exits.
+    ended: Arc<AtomicBool>,
 }
 
 impl Session {
@@ -378,22 +381,29 @@ impl Session {
         let mut stdout = child.stdout.take().expect("stdout is piped");
         let output = Arc::new(Mutex::new(String::new()));
         let collected = output.clone();
+        let ended = Arc::new(AtomicBool::new(false));
+        let ending = ended.clone();
         thread::spawn(move || {
             let mut chunk = [0u8; 4096];
             let mut plain = PlainText::default();
             while let Ok(read @ 1..) = stdout.read(&mut chunk) {
-                let _ = std::io::stdout().write_all(&chunk[..read]);
+                // Flushed, so prompts without a newline show up in the log too.
+                let mut echo = std::io::stdout().lock();
+                let _ = echo.write_all(&chunk[..read]).and_then(|()| echo.flush());
+                drop(echo);
                 let text = plain.filter(&chunk[..read]);
                 collected
                     .lock()
                     .unwrap()
                     .push_str(&String::from_utf8_lossy(&text));
             }
+            ending.store(true, Ordering::Release);
         });
         Ok(Self {
             child,
             stdin,
             output,
+            ended,
         })
     }
 
@@ -412,6 +422,10 @@ impl Session {
                 if let Some(at) = output.get(from..).and_then(|rest| rest.find(text)) {
                     return Ok(from + at + text.len());
                 }
+            }
+            // Checked after the search, so output that came just before the end counts.
+            if self.ended.load(Ordering::Acquire) {
+                return Err(format!("vmmc-vmx exited before the guest printed {text:?}"));
             }
             if Instant::now() > deadline {
                 return Err(format!(
@@ -439,6 +453,14 @@ impl Session {
             .write_all(text.as_bytes())
             .and_then(|()| self.stdin.flush())
             .map_err(|e| format!("can't write to the VM's console: {e}"))
+    }
+
+    /// Has vmmc-vmx print every vCPU's registers to its stderr (Ctrl-A r), to show
+    /// where a hung guest is stuck, and gives it a moment to.
+    pub(crate) fn dump_state(&mut self) {
+        if self.send("r").is_ok() {
+            thread::sleep(Duration::from_secs(2));
+        }
     }
 
     pub(crate) fn wait(&mut self, timeout: Duration) -> Option<ExitStatus> {

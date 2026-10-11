@@ -620,6 +620,7 @@ impl Ahci {
     }
 
     fn write_register(&mut self, offset: u64, value: u32) {
+        tracing::trace!(offset, value, "AHCI register write");
         let shared = self.shared.clone();
         let mut regs = lock(&shared.regs);
         match offset {

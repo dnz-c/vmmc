@@ -8,9 +8,10 @@
 //! A guest reset restarts the VM from scratch (unless `--no-reboot`). Exit status: 0
 //! when the guest powers off (or the user quits with Ctrl-A x), 2 when it resets with
 //! `--no-reboot`, 3 on a triple fault, 1 on any error. Ctrl-A p presses the ACPI power
-//! button.
+//! button, Ctrl-A r prints each vCPU's registers, and Ctrl-A m saves guest RAM.
 
 mod console;
+mod memdump;
 mod screenshot;
 mod vm_dir;
 
@@ -339,6 +340,7 @@ fn run(args: RunArgs) -> Result<RunOutcome, Box<dyn Error>> {
             power: machine.power_button(),
             stop: machine.stop_handle(),
             display: machine.display(),
+            memory: machine.memory().clone(),
         }));
         let outcome = machine.run();
         targets.set(None);

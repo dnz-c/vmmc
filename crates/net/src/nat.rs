@@ -23,7 +23,7 @@ use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, IpAddress, IpCidr,
-    IpListenEndpoint, IpProtocol, Ipv4Packet, TcpPacket,
+    IpListenEndpoint, IpProtocol, Ipv4Packet, TcpPacket, UdpPacket,
 };
 
 use crate::frames::{self, UdpDatagram};
@@ -347,8 +347,17 @@ impl Engine {
         {
             match ip.next_header() {
                 IpProtocol::Udp => {
-                    if let Some(datagram) = frames::parse_udp(&frame) {
-                        self.guest_udp(datagram);
+                    match frames::parse_udp(&frame) {
+                        Some(datagram) => self.guest_udp(datagram),
+                        None => tracing::debug!(
+                            src = %ip.src_addr(),
+                            dst = %ip.dst_addr(),
+                            ip_checksum_ok = ip.verify_checksum(),
+                            udp_checksum_ok = UdpPacket::new_checked(ip.payload()).is_ok_and(
+                                |udp| udp.verify_checksum(&ip.src_addr().into(), &ip.dst_addr().into())
+                            ),
+                            "NAT: dropped a UDP datagram that failed its checks"
+                        ),
                     }
                     return;
                 }
@@ -357,6 +366,16 @@ impl Engine {
                         && tcp.syn()
                         && !tcp.ack()
                     {
+                        // smoltcp drops frames whose checksums are wrong, silently.
+                        tracing::debug!(
+                            from_port = tcp.src_port(),
+                            to = %ip.dst_addr(),
+                            port = tcp.dst_port(),
+                            ip_checksum_ok = ip.verify_checksum(),
+                            tcp_checksum_ok =
+                                tcp.verify_checksum(&ip.src_addr().into(), &ip.dst_addr().into()),
+                            "NAT: guest opens a TCP connection"
+                        );
                         self.listen_for(tcp.src_port(), ip.dst_addr(), tcp.dst_port());
                     }
                 }
@@ -378,7 +397,13 @@ impl Engine {
     /// Readies a smoltcp socket for the guest's SYN, and opens the host side.
     fn listen_for(&mut self, guest_port: u16, address: Ipv4Addr, port: u16) {
         let key = (guest_port, address, port);
-        if self.by_key.contains_key(&key) || address.is_broadcast() || address.is_multicast() {
+        // The DNS address only exists for UDP. With no socket, smoltcp resets the
+        // connection at once and the guest stays with UDP (Windows tries TCP too).
+        if self.by_key.contains_key(&key)
+            || address.is_broadcast()
+            || address.is_multicast()
+            || address == self.config.dns
+        {
             return;
         }
         let mut socket = tcp::Socket::new(
@@ -430,6 +455,7 @@ impl Engine {
     }
 
     fn connected(&mut self, id: u64, stream: TcpStream) {
+        tracing::debug!(peer = ?stream.peer_addr().ok(), "NAT: host connection open");
         let Some(connection) = self.connections.get_mut(&id) else {
             let _ = stream.shutdown(Shutdown::Both);
             return;

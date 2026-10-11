@@ -244,6 +244,14 @@ impl BusDevice for PciConfigIo {
                         .lock()
                         .unwrap()
                         .config_read(bus, slot, function, register, data);
+                    tracing::trace!(
+                        bus,
+                        slot,
+                        function,
+                        register,
+                        ?data,
+                        "PCI config read (cf8)"
+                    );
                 }
                 None => data.fill(0xff),
             },
@@ -269,6 +277,14 @@ impl BusDevice for PciConfigIo {
             }
             _ => {
                 if let Some((bus, slot, function, register)) = self.target(offset - 4) {
+                    tracing::trace!(
+                        bus,
+                        slot,
+                        function,
+                        register,
+                        ?data,
+                        "PCI config write (cf8)"
+                    );
                     self.root
                         .lock()
                         .unwrap()
@@ -305,10 +321,26 @@ impl BusDevice for PciEcam {
                 .config_read(bus, slot, function, register, data),
             None => data.fill(0xff),
         }
+        tracing::trace!(
+            bus,
+            slot,
+            function,
+            register,
+            ?data,
+            "PCI config read (ecam)"
+        );
     }
 
     fn write(&mut self, offset: u64, data: &[u8]) {
         let (bus, slot, function, register) = ecam_target(offset);
+        tracing::trace!(
+            bus,
+            slot,
+            function,
+            register,
+            ?data,
+            "PCI config write (ecam)"
+        );
         if let Some(root) = self.0.upgrade() {
             root.lock()
                 .unwrap()

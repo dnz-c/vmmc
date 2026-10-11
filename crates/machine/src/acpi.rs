@@ -512,10 +512,16 @@ fn dsdt_aml(config: &AcpiConfig, sink: &mut Vec<u8>) {
         );
     }
 
+    // The legacy devices sit behind the ICH9 LPC bridge (00:1f.0), inside PCI0: its
+    // I/O window covers their ports, and Windows won't start a root bridge whose
+    // windows overlap devices outside it (problem 12, conflicting addresses).
+    let lpc_address = 0x001f_0000u32;
+    device("\\_SB_.PCI0.ISA_", &[("_ADR", &lpc_address)], &[], sink);
+
     let com1_io = IO::new(COM1_BASE, COM1_BASE, 1, 8);
     let com1_irq = Interrupt::new(true, true, false, false, COM1_IRQ.into());
     device(
-        "\\_SB_.COM1",
+        "\\_SB_.PCI0.ISA_.COM1",
         &[
             ("_HID", &EISAName::new("PNP0501")),
             ("_UID", &one),
@@ -530,7 +536,7 @@ fn dsdt_aml(config: &AcpiConfig, sink: &mut Vec<u8>) {
     let kbd_command = IO::new(I8042_COMMAND, I8042_COMMAND, 1, 1);
     let kbd_irq = Interrupt::new(true, true, false, false, 1);
     device(
-        "\\_SB_.KBD_",
+        "\\_SB_.PCI0.ISA_.KBD_",
         &[
             ("_HID", &EISAName::new("PNP0303")),
             (
@@ -542,10 +548,11 @@ fn dsdt_aml(config: &AcpiConfig, sink: &mut Vec<u8>) {
         sink,
     );
 
-    // The CMOS RTC (no interrupt wired yet).
+    // The CMOS RTC. Its IRQ 8 isn't listed: alarm and update interrupts aren't
+    // emulated, and Linux's driver would wait for them.
     let rtc_io = IO::new(RTC_BASE, RTC_BASE, 1, 2);
     device(
-        "\\_SB_.RTC_",
+        "\\_SB_.PCI0.ISA_.RTC_",
         &[
             ("_HID", &EISAName::new("PNP0B00")),
             ("_CRS", &ResourceTemplate::new(vec![&rtc_io])),
@@ -907,6 +914,7 @@ mod tests {
         let contains = |needle: &[u8]| dsdt.windows(needle.len()).any(|w| w == needle);
         for name in [
             &b"PCI0"[..],
+            b"ISA_",
             b"MBRS",
             b"COM1",
             b"KBD_",

@@ -3,7 +3,8 @@
 //!
 //! - **Inputs:** `VMMC_WIN11_ISO` names the ISO. `VMMC_WIN11_IMAGE` picks the edition
 //!   (default "Windows 11 Pro", installed with Microsoft's public generic key, which
-//!   installs but doesn't activate).
+//!   installs but doesn't activate). Setup runs in the ISO's language, read from its
+//!   `sources/lang.ini`, or the one `VMMC_WIN11_LANG` names (such as `en-US`).
 //! - **Answer disc:** a second ISO with `autounattend.xml` and a first-logon script that
 //!   writes `VMMC-WIN:` markers to COM1 and shuts down.
 //! - **Progress:** a screenshot every 30 s in `target/win11-test/screens`.
@@ -11,8 +12,9 @@
 //! It takes 20 to 60 minutes.
 
 use std::env;
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -21,12 +23,19 @@ use crate::{build_vmmc_vmx, iso, native, workspace};
 
 const ISO_VAR: &str = "VMMC_WIN11_ISO";
 const IMAGE_VAR: &str = "VMMC_WIN11_IMAGE";
+const LANGUAGE_VAR: &str = "VMMC_WIN11_LANG";
+/// How `sources/lang.ini` on a Windows ISO starts.
+const LANG_INI: &[u8] = b"[Available UI Languages]";
 const DEFAULT_IMAGE: &str = "Windows 11 Pro";
 /// Microsoft's published generic installation keys: they install, never activate.
-const GENERIC_KEYS: [(&str, &str); 3] = [
+/// Windows 10 and 11 share them.
+const GENERIC_KEYS: [(&str, &str); 6] = [
     ("Windows 11 Pro", "VK7JG-NPHTM-C97JM-9MPGT-3V66T"),
     ("Windows 11 Home", "YTMG3-N6DKC-DKB77-7M9GH-8HVX7"),
     ("Windows 11 Enterprise", "XGVPP-NMH47-7TTHJ-W3FW7-8HV2C"),
+    ("Windows 10 Pro", "VK7JG-NPHTM-C97JM-9MPGT-3V66T"),
+    ("Windows 10 Home", "YTMG3-N6DKC-DKB77-7M9GH-8HVX7"),
+    ("Windows 10 Enterprise", "XGVPP-NMH47-7TTHJ-W3FW7-8HV2C"),
 ];
 const AUTOUNATTEND: &str = include_str!("../guest/autounattend.xml");
 const FIRST_LOGON: &str = include_str!("../guest/firstlogon.ps1");
@@ -40,16 +49,80 @@ const CD_PROMPT_TIMEOUT: Duration = Duration::from_secs(180);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(90 * 60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(300);
 /// What the first-logon script must report, in order.
-const MARKERS: [&str; 5] = [
+const MARKERS: [&str; 6] = [
     "VMMC-WIN: booted",
     "VMMC-WIN: cpus=4",
     "VMMC-WIN: secureboot=",
     "VMMC-WIN: tpm=",
+    "VMMC-WIN: net=ok",
     "VMMC-WIN: done",
 ];
 
-/// The answer file for `image`, with the check bypasses while vmmc needs them.
-fn answer_file(image: &str, key: &str) -> String {
+/// The first language `lang.ini` lists, as a tag like `de-DE`.
+fn parse_lang_ini(text: &str) -> Option<String> {
+    let mut lines = text
+        .lines()
+        .map(str::trim)
+        .skip_while(|line| line.is_empty());
+    if lines.next()? != "[Available UI Languages]" {
+        return None;
+    }
+    let tag = lines
+        .take_while(|line| !line.starts_with('['))
+        .find_map(|line| {
+            let (tag, index) = line.split_once('=')?;
+            index.trim().parse::<u32>().ok()?;
+            Some(tag.trim())
+        })
+        .filter(|tag| !tag.is_empty())?;
+    Some(match tag.split_once('-') {
+        Some((language, region)) if region.len() == 2 => {
+            format!("{}-{}", language.to_lowercase(), region.to_uppercase())
+        }
+        _ => tag.to_owned(),
+    })
+}
+
+/// The language of a Windows ISO's Setup, from its `sources/lang.ini`. The ISO's files
+/// are on a UDF file system, and a file that small sits inside its file entry, so
+/// rather than read UDF, look for the file's contents.
+fn iso_language(iso: &Path) -> Result<String, String> {
+    let mut file = File::open(iso).map_err(|e| format!("can't open {}: {e}", iso.display()))?;
+    // Each read keeps the end of the last one, so a match can straddle two reads.
+    const KEEP: usize = 512;
+    let mut buffer = vec![0u8; KEEP + (8 << 20)];
+    let mut kept = 0;
+    loop {
+        let read = file
+            .read(&mut buffer[kept..])
+            .map_err(|e| format!("can't read {}: {e}", iso.display()))?;
+        if read == 0 {
+            return Err(format!(
+                "{}: no sources/lang.ini found; set {LANGUAGE_VAR} to Setup's language",
+                iso.display()
+            ));
+        }
+        let filled = kept + read;
+        let mut from = 0;
+        while let Some(at) = buffer[from..filled]
+            .windows(LANG_INI.len())
+            .position(|window| window == LANG_INI)
+        {
+            let start = from + at;
+            let text = String::from_utf8_lossy(&buffer[start..filled.min(start + KEEP)]);
+            if let Some(language) = parse_lang_ini(&text) {
+                return Ok(language);
+            }
+            from = start + 1;
+        }
+        kept = KEEP.min(filled);
+        buffer.copy_within(filled - kept..filled, 0);
+    }
+}
+
+/// The answer file for `image` in `language`, with the check bypasses while vmmc
+/// needs them.
+fn answer_file(image: &str, key: &str, language: &str) -> String {
     let commands: String = BYPASSES
         .iter()
         .enumerate()
@@ -69,6 +142,7 @@ fn answer_file(image: &str, key: &str) -> String {
         .replace("@@LABCONFIG@@", &labconfig)
         .replace("@@IMAGE@@", image)
         .replace("@@KEY@@", key)
+        .replace("@@LANGUAGE@@", language)
 }
 
 pub fn test() -> Result<(), String> {
@@ -95,8 +169,19 @@ pub fn test() -> Result<(), String> {
     fs::create_dir_all(&dir).map_err(|e| format!("can't create {}: {e}", dir.display()))?;
 
     let answer = dir.join("answer.iso");
-    let answer_xml = answer_file(&image, key);
-    let script = FIRST_LOGON.replace("\r\n", "\n").replace('\n', "\r\n");
+    let language = match env::var(LANGUAGE_VAR) {
+        Ok(language) => language,
+        Err(_) => iso_language(&windows_iso)?,
+    };
+    eprintln!("xtask: Setup language {language}");
+    let answer_xml = answer_file(&image, key, &language);
+    // The guest fetches this through the NAT's gateway.
+    let http = crate::serve_http()?;
+    let script = FIRST_LOGON
+        .replace("@@HTTP_PORT@@", &http.to_string())
+        .replace("@@HTTP_BODY@@", crate::HTTP_BODY)
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n");
     let disc = iso::build(
         "VMMC_ANSWER",
         &[
@@ -127,6 +212,7 @@ pub fn test() -> Result<(), String> {
         .arg("--disk")
         .arg(format!("{},nvme", disk.display()))
         .args(["--cpus", CPUS, "--memory", MEMORY_MIB])
+        .args(["--nic", "e1000e"])
         .arg("--screenshot")
         .arg(dir.join("screens"))
         .args(["--screenshot-every", "30"]);
@@ -146,6 +232,9 @@ pub fn test() -> Result<(), String> {
             }
             Err(_) => {
                 eprintln!("xtask: no \"{CD_PROMPT}\" prompt seen; carrying on");
+                // Twice, so a guest that's spinning shows whether it moves.
+                vm.dump_state();
+                vm.dump_state();
                 0
             }
         };
@@ -163,6 +252,7 @@ pub fn test() -> Result<(), String> {
     let status = match &result {
         Ok(_) => vm.wait(SHUTDOWN_TIMEOUT),
         Err(_) => {
+            vm.dump_state();
             vm.kill();
             None
         }
@@ -183,8 +273,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reads_the_language_from_lang_ini() {
+        let ini = "[Available UI Languages]\r\nde-de = 3\r\n\r\n[Fallback Languages]\r\nde-de = en-us\r\n";
+        assert_eq!(parse_lang_ini(ini).as_deref(), Some("de-DE"));
+        assert_eq!(
+            parse_lang_ini("[Available UI Languages]\nsr-latn-rs = 1\n").as_deref(),
+            Some("sr-latn-rs")
+        );
+        assert_eq!(
+            parse_lang_ini("[Available UI Languages]\n[Other]\nx = 1"),
+            None
+        );
+    }
+
+    #[test]
     fn answer_file_fills_every_placeholder() {
-        let xml = answer_file("Windows 11 Pro", "VK7JG-NPHTM-C97JM-9MPGT-3V66T");
+        let xml = answer_file("Windows 11 Pro", "VK7JG-NPHTM-C97JM-9MPGT-3V66T", "de-DE");
+        assert_eq!(xml.matches("de-DE").count(), 9);
         assert!(!xml.contains("@@"));
         assert!(xml.contains("<Value>Windows 11 Pro</Value>"));
         assert!(xml.contains("BypassTPMCheck"));

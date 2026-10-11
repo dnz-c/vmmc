@@ -242,6 +242,27 @@ fn refused_connections_are_reset() {
 }
 
 #[test]
+fn tcp_to_the_dns_address_is_reset_at_once() {
+    let mut guest = Guest::new();
+    let handle = guest.tcp_socket();
+    let context = guest.iface.context();
+    let dns = IpEndpoint::new(IpAddress::Ipv4(NatConfig::default().dns), 53);
+    guest
+        .sockets
+        .get_mut::<tcp::Socket>(handle)
+        .connect(context, dns, 49_154)
+        .unwrap();
+    let start = std::time::Instant::now();
+    guest.until("the reset", |guest| {
+        guest.sockets.get::<tcp::Socket>(handle).state() == tcp::State::Closed
+    });
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "not a host connection that times out"
+    );
+}
+
+#[test]
 fn dns_answers_from_the_host_resolver() {
     let mut guest = Guest::new();
     let handle = guest.udp_socket(50_000);

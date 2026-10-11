@@ -47,7 +47,7 @@ const LINUX_MARKERS: [&str; 7] = [
     "VMMC-TEST: done",
 ];
 /// What the host's test web server answers, and the guest checks for.
-const HTTP_BODY: &str = "vmmc net ok";
+pub(crate) const HTTP_BODY: &str = "vmmc net ok";
 
 fn main() -> ExitCode {
     let result = match env::args().nth(1).as_deref() {
@@ -218,7 +218,8 @@ pub(crate) fn serve_http() -> Result<u16, String> {
             let mut request = [0u8; 4096];
             let _ = stream.read(&mut request);
             let response = format!(
-                "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{HTTP_BODY}",
+                "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{HTTP_BODY}",
                 HTTP_BODY.len()
             );
             let _ = stream.write_all(response.as_bytes());
