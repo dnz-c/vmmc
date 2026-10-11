@@ -1,4 +1,5 @@
-# Builds the native (C) dependencies vmmc can't build with cargo, and publishes them as a
+# Builds the native (C) dependencies vmmc can't build with cargo (OVMF, and the TPM 2.0
+# reference implementation with OpenSSL), and publishes them as a
 # GitHub release that `cargo xtask fetch-native` downloads by pinned SHA-256.
 #
 # Run it from the Actions tab (or `gh workflow run native-deps.yml -f release=native-deps-N`),
@@ -18,6 +19,9 @@ permissions:
 env:
   EDK2_TAG: edk2-stable202608
   VIRT_FIRMWARE_VERSION: "26.9"
+  TPM_REF_TAG: v1.83r1
+  # vcpkg release whose baseline builds OpenSSL 3.6.5.
+  VCPKG_TAG: "2026.07.29"
 
 jobs:
   ovmf:
@@ -92,9 +96,78 @@ jobs:
           name: ovmf
           path: dist/
 
+  tpm:
+    name: TPM 2.0 reference implementation (static MSVC libraries)
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Fetch ms-tpm-20-ref ${{ env.TPM_REF_TAG }}
+        run: git clone --depth 1 --branch $env:TPM_REF_TAG https://github.com/microsoft/ms-tpm-20-ref.git
+
+      # Static libraries against the dynamic CRT (/MD), as Rust's MSVC targets link.
+      - name: Build OpenSSL (vcpkg, x64-windows-static-md)
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git
+          git -C vcpkg checkout $env:VCPKG_TAG
+          .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          .\vcpkg\vcpkg.exe install openssl:x64-windows-static-md
+
+      # A VM's TPM, not a simulator: SIMULATION enables reproducible RNG seeding and
+      # key caching meant for tests, and forced failure mode is a test hook.
+      - name: Configure the TPM for a VM
+        run: |
+          $file = 'ms-tpm-20-ref/TPMCmd/TpmConfiguration/TpmConfiguration/TpmBuildSwitches.h'
+          $text = Get-Content -Raw $file
+          $text = $text -replace '#define SIMULATION\s+YES', '#define SIMULATION NO'
+          $text = $text -replace '#define ALLOW_FORCE_FAILURE_MODE\s+YES', '#define ALLOW_FORCE_FAILURE_MODE NO'
+          if ($text -notmatch '#define SIMULATION NO' -or $text -notmatch '#define ALLOW_FORCE_FAILURE_MODE NO') {
+            throw 'build switches not found'
+          }
+          Set-Content -NoNewline -Path $file -Value $text
+
+      # FILE_BACKED_NV=0 keeps the NV image in memory: vmmc saves it to the VM's
+      # tpm-state.bin, rather than the reference platform writing ./NVChip.
+      - name: Build
+        run: |
+          $ossl = Join-Path $PWD 'vcpkg/installed/x64-windows-static-md'
+          $env:CL = '/DFILE_BACKED_NV=0'
+          cmake -S ms-tpm-20-ref/TPMCmd -B build -G 'Visual Studio 17 2022' -A x64 `
+            "-DOSSL_INCLUDE_SUBDIR=$ossl/include"
+          cmake --build build --config Release --parallel `
+            --target Tpm_PlatformLib Tpm_CoreLib Tpm_CryptoLib_Math_Ossl
+
+      - name: Package
+        run: |
+          $ossl = 'vcpkg/installed/x64-windows-static-md'
+          New-Item -ItemType Directory dist | Out-Null
+          Get-ChildItem build -Recurse -Filter *.lib |
+            Where-Object { $_.FullName -match '\\Release\\' } |
+            ForEach-Object { Copy-Item $_.FullName (Join-Path dist ("tpm-" + $_.Name)) }
+          Copy-Item "$ossl/lib/libcrypto.lib" dist/tpm-libcrypto.lib
+          Copy-Item ms-tpm-20-ref/LICENSE dist/TPM-REF-LICENSE.txt
+          Copy-Item "$ossl/share/openssl/copyright" dist/OPENSSL-LICENSE.txt
+          @(
+            "ms-tpm-20-ref tag: $env:TPM_REF_TAG"
+            "ms-tpm-20-ref commit: $(git -C ms-tpm-20-ref rev-parse HEAD)"
+            "vcpkg tag: $env:VCPKG_TAG ($(git -C vcpkg rev-parse HEAD))"
+            "OpenSSL: $(.\vcpkg\vcpkg.exe list openssl)"
+            'triplet: x64-windows-static-md (static libraries, dynamic CRT)'
+            'switches: SIMULATION NO, ALLOW_FORCE_FAILURE_MODE NO, FILE_BACKED_NV 0, Release'
+            "libraries: $((Get-ChildItem dist -Filter *.lib).Name -join ' ')"
+          ) | Set-Content dist/TPM-BUILD-INFO.txt
+          Get-Content dist/TPM-BUILD-INFO.txt
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tpm
+          path: dist/
+
   publish:
     name: Publish release
-    needs: [ovmf]
+    needs: [ovmf, tpm]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
@@ -112,5 +185,5 @@ jobs:
           cat SHA256SUMS
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
             --title "Native dependencies ($TAG)" \
-            --notes "OVMF from $EDK2_TAG (SMM off, TPM 2.0; Secure Boot on except in the test build). See OVMF-BUILD-INFO.txt." \
+            --notes "OVMF from $EDK2_TAG (SMM off, TPM 2.0; Secure Boot on except in the test build), and the TPM 2.0 reference implementation ($TPM_REF_TAG) with OpenSSL. See OVMF-BUILD-INFO.txt and TPM-BUILD-INFO.txt." \
             *
