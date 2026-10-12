@@ -129,6 +129,36 @@ jobs:
           }
           Set-Content -NoNewline -Path $file -Value $text
 
+      # The reference platform's entropy is rand(), seeded with the time and process ID:
+      # fine for a simulator, but a VM's TPM makes its seeds and keys from it. Take it
+      # from the system's CSPRNG instead. BCryptGenRandom is declared here rather than
+      # through windows.h, whose types clash with the TPM's; vmmc links bcrypt.
+      - name: Take the TPM's entropy from Windows
+        run: |
+          $file = 'ms-tpm-20-ref/TPMCmd/Platform/src/Entropy.c'
+          if ((Get-Content -Raw $file) -notmatch 'LIB_EXPORT int32_t _plat__GetEntropy') {
+            throw 'entropy source not found'
+          }
+          @'
+          // vmmc: platform entropy from the system's CSPRNG, replacing the reference
+          // implementation's rand(), which is seeded with the time and process ID.
+          #include "Platform.h"
+
+          __declspec(dllimport) long __stdcall BCryptGenRandom(
+              void* algorithm, unsigned char* buffer, unsigned long size, unsigned long flags);
+          #define VMMC_SYSTEM_PREFERRED_RNG 0x00000002
+
+          LIB_EXPORT int32_t _plat__GetEntropy(unsigned char* entropy, uint32_t amount)
+          {
+              // A request for nothing seeds a software source; there's none to seed.
+              if(amount == 0)
+                  return 0;
+              if(BCryptGenRandom(NULL, entropy, amount, VMMC_SYSTEM_PREFERRED_RNG) < 0)
+                  return -1;
+              return (int32_t)amount;
+          }
+          '@ | Set-Content -Path $file
+
       # The OpenSSL glue reads OpenSSL's private bignum_st and refuses versions from 3.1
       # on as untested. Check the layout in the OpenSSL source vcpkg built, then let it
       # build against this version (below 3.7).
@@ -184,6 +214,7 @@ jobs:
             "OpenSSL: $(.\vcpkg\vcpkg.exe list openssl)"
             'triplet: x64-windows-static-md (static libraries, dynamic CRT)'
             'switches: SIMULATION NO, ALLOW_FORCE_FAILURE_MODE NO, CRYPTO_LIB_REPORTING NO, FILE_BACKED_NV 0, Release'
+            'entropy: BCryptGenRandom (system-preferred RNG)'
             "libraries: $((Get-ChildItem dist -Filter *.lib).Name -join ' ')"
           ) | Set-Content dist/TPM-BUILD-INFO.txt
           Get-Content dist/TPM-BUILD-INFO.txt
