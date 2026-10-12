@@ -115,14 +115,16 @@ jobs:
           .\vcpkg\vcpkg.exe install openssl:x64-windows-static-md
 
       # A VM's TPM, not a simulator: SIMULATION enables reproducible RNG seeding and
-      # key caching meant for tests, and forced failure mode is a test hook.
+      # key caching meant for tests, and forced failure mode is a test hook. Crypto
+      # library reporting is a simulator command that only builds with SIMULATION.
       - name: Configure the TPM for a VM
         run: |
           $file = 'ms-tpm-20-ref/TPMCmd/TpmConfiguration/TpmConfiguration/TpmBuildSwitches.h'
           $text = Get-Content -Raw $file
           $text = $text -replace '#define SIMULATION\s+YES', '#define SIMULATION NO'
           $text = $text -replace '#define ALLOW_FORCE_FAILURE_MODE\s+YES', '#define ALLOW_FORCE_FAILURE_MODE NO'
-          if ($text -notmatch '#define SIMULATION NO' -or $text -notmatch '#define ALLOW_FORCE_FAILURE_MODE NO') {
+          $text = $text -replace '#define CRYPTO_LIB_REPORTING\s+YES', '#define CRYPTO_LIB_REPORTING NO'
+          if ($text -notmatch '#define SIMULATION NO' -or $text -notmatch '#define ALLOW_FORCE_FAILURE_MODE NO' -or $text -notmatch '#define CRYPTO_LIB_REPORTING NO') {
             throw 'build switches not found'
           }
           Set-Content -NoNewline -Path $file -Value $text
@@ -181,7 +183,7 @@ jobs:
             "vcpkg tag: $env:VCPKG_TAG ($(git -C vcpkg rev-parse HEAD))"
             "OpenSSL: $(.\vcpkg\vcpkg.exe list openssl)"
             'triplet: x64-windows-static-md (static libraries, dynamic CRT)'
-            'switches: SIMULATION NO, ALLOW_FORCE_FAILURE_MODE NO, FILE_BACKED_NV 0, Release'
+            'switches: SIMULATION NO, ALLOW_FORCE_FAILURE_MODE NO, CRYPTO_LIB_REPORTING NO, FILE_BACKED_NV 0, Release'
             "libraries: $((Get-ChildItem dist -Filter *.lib).Name -join ' ')"
           ) | Set-Content dist/TPM-BUILD-INFO.txt
           Get-Content dist/TPM-BUILD-INFO.txt
