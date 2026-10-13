@@ -234,6 +234,7 @@ pub fn run(
         }
     });
 
+    keyboard::stop_raw_input();
     let hook = keyboard::install(targets.clone(), keyboard::current_thread());
     let result = window.run().map_err(|e| format!("the window failed: {e}"));
     drop(hook);
@@ -410,6 +411,7 @@ mod keyboard {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, VK_NUMLOCK, VK_PAUSE,
     };
+    use windows::Win32::UI::Input::{RAWINPUTDEVICE, RIDEV_REMOVE, RegisterRawInputDevices};
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, DispatchMessageW, GetClassNameW, GetForegroundWindow, GetMessageW,
         GetWindowThreadProcessId, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP, MSG,
@@ -423,6 +425,28 @@ mod keyboard {
         keys: Sender<(u16, bool)>,
         pressed: BTreeSet<u16>,
         ui_thread: u32,
+    }
+
+    /// Takes the keyboard back from raw input, which the window library asks for when
+    /// its event loop starts (for device events, which nothing here uses). While a
+    /// process reads the keyboard as raw input, Windows doesn't call the process's
+    /// low-level keyboard hooks for keys typed into its own windows: the hook saw keys
+    /// typed anywhere but into the console window, and the guest got none. Call it
+    /// once the window exists.
+    pub fn stop_raw_input() {
+        // HID usage page 1 (generic desktop), usage 6: keyboards.
+        let keyboards = RAWINPUTDEVICE {
+            usUsagePage: 0x01,
+            usUsage: 0x06,
+            dwFlags: RIDEV_REMOVE,
+            hwndTarget: HWND::default(),
+        };
+        // SAFETY: one valid RAWINPUTDEVICE, of the size passed.
+        let stopped =
+            unsafe { RegisterRawInputDevices(&[keyboards], size_of::<RAWINPUTDEVICE>() as u32) };
+        if let Err(e) = stopped {
+            tracing::warn!(%e, "can't stop raw keyboard input; the guest may get no keys");
+        }
     }
 
     /// The calling thread's ID, for [`install`]'s `ui_thread`.
