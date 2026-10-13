@@ -276,12 +276,12 @@ Scope moved out of Phase 1:
     - UDP flows through host sockets;
     - the gateway address reaches the host's loopback.
 
-    10 tests run with a second smoltcp stack as the guest: DHCP, a 300 KB TCP echo, connection refused, DNS, and UDP.
+    Tests run with a second smoltcp stack as the guest: DHCP, a 300 KB TCP echo, 2 MB into a NIC that holds 16 frames (none may be dropped), connection refused, DNS, and UDP.
   - **virtio-net**, with no offloads.
   - **e1000e (82574L)**, written from the datasheet:
     - EEPROM with a valid checksum, PHY over MDIC;
     - legacy and extended receive descriptors;
-    - transmit with context descriptors, checksum insertion and TSO in software;
+    - both transmit queues, with context descriptors, checksum insertion and TSO in software;
     - MSI or INTA, with ICR auto-mask.
 
     Linux's own `e1000e` driver identifies it ("MAC: 3, PHY: 8"), brings the link up at 1 Gb/s, and passes its MSI self-test.
@@ -290,6 +290,10 @@ Scope moved out of Phase 1:
   - **Bugs found:**
     - The NAT treated SYN-RECEIVED as "guest closed" and shut the host side.
     - The e1000e raised a link change when the driver unmasked it, rather than latching it at link-up. That broke Linux's MSI self-test half the time.
+    - **Windows' link went down every 10.7 s.** The 82574 has two transmit queues and Windows' driver uses both; the e1000e only ran the first. Packets on the second were never sent, so the driver took the queue for hung and reset the adapter. Each reset took the link down and up. Browsers then failed with `ERR_NETWORK_CHANGED` and pages loaded without their CSS. Found with the register trace (`VMMC_LOG=devices::nic::e1000e=trace`): the driver wrote TDT1. With both queues the link stays up, and a 50 MB download runs at the host's speed.
+    - The PHY's autonegotiation expansion register read 0, so Windows' driver warned at every link-up that the link partner didn't autonegotiate.
+    - **Every guest reset leaked the guest's RAM.** The e1000e kept its NAT in the state that the NAT's own thread holds, so after a reset rebuilt the machine, neither could be freed, and the old guest memory went with them. That's 8 GB per reboot for an 8 GB Windows, and Setup reboots several times. The NAT now hangs off the device itself. Measured across three resets from the UEFI shell with 2 GB of RAM: 2 GB, 4 GB, 6 GB, 8 GB committed before; 2 GB throughout after.
+    - **Flow control from the NIC to the NAT.** The NAT sent TCP data to the guest as fast as smoltcp allowed, and a NIC with no free receive buffers dropped what didn't fit. Each loss stalls the connection for smoltcp's 1 s minimum retransmission timeout. Now a NIC with frames waiting tells the NAT it's full (`FrameSink::has_room`), and the NAT holds data in its TCP buffers until the NIC wakes it.
   - **Host note:** the workspace's A: volume rescans a whole file on its first write after it's opened, at about 1 MB/s. Guest disk writes stalled 30-60 s and looked like lost interrupts. xtask now keeps guest-written images in `%TEMP%\vmmc-test-images` (or `VMMC_TEST_IMAGES`).
 - **M7, TPM 2.0 and Secure Boot:**
   - **The TPM engine** (`crates/tpm`): Microsoft's reference implementation (ms-tpm-20-ref v1.83r1) with OpenSSL 3.6, built by the `native-deps` workflow as static MSVC libraries and linked when `fetch-native` has fetched them (a stub otherwise).

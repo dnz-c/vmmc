@@ -6,6 +6,7 @@ use crate::irq::testing::RecordingSink;
 
 const MAC: [u8; 6] = [0x52, 0x54, 0x00, 0xab, 0xcd, 0xef];
 const TX_RING: u64 = 0x1_0000;
+const TX_RING1: u64 = 0x3_0000;
 const RX_RING: u64 = 0x2_0000;
 const TX_DATA: u64 = 0x10_0000;
 const RX_BUFFERS: u64 = 0x20_0000;
@@ -126,6 +127,7 @@ fn eeprom_and_phy_identify_the_part() {
     assert_eq!(sum, 0xbaba, "EEPROM checksum");
     assert_eq!((nic.phy(2), nic.phy(3)), (PHY_ID1, PHY_ID2));
     assert_ne!(nic.phy(1) & (1 << 2), 0, "link up");
+    assert_ne!(nic.phy(6) & 1, 0, "the link partner autonegotiates");
     assert_eq!(nic.read(STATUS) & 0b11, 0b11, "full duplex, link up");
     assert_eq!(nic.read(RAH0) & RAH_AV, RAH_AV);
 
@@ -134,6 +136,45 @@ fn eeprom_and_phy_identify_the_part() {
     assert_eq!(nic.read(SWSM) & SWSM_SMBI, SWSM_SMBI);
     nic.write(SWSM, 0);
     assert_eq!(nic.read(SWSM) & SWSM_SMBI, 0);
+}
+
+#[test]
+fn both_transmit_queues_send_and_gather_packets_independently() {
+    let mut nic = Nic::new();
+    nic.setup_tx();
+    nic.write(TDBAL1, TX_RING1 as u32);
+    nic.write(TDBAH1, 0);
+    nic.write(TDLEN1, 16 * DESCRIPTOR as u32);
+    nic.write(TDH1, 0);
+    nic.write(TDT1, 0);
+    let first: Vec<u8> = (0..100).map(|i| i as u8).collect();
+    let second: Vec<u8> = (0..80).map(|i| 200 - i as u8).collect();
+    nic.memory
+        .write_slice(&first, GuestAddress(TX_DATA))
+        .unwrap();
+    nic.memory
+        .write_slice(&second, GuestAddress(TX_DATA + 0x1000))
+        .unwrap();
+    // Queue 0 starts a packet, queue 1 sends a whole one, then queue 0 finishes.
+    nic.put_descriptor(0, legacy_tx(TX_DATA, 40, 0));
+    nic.write(TDT, 1);
+    nic.memory
+        .write_slice(
+            &legacy_tx(TX_DATA + 0x1000, 80, TX_CMD_EOP),
+            GuestAddress(TX_RING1),
+        )
+        .unwrap();
+    nic.write(TDT1, 1);
+    nic.put_descriptor(1, legacy_tx(TX_DATA + 40, 60, TX_CMD_EOP));
+    nic.write(TDT, 2);
+    assert_eq!(*nic.sent.0.lock().unwrap(), [second, first]);
+    assert_eq!((nic.read(TDH), nic.read(TDH1)), (2, 1));
+    assert_ne!(nic.descriptor(TX_RING1, 0)[12] & TX_STA_DD, 0);
+    let icr = nic.read(ICR);
+    assert_eq!(
+        icr & (ICR_TXDW | ICR_TXQ0 | ICR_TXQ1),
+        ICR_TXDW | ICR_TXQ0 | ICR_TXQ1
+    );
 }
 
 #[test]
@@ -373,4 +414,50 @@ fn link_change_is_latched_at_reset_and_auto_mask_follows_icr_reads() {
     assert_eq!(nic.sink.take().len(), 1);
     assert_ne!(nic.read(ICR) & (1 << 3), 0);
     assert_eq!(nic.read(IMS), 0, "the ICR read auto-masked everything");
+}
+
+#[test]
+fn a_full_backlog_holds_the_backend_back_until_the_driver_makes_room() {
+    let mut nic = Nic::new();
+    let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = woken.clone();
+    let receiver = nic.device.receiver();
+    receiver.set_waker(Arc::new(move || {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }));
+    // Receive is off, so frames for this NIC wait.
+    let mut frame = MAC.to_vec();
+    frame.resize(64, 0);
+    for _ in 0..RX_ROOM {
+        assert!(receiver.has_room());
+        receiver.deliver(&frame);
+    }
+    assert!(!receiver.has_room());
+    assert_eq!(woken.load(std::sync::atomic::Ordering::Relaxed), 0);
+    // The driver posts 15 descriptors: frames move in, and the backend is woken once.
+    nic.setup_rx(false, 0);
+    assert!(receiver.has_room());
+    assert_eq!(woken.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+/// A backend that holds the NIC's receiver, as the NAT's thread does.
+struct HoldsReceiver(#[allow(dead_code)] Receiver);
+
+impl NetBackend for HoldsReceiver {
+    fn send(&self, _: &[u8]) {}
+}
+
+#[test]
+fn dropping_the_device_frees_its_state_even_though_the_backend_holds_it() {
+    let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+    let mut device = E1000e::new(MAC, memory, Arc::new(RecordingSink::default()), None);
+    let state = Arc::downgrade(&device.state);
+    device.set_backend(Arc::new(HoldsReceiver(device.receiver())));
+    drop(device);
+    // A machine rebuilt at every guest reset used to keep the old one's NIC, and its
+    // guest memory, this way.
+    assert!(
+        state.upgrade().is_none(),
+        "the state (and guest memory) leaked"
+    );
 }

@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, UdpSocket};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant as StdInstant};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
@@ -23,7 +24,64 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 /// The guest's NIC: frames it sends go to the NAT; the NAT's go into `received`.
 struct GuestNic {
     nat: Arc<Nat>,
-    received: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    received: Arc<Received>,
+}
+
+/// Frames from the NAT, waiting for the guest. With a capacity, that many fit and the
+/// rest are dropped, as in a NIC's receive ring; the NAT is told there's no room
+/// once half of it is taken.
+#[derive(Default)]
+struct Received {
+    frames: Mutex<VecDeque<Vec<u8>>>,
+    capacity: Option<usize>,
+    dropped: AtomicUsize,
+    nat_waiting: AtomicBool,
+    waker: Mutex<Option<Waker>>,
+}
+
+impl Received {
+    fn take(&self) -> Option<Vec<u8>> {
+        let mut frames = self.frames.lock().unwrap();
+        let frame = frames.pop_front();
+        if self.has_room_in(&frames)
+            && self.nat_waiting.swap(false, Ordering::Relaxed)
+            && let Some(waker) = &*self.waker.lock().unwrap()
+        {
+            waker();
+        }
+        frame
+    }
+
+    fn has_room_in(&self, frames: &VecDeque<Vec<u8>>) -> bool {
+        self.capacity
+            .is_none_or(|capacity| frames.len() < capacity / 2)
+    }
+}
+
+impl FrameSink for Received {
+    fn deliver(&self, frame: &[u8]) {
+        let mut frames = self.frames.lock().unwrap();
+        if self
+            .capacity
+            .is_some_and(|capacity| frames.len() >= capacity)
+        {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        } else {
+            frames.push_back(frame.to_vec());
+        }
+    }
+
+    fn has_room(&self) -> bool {
+        let room = self.has_room_in(&self.frames.lock().unwrap());
+        if !room {
+            self.nat_waiting.store(true, Ordering::Relaxed);
+        }
+        room
+    }
+
+    fn set_waker(&self, waker: Waker) {
+        *self.waker.lock().unwrap() = Some(waker);
+    }
 }
 
 struct Rx(Vec<u8>);
@@ -49,7 +107,7 @@ impl Device for GuestNic {
     type TxToken<'a> = Tx<'a>;
 
     fn receive(&mut self, _: Instant) -> Option<(Rx, Tx<'_>)> {
-        let frame = self.received.lock().unwrap().pop_front()?;
+        let frame = self.received.take()?;
         Some((Rx(frame), Tx(&self.nat)))
     }
 
@@ -75,13 +133,16 @@ struct Guest {
 impl Guest {
     /// A guest that has done DHCP.
     fn new() -> Self {
-        let received = Arc::new(Mutex::new(VecDeque::new()));
-        let sink_queue = received.clone();
-        let nat = Nat::start(
-            NatConfig::default(),
-            Arc::new(move |frame: &[u8]| sink_queue.lock().unwrap().push_back(frame.to_vec())),
-        )
-        .unwrap();
+        Self::with_nic_capacity(None)
+    }
+
+    /// A guest that has done DHCP, whose NIC holds `capacity` frames if given.
+    fn with_nic_capacity(capacity: Option<usize>) -> Self {
+        let received = Arc::new(Received {
+            capacity,
+            ..Received::default()
+        });
+        let nat = Nat::start(NatConfig::default(), received.clone()).unwrap();
         let mut nic = GuestNic {
             nat: Arc::new(nat),
             received,
@@ -220,6 +281,48 @@ fn tcp_through_the_gateway_reaches_host_loopback() {
         !guest.sockets.get::<tcp::Socket>(handle).is_open()
             || guest.sockets.get::<tcp::Socket>(handle).state() == tcp::State::TimeWait
     });
+    server.join().unwrap();
+}
+
+#[test]
+fn a_full_nic_holds_tcp_data_back_instead_of_losing_it() {
+    // A host server sending far more than the guest's NIC and window hold.
+    let data: Vec<u8> = (0..2_000_000u32).map(|i| (i % 253) as u8).collect();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let to_send = data.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(&to_send).unwrap();
+    });
+
+    let mut guest = Guest::with_nic_capacity(Some(16));
+    let handle = guest.tcp_socket();
+    let context = guest.iface.context();
+    guest
+        .sockets
+        .get_mut::<tcp::Socket>(handle)
+        .connect(context, gateway(port), 49_155)
+        .unwrap();
+    let mut received = Vec::new();
+    guest.until("all the data", |guest| {
+        let socket = guest.sockets.get_mut::<tcp::Socket>(handle);
+        while socket.can_recv() {
+            socket
+                .recv(|chunk| {
+                    received.extend_from_slice(chunk);
+                    (chunk.len(), ())
+                })
+                .unwrap();
+        }
+        received.len() == data.len()
+    });
+    assert!(received == data, "the data arrived intact");
+    assert_eq!(
+        guest.nic.received.dropped.load(Ordering::Relaxed),
+        0,
+        "frames dropped by the guest's NIC"
+    );
     server.join().unwrap();
 }
 

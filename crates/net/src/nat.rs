@@ -9,6 +9,9 @@
 //!   answered here; every other datagram goes out through a host UDP socket per flow.
 //! - **ARP and ping to the gateway:** smoltcp. ARP is only answered for the NAT's
 //!   own addresses (see [`Engine::guest_frame`]).
+//! - **Flow control:** while the guest's NIC is full, smoltcp sends nothing more, so
+//!   TCP data waits in its buffers instead of being dropped by the NIC; the NIC wakes
+//!   the engine when the guest makes room (see [`FrameSink::has_room`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -28,7 +31,7 @@ use smoltcp::wire::{
 };
 
 use crate::frames::{self, UdpDatagram};
-use crate::{FrameSink, NatConfig, NetBackend, dhcp, dns};
+use crate::{FrameSink, NatConfig, NetBackend, Waker, dhcp, dns};
 
 const TCP_BUFFER: usize = 256 * 1024;
 /// How much host data may wait for the guest per connection before reading pauses.
@@ -65,6 +68,8 @@ enum Event {
     UdpExpired {
         key: (u16, SocketAddrV4),
     },
+    /// The guest's NIC has room again.
+    Room,
     Stop,
 }
 
@@ -76,9 +81,14 @@ pub struct Nat {
 
 impl Nat {
     /// Starts the engine. Frames for the guest go to `sink`.
-    pub fn start(config: NatConfig, sink: FrameSink) -> std::io::Result<Self> {
+    pub fn start(config: NatConfig, sink: Arc<dyn FrameSink>) -> std::io::Result<Self> {
         let (events, receiver) = mpsc::channel();
         let engine_events = events.clone();
+        let waker_events = events.clone();
+        let waker: Waker = Arc::new(move || {
+            let _ = waker_events.send(Event::Room);
+        });
+        sink.set_waker(waker);
         let thread = thread::Builder::new()
             .name("net-nat".into())
             .spawn(move || Engine::new(config, sink, engine_events).run(receiver))?;
@@ -104,15 +114,15 @@ impl Drop for Nat {
     }
 }
 
-/// Frames queued between the engine and smoltcp.
-#[derive(Default)]
+/// smoltcp's device: frames from the guest wait in a queue, frames for the guest go
+/// straight to its NIC.
 struct Queues {
     from_guest: VecDeque<Vec<u8>>,
-    to_guest: VecDeque<Vec<u8>>,
+    sink: Arc<dyn FrameSink>,
 }
 
 struct Rx(Vec<u8>);
-struct Tx<'a>(&'a mut VecDeque<Vec<u8>>);
+struct Tx<'a>(&'a dyn FrameSink);
 
 impl RxToken for Rx {
     fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
@@ -124,7 +134,7 @@ impl TxToken for Tx<'_> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         let mut frame = vec![0u8; len];
         let result = f(&mut frame);
-        self.0.push_back(frame);
+        self.0.deliver(&frame);
         result
     }
 }
@@ -135,11 +145,11 @@ impl Device for Queues {
 
     fn receive(&mut self, _: Instant) -> Option<(Rx, Tx<'_>)> {
         let frame = self.from_guest.pop_front()?;
-        Some((Rx(frame), Tx(&mut self.to_guest)))
+        Some((Rx(frame), Tx(&*self.sink)))
     }
 
     fn transmit(&mut self, _: Instant) -> Option<Tx<'_>> {
-        Some(Tx(&mut self.to_guest))
+        self.sink.has_room().then(|| Tx(&*self.sink))
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -211,7 +221,7 @@ struct UdpFlow {
 
 struct Engine {
     config: NatConfig,
-    sink: FrameSink,
+    sink: Arc<dyn FrameSink>,
     events: Sender<Event>,
     iface: Interface,
     queues: Queues,
@@ -226,10 +236,13 @@ struct Engine {
 }
 
 impl Engine {
-    fn new(config: NatConfig, sink: FrameSink, events: Sender<Event>) -> Self {
+    fn new(config: NatConfig, sink: Arc<dyn FrameSink>, events: Sender<Event>) -> Self {
         let epoch = std::time::Instant::now();
         let gateway_mac = EthernetAddress(config.gateway_mac);
-        let mut queues = Queues::default();
+        let mut queues = Queues {
+            from_guest: VecDeque::new(),
+            sink: sink.clone(),
+        };
         let mut iface = Interface::new(
             Config::new(HardwareAddress::Ethernet(gateway_mac)),
             &mut queues,
@@ -266,13 +279,18 @@ impl Engine {
 
     fn run(mut self, events: Receiver<Event>) {
         loop {
-            let delay = self
-                .iface
-                .poll_delay(self.now(), &self.sockets)
-                .map_or(IDLE_POLL, |delay| {
-                    Duration::from_micros(delay.total_micros())
-                })
-                .min(IDLE_POLL);
+            // While the guest's NIC is full, smoltcp's timers can't send anything:
+            // wait for the NIC's wake-up instead.
+            let delay = if self.sink.has_room() {
+                self.iface
+                    .poll_delay(self.now(), &self.sockets)
+                    .map_or(IDLE_POLL, |delay| {
+                        Duration::from_micros(delay.total_micros())
+                    })
+                    .min(IDLE_POLL)
+            } else {
+                IDLE_POLL
+            };
             let first = match events.recv_timeout(delay) {
                 Ok(event) => Some(event),
                 Err(RecvTimeoutError::Timeout) => None,
@@ -295,9 +313,6 @@ impl Engine {
         self.shuttle();
         let now = self.now();
         self.iface.poll(now, &mut self.queues, &mut self.sockets);
-        while let Some(frame) = self.queues.to_guest.pop_front() {
-            (self.sink)(&frame);
-        }
     }
 
     fn handle(&mut self, event: Event) -> bool {
@@ -330,6 +345,8 @@ impl Engine {
             Event::UdpExpired { key } => {
                 self.udp.remove(&key);
             }
+            // The step that follows sends what waited.
+            Event::Room => {}
             Event::Stop => return false,
         }
         true
@@ -628,7 +645,7 @@ impl Engine {
                     SocketAddrV4::new(Ipv4Addr::BROADCAST, 68),
                     &reply,
                 );
-                (self.sink)(&frame);
+                self.sink.deliver(&frame);
             }
             return;
         }
@@ -716,7 +733,7 @@ impl Engine {
             SocketAddrV4::new(self.config.guest, to_port),
             data,
         );
-        (self.sink)(&frame);
+        self.sink.deliver(&frame);
     }
 
     fn shut_down(&mut self) {

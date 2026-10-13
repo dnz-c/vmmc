@@ -4,8 +4,9 @@
 //! - **Transmit:** runs on the vCPU that notifies the queue; frames go straight to the
 //!   backend.
 //! - **Receive:** runs on whatever thread the backend delivers from. Frames go into the
-//!   driver's receive buffers; while it has none, a few wait and the rest are dropped,
-//!   as on a real NIC.
+//!   driver's receive buffers; while it has none, some wait and the rest are dropped,
+//!   as on a real NIC. While more than a few wait, the backend is told the NIC is full
+//!   (`FrameSink::has_room`) and woken once the driver posts buffers again.
 //!
 //! No offloads are offered: the guest computes its own checksums and segments.
 
@@ -13,7 +14,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use net::NetBackend;
+use net::{FrameSink, NetBackend, Waker};
 use virtio_queue::{Queue, QueueT};
 use vm_memory::GuestMemoryMmap;
 
@@ -30,6 +31,8 @@ const HEADER_LEN: usize = 12;
 const MAX_FRAME: usize = 65_550;
 /// Received frames kept while the driver has no buffers posted.
 const RX_BACKLOG: usize = 256;
+/// The backend holds frames back while this many wait for receive buffers.
+const RX_ROOM: usize = 32;
 
 const F_MAC: u64 = 1 << 5;
 const F_STATUS: u64 = 1 << 16;
@@ -48,6 +51,21 @@ struct Shared {
     active: Option<Active>,
     /// Frames for the guest that found no buffer yet.
     backlog: VecDeque<Vec<u8>>,
+    /// Wakes the backend, which found the NIC full, once there's room again.
+    waker: Option<Waker>,
+    backend_waiting: bool,
+}
+
+impl Shared {
+    /// Tells the backend there's room again, if it was waiting for that.
+    fn wake_backend(&mut self) {
+        if self.backend_waiting && self.backlog.len() < RX_ROOM {
+            self.backend_waiting = false;
+            if let Some(waker) = &self.waker {
+                waker();
+            }
+        }
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -65,13 +83,24 @@ pub struct VirtioNet {
 #[derive(Clone)]
 pub struct Receiver(Arc<Mutex<Shared>>);
 
-impl Receiver {
-    pub fn deliver(&self, frame: &[u8]) {
+impl FrameSink for Receiver {
+    fn deliver(&self, frame: &[u8]) {
         let mut shared = lock(&self.0);
         if shared.backlog.len() < RX_BACKLOG {
             shared.backlog.push_back(frame.to_vec());
         }
         flush_rx(&mut shared);
+    }
+
+    fn has_room(&self) -> bool {
+        let mut shared = lock(&self.0);
+        let room = shared.backlog.len() < RX_ROOM;
+        shared.backend_waiting |= !room;
+        room
+    }
+
+    fn set_waker(&self, waker: Waker) {
+        lock(&self.0).waker = Some(waker);
     }
 }
 
@@ -141,9 +170,17 @@ impl VirtioNet {
     }
 }
 
-/// Moves waiting frames into the driver's receive buffers.
+/// Moves waiting frames into the driver's receive buffers, then wakes the backend if
+/// it waits for room.
 fn flush_rx(shared: &mut Shared) {
-    let Shared { active, backlog } = shared;
+    deliver_backlog(shared);
+    shared.wake_backend();
+}
+
+fn deliver_backlog(shared: &mut Shared) {
+    let Shared {
+        active, backlog, ..
+    } = shared;
     let Some(active) = active.as_mut() else {
         backlog.clear();
         return;
@@ -236,6 +273,7 @@ impl VirtioDevice for VirtioNet {
         let mut shared = lock(&self.shared);
         shared.active = None;
         shared.backlog.clear();
+        shared.wake_backend();
     }
 }
 

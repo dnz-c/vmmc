@@ -5,16 +5,20 @@
 //! - **Configuration:** EEPROM reads through EERD (a minimal image with the MAC address
 //!   and a valid checksum), and PHY registers through MDIC (link always up at 1 Gb/s
 //!   full duplex).
-//! - **Receive:** one queue, legacy or extended descriptors.
-//! - **Transmit:** one queue, legacy, context and data descriptors, with IP/TCP/UDP
-//!   checksum insertion and TCP segmentation (TSO) done in software.
+//! - **Receive:** one queue, legacy or extended descriptors. Frames that find no free
+//!   descriptor wait; while more than a few wait, the backend is told the NIC is full
+//!   (`FrameSink::has_room`) and woken once the guest posts descriptors again.
+//! - **Transmit:** both of the part's queues, with legacy, context and data
+//!   descriptors, IP/TCP/UDP checksum insertion and TCP segmentation (TSO) done in
+//!   software. Windows' driver spreads packets over both queues, and resets the
+//!   adapter (link down and up) when one stops moving.
 //! - **Interrupts:** MSI when the guest enables it, otherwise INTA. No moderation:
 //!   causes are signalled at once.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use net::NetBackend;
+use net::{FrameSink, NetBackend, Waker};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 use crate::irq::{IrqLine, MsiMessage, MsiSink};
@@ -48,6 +52,11 @@ const TDBAH: usize = 0x3804;
 const TDLEN: usize = 0x3808;
 const TDH: usize = 0x3810;
 const TDT: usize = 0x3818;
+const TDBAL1: usize = 0x3900;
+const TDBAH1: usize = 0x3904;
+const TDLEN1: usize = 0x3908;
+const TDH1: usize = 0x3910;
+const TDT1: usize = 0x3918;
 const STATISTICS: std::ops::Range<usize> = 0x4000..0x4100;
 const GPRC: usize = 0x4074;
 const GPTC: usize = 0x4080;
@@ -88,6 +97,7 @@ const ICR_RXO: u32 = 1 << 6;
 const ICR_RXT0: u32 = 1 << 7;
 const ICR_RXQ0: u32 = 1 << 20;
 const ICR_TXQ0: u32 = 1 << 22;
+const ICR_TXQ1: u32 = 1 << 23;
 const ICR_INT_ASSERTED: u32 = 1 << 31;
 
 // Descriptor bits.
@@ -106,9 +116,50 @@ const DESCRIPTOR: u64 = 16;
 const MAX_TSO: usize = 256 * 1024;
 const MAX_FRAME: usize = 16 * 1024;
 const RX_BACKLOG: usize = 128;
+/// The backend holds frames back while this many wait for receive descriptors.
+const RX_ROOM: usize = 32;
 
 const PHY_ID1: u16 = 0x0141;
 const PHY_ID2: u16 = 0x0cb1;
+
+/// A transmit queue's registers, and the interrupt cause that's its own.
+struct TxRegisters {
+    base_low: usize,
+    base_high: usize,
+    len: usize,
+    head: usize,
+    tail: usize,
+    cause: u32,
+}
+
+const TX_QUEUES: [TxRegisters; 2] = [
+    TxRegisters {
+        base_low: TDBAL,
+        base_high: TDBAH,
+        len: TDLEN,
+        head: TDH,
+        tail: TDT,
+        cause: ICR_TXQ0,
+    },
+    TxRegisters {
+        base_low: TDBAL1,
+        base_high: TDBAH1,
+        len: TDLEN1,
+        head: TDH1,
+        tail: TDT1,
+        cause: ICR_TXQ1,
+    },
+];
+
+/// A transmit queue's offload context, and the packet its data descriptors are
+/// gathering. Each queue has its own: the driver fills them independently.
+#[derive(Default)]
+struct TxQueue {
+    context: Context,
+    packet: Vec<u8>,
+    packet_tse: bool,
+    packet_popts: u8,
+}
 
 /// The offload context the last context descriptor set up.
 #[derive(Clone, Copy, Default, Debug)]
@@ -130,13 +181,11 @@ struct State {
     eeprom: [u16; 64],
     phy: [u16; 32],
     memory: GuestMemoryMmap,
-    backend: Option<Arc<dyn NetBackend>>,
-    context: Context,
-    /// The packet being gathered from data descriptors, and its options.
-    packet: Vec<u8>,
-    packet_tse: bool,
-    packet_popts: u8,
+    tx: [TxQueue; 2],
     backlog: VecDeque<Vec<u8>>,
+    /// Wakes the backend, which found the NIC full, once there's room again.
+    waker: Option<Waker>,
+    backend_waiting: bool,
     sink: Arc<dyn MsiSink>,
     msi: Option<MsiMessage>,
     intx: Option<IrqLine>,
@@ -189,9 +238,9 @@ impl State {
             RAH0,
             u32::from(u16::from_le_bytes([mac[4], mac[5]])) | RAH_AV,
         );
-        self.context = Context::default();
-        self.packet.clear();
+        self.tx = Default::default();
         self.backlog.clear();
+        self.wake_backend();
         self.phy = phy_registers();
         // The link comes (back) up, which latches a link status change, as on real
         // hardware. It interrupts once the driver unmasks it, unless the driver
@@ -260,7 +309,7 @@ impl State {
             match register {
                 // Control: reset and restart autonegotiation self-clear.
                 0 => self.phy[0] = data & !((1 << 15) | (1 << 9)),
-                1 | 2 | 3 | 5 | 10 | 17 => {}
+                1 | 2 | 3 | 5 | 6 | 10 | 17 => {}
                 _ => self.phy[register] = data,
             }
             result |= u32::from(data);
@@ -286,17 +335,19 @@ impl State {
         (base, self.reg(len) / DESCRIPTOR as u32)
     }
 
-    /// Runs transmit descriptors from TDH up to TDT.
-    fn transmit(&mut self) {
+    /// Runs transmit queue `queue`'s descriptors from its head up to its tail, sending
+    /// the packets to `backend`.
+    fn transmit(&mut self, queue: usize, backend: Option<&dyn NetBackend>) {
         if self.reg(TCTL) & TCTL_EN == 0 {
             return;
         }
-        let (base, entries) = self.ring((TDBAL, TDBAH, TDLEN));
+        let registers = &TX_QUEUES[queue];
+        let (base, entries) = self.ring((registers.base_low, registers.base_high, registers.len));
         if entries == 0 {
             return;
         }
-        let mut head = self.reg(TDH) % entries;
-        let tail = self.reg(TDT) % entries;
+        let mut head = self.reg(registers.head) % entries;
+        let tail = self.reg(registers.tail) % entries;
         let mut written_back = false;
         while head != tail {
             let address = GuestAddress(base + u64::from(head) * DESCRIPTOR);
@@ -307,8 +358,9 @@ impl State {
             let dtyp_cmd = descriptor[11];
             let extended = dtyp_cmd & TX_CMD_DEXT != 0;
             let dtyp = (descriptor[10] >> 4) & 0xf;
+            let tx = &mut self.tx[queue];
             if extended && dtyp == 0 {
-                self.context = parse_context(&descriptor);
+                tx.context = parse_context(&descriptor);
             } else {
                 let (len, popts) = if extended {
                     let len = u32::from_le_bytes(descriptor[8..12].try_into().unwrap()) & 0xf_ffff;
@@ -320,26 +372,27 @@ impl State {
                     )
                 };
                 let buffer = u64::from_le_bytes(descriptor[..8].try_into().unwrap());
-                if self.packet.len() + len <= MAX_TSO {
-                    let start = self.packet.len();
-                    self.packet.resize(start + len, 0);
+                if tx.packet.len() + len <= MAX_TSO {
+                    let start = tx.packet.len();
+                    tx.packet.resize(start + len, 0);
                     if self
                         .memory
-                        .read_slice(&mut self.packet[start..], GuestAddress(buffer))
+                        .read_slice(&mut tx.packet[start..], GuestAddress(buffer))
                         .is_err()
                     {
-                        self.packet.truncate(start);
+                        tx.packet.truncate(start);
                     }
                 }
                 if extended {
-                    self.packet_tse |= dtyp_cmd & TX_CMD_TSE != 0;
-                    self.packet_popts |= popts;
+                    tx.packet_tse |= dtyp_cmd & TX_CMD_TSE != 0;
+                    tx.packet_popts |= popts;
                 }
                 if dtyp_cmd & TX_CMD_EOP != 0 {
-                    let packet = std::mem::take(&mut self.packet);
-                    self.send_packet(packet);
-                    self.packet_tse = false;
-                    self.packet_popts = 0;
+                    let packet = std::mem::take(&mut tx.packet);
+                    let (context, tse, popts) = (tx.context, tx.packet_tse, tx.packet_popts);
+                    tx.packet_tse = false;
+                    tx.packet_popts = 0;
+                    self.send_packet(backend, packet, &context, tse, popts);
                 }
             }
             // Write back "descriptor done" (the status byte), for every descriptor.
@@ -350,27 +403,32 @@ impl State {
             written_back = true;
             head = (head + 1) % entries;
         }
-        self.set(TDH, head);
+        self.set(registers.head, head);
         if written_back {
-            self.cause(ICR_TXDW | ICR_TXQ0);
+            self.cause(ICR_TXDW | registers.cause);
         }
     }
 
-    fn send_packet(&mut self, packet: Vec<u8>) {
-        let Some(backend) = self.backend.clone() else {
+    fn send_packet(
+        &mut self,
+        backend: Option<&dyn NetBackend>,
+        packet: Vec<u8>,
+        context: &Context,
+        tse: bool,
+        popts: u8,
+    ) {
+        let Some(backend) = backend else {
             return;
         };
-        let context = self.context;
         let mut sent = 0;
-        if self.packet_tse && context.mss > 0 && context.hdrlen > 0 && packet.len() > context.hdrlen
-        {
-            for segment in segment(&packet, &context, self.packet_popts) {
+        if tse && context.mss > 0 && context.hdrlen > 0 && packet.len() > context.hdrlen {
+            for segment in segment(&packet, context, popts) {
                 backend.send(&segment);
                 sent += 1;
             }
         } else {
             let mut packet = packet;
-            apply_checksums(&mut packet, &context, self.packet_popts, None);
+            apply_checksums(&mut packet, context, popts, None);
             backend.send(&packet);
             sent = 1;
         }
@@ -473,6 +531,17 @@ impl State {
         }
         if delivered {
             self.cause(ICR_RXT0 | ICR_RXQ0);
+        }
+        self.wake_backend();
+    }
+
+    /// Tells the backend there's room again, if it was waiting for that.
+    fn wake_backend(&mut self) {
+        if self.backend_waiting && self.backlog.len() < RX_ROOM {
+            self.backend_waiting = false;
+            if let Some(waker) = &self.waker {
+                waker();
+            }
         }
     }
 }
@@ -582,6 +651,9 @@ fn phy_registers() -> [u16; 32] {
     phy[3] = PHY_ID2;
     phy[4] = 0x0de1; // advertising 10/100 half and full, pause
     phy[5] = 0xcde1; // the partner: the same, acknowledged
+    // The partner autonegotiates, with next pages (which 1000BASE-T needs), as do we.
+    // Without this, Windows' driver warns of a duplex mismatch at every link-up.
+    phy[6] = 0x000d;
     phy[9] = 0x0300; // advertising 1000 full and half
     phy[10] = 0x3c00; // the partner can do 1000 full and half
     phy[15] = 0x3000; // 1000BASE-T full and half capable
@@ -612,8 +684,8 @@ fn eeprom(mac: [u8; 6]) -> [u16; 64] {
 #[derive(Clone)]
 pub struct Receiver(Arc<Mutex<State>>);
 
-impl Receiver {
-    pub fn deliver(&self, frame: &[u8]) {
+impl FrameSink for Receiver {
+    fn deliver(&self, frame: &[u8]) {
         let mut state = lock(&self.0);
         if frame.len() > MAX_FRAME || !state.accepts(frame) {
             return;
@@ -621,11 +693,27 @@ impl Receiver {
         if state.backlog.len() >= RX_BACKLOG {
             let missed = state.reg(0x4010).wrapping_add(1); // MPC
             state.set(0x4010, missed);
+            tracing::debug!(
+                head = state.reg(RDH),
+                tail = state.reg(RDT),
+                "e1000e: receive ring full, frame dropped"
+            );
             state.cause(ICR_RXO);
             return;
         }
         state.backlog.push_back(frame.to_vec());
         state.receive();
+    }
+
+    fn has_room(&self) -> bool {
+        let mut state = lock(&self.0);
+        let room = state.backlog.len() < RX_ROOM;
+        state.backend_waiting |= !room;
+        room
+    }
+
+    fn set_waker(&self, waker: Waker) {
+        lock(&self.0).waker = Some(waker);
     }
 }
 
@@ -633,6 +721,10 @@ pub struct E1000e {
     config: ConfigSpace,
     msi_capability: u16,
     state: Arc<Mutex<State>>,
+    /// Kept here, not in `state`: the backend's own thread holds `state` (through a
+    /// [`Receiver`]), so a backend in there would keep both alive for good, guest
+    /// memory included, every time the machine is rebuilt.
+    backend: Option<Arc<dyn NetBackend>>,
 }
 
 impl E1000e {
@@ -664,12 +756,10 @@ impl E1000e {
             eeprom: eeprom(mac),
             phy: phy_registers(),
             memory,
-            backend: None,
-            context: Context::default(),
-            packet: Vec::new(),
-            packet_tse: false,
-            packet_popts: 0,
+            tx: Default::default(),
             backlog: VecDeque::new(),
+            waker: None,
+            backend_waiting: false,
             sink,
             msi: None,
             intx,
@@ -679,6 +769,7 @@ impl E1000e {
             config,
             msi_capability,
             state: Arc::new(Mutex::new(state)),
+            backend: None,
         }
     }
 
@@ -687,10 +778,22 @@ impl E1000e {
     }
 
     pub fn set_backend(&mut self, backend: Arc<dyn NetBackend>) {
-        lock(&self.state).backend = Some(backend);
+        self.backend = Some(backend);
     }
 
+    /// Reads a register. Every access is traced (`VMMC_LOG=devices::nic::e1000e=trace`),
+    /// which shows what a driver does with the device.
     fn read_register(&self, offset: usize) -> u32 {
+        let value = self.read_register_inner(offset);
+        tracing::trace!(
+            offset = format_args!("{offset:#06x}"),
+            value = format_args!("{value:#010x}"),
+            "e1000e: read"
+        );
+        value
+    }
+
+    fn read_register_inner(&self, offset: usize) -> u32 {
         let mut state = lock(&self.state);
         match offset {
             STATUS => STATUS_LINK,
@@ -713,14 +816,21 @@ impl E1000e {
     }
 
     fn write_register(&self, offset: usize, value: u32) {
+        tracing::trace!(
+            offset = format_args!("{offset:#06x}"),
+            value = format_args!("{value:#010x}"),
+            "e1000e: write"
+        );
         let mut state = lock(&self.state);
         match offset {
             CTRL => {
                 if value & CTRL_RST != 0 {
+                    tracing::debug!("e1000e: the driver resets the device");
                     state.reset();
                 } else {
                     state.set(CTRL, value & !(CTRL_RST | CTRL_PHY_RST));
                     if value & CTRL_PHY_RST != 0 {
+                        tracing::debug!("e1000e: the driver resets the PHY");
                         state.phy = phy_registers();
                         state.cause(ICR_LSC);
                     }
@@ -757,14 +867,20 @@ impl E1000e {
                 state.set(RDT, value & 0xffff);
                 state.receive();
             }
-            RDH | TDH => state.set(offset, value & 0xffff),
+            RDH | TDH | TDH1 => state.set(offset, value & 0xffff),
             TCTL => {
                 state.set(TCTL, value);
-                state.transmit();
+                for queue in 0..TX_QUEUES.len() {
+                    state.transmit(queue, self.backend.as_deref());
+                }
             }
             TDT => {
                 state.set(TDT, value & 0xffff);
-                state.transmit();
+                state.transmit(0, self.backend.as_deref());
+            }
+            TDT1 => {
+                state.set(TDT1, value & 0xffff);
+                state.transmit(1, self.backend.as_deref());
             }
             o if o < REGISTER_BAR_SIZE as usize => state.set(o, value),
             _ => {}

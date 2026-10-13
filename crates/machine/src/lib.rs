@@ -536,11 +536,8 @@ impl<P: Partition + 'static> Machine<P> {
                     NicModel::Virtio => {
                         let mut device = VirtioNet::new(nic.mac);
                         let receiver = device.receiver();
-                        let nat = Nat::start(
-                            NatConfig::default(),
-                            Arc::new(move |frame: &[u8]| receiver.deliver(frame)),
-                        )
-                        .map_err(Error::Thread)?;
+                        let nat = Nat::start(NatConfig::default(), Arc::new(receiver))
+                            .map_err(Error::Thread)?;
                         device.set_backend(Arc::new(nat));
                         let mut pci =
                             VirtioPci::new(Box::new(device), vm.memory().clone(), sink.clone());
@@ -567,11 +564,8 @@ impl<P: Partition + 'static> Machine<P> {
                         let mut device =
                             E1000e::new(nic.mac, vm.memory().clone(), sink.clone(), Some(intx));
                         let receiver = device.receiver();
-                        let nat = Nat::start(
-                            NatConfig::default(),
-                            Arc::new(move |frame: &[u8]| receiver.deliver(frame)),
-                        )
-                        .map_err(Error::Thread)?;
+                        let nat = Nat::start(NatConfig::default(), Arc::new(receiver))
+                            .map_err(Error::Thread)?;
                         device.set_backend(Arc::new(nat));
                         if direct_boot {
                             device

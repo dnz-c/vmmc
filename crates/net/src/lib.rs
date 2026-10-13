@@ -20,8 +20,32 @@ pub trait NetBackend: Send + Sync {
     fn send(&self, frame: &[u8]);
 }
 
-/// Gives a frame to the guest NIC, which may drop it if its receive ring is full.
-pub type FrameSink = Arc<dyn Fn(&[u8]) + Send + Sync>;
+/// A guest NIC's receive side, where the NAT hands frames for the guest.
+pub trait FrameSink: Send + Sync {
+    /// Gives a frame to the guest. A NIC with no room left drops it.
+    fn deliver(&self, frame: &[u8]);
+
+    /// Whether the NIC has room for more frames now. Once it has said no, it calls
+    /// the waker given to [`FrameSink::set_waker`] when room frees up. The NAT holds
+    /// TCP data back meanwhile: a frame the NIC drops costs a retransmission, and
+    /// TCP stalls for a second or more before it retransmits.
+    fn has_room(&self) -> bool {
+        true
+    }
+
+    /// What to call when room frees up after [`FrameSink::has_room`] said no.
+    fn set_waker(&self, _waker: Waker) {}
+}
+
+/// Wakes the NAT; see [`FrameSink::set_waker`].
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
+
+/// A function as a sink that always has room.
+impl<F: Fn(&[u8]) + Send + Sync> FrameSink for F {
+    fn deliver(&self, frame: &[u8]) {
+        self(frame);
+    }
+}
 
 /// The guest's network, as the NAT presents it.
 #[derive(Clone, Debug)]
