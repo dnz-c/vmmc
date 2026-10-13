@@ -3,7 +3,9 @@
 //! Input goes to the guest byte for byte. Ctrl-A starts an escape: Ctrl-A x quits,
 //! Ctrl-A p presses the ACPI power button, Ctrl-A s saves a screenshot (with
 //! `--screenshot`), Ctrl-A r prints each vCPU's registers, Ctrl-A m saves guest RAM
-//! and vCPU state to a temp directory, Ctrl-A Ctrl-A sends a literal Ctrl-A.
+//! and vCPU state to a temp directory, Ctrl-A k switches between typing on the serial
+//! port and typing on the PS/2 keyboard (US layout), Ctrl-A Ctrl-A sends a literal
+//! Ctrl-A.
 
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +28,8 @@ pub const QUIT_CODE: u32 = 0;
 pub enum Input {
     /// Bytes for the guest's serial port.
     Guest(Vec<u8>),
+    /// Characters to type on the guest's keyboard.
+    Keys(Vec<u8>),
     PowerButton,
     Screenshot,
     DumpState,
@@ -37,40 +41,51 @@ pub enum Input {
 #[derive(Debug, Default)]
 pub struct EscapeFilter {
     after_ctrl_a: bool,
+    /// Input goes to the keyboard rather than the serial port (Ctrl-A k).
+    typing: bool,
 }
 
 impl EscapeFilter {
     pub fn filter(&mut self, input: &[u8]) -> Vec<Input> {
         let mut out = Vec::new();
         let mut bytes = Vec::new();
-        let flush = |bytes: &mut Vec<u8>, out: &mut Vec<Input>| {
+        let flush = |bytes: &mut Vec<u8>, out: &mut Vec<Input>, typing: bool| {
             if !bytes.is_empty() {
-                out.push(Input::Guest(std::mem::take(bytes)));
+                let bytes = std::mem::take(bytes);
+                out.push(if typing {
+                    Input::Keys(bytes)
+                } else {
+                    Input::Guest(bytes)
+                });
             }
         };
         for &byte in input {
             if std::mem::take(&mut self.after_ctrl_a) {
                 match byte {
                     b'x' | b'X' => {
-                        flush(&mut bytes, &mut out);
+                        flush(&mut bytes, &mut out, self.typing);
                         out.push(Input::Quit);
                         return out;
                     }
                     b'p' | b'P' => {
-                        flush(&mut bytes, &mut out);
+                        flush(&mut bytes, &mut out, self.typing);
                         out.push(Input::PowerButton);
                     }
                     b's' | b'S' => {
-                        flush(&mut bytes, &mut out);
+                        flush(&mut bytes, &mut out, self.typing);
                         out.push(Input::Screenshot);
                     }
                     b'r' | b'R' => {
-                        flush(&mut bytes, &mut out);
+                        flush(&mut bytes, &mut out, self.typing);
                         out.push(Input::DumpState);
                     }
                     b'm' | b'M' => {
-                        flush(&mut bytes, &mut out);
+                        flush(&mut bytes, &mut out, self.typing);
                         out.push(Input::SaveMemory);
+                    }
+                    b'k' | b'K' => {
+                        flush(&mut bytes, &mut out, self.typing);
+                        self.typing = !self.typing;
                     }
                     CTRL_A => bytes.push(CTRL_A),
                     // Unknown escapes are swallowed, like QEMU's.
@@ -82,7 +97,7 @@ impl EscapeFilter {
                 bytes.push(byte);
             }
         }
-        flush(&mut bytes, &mut out);
+        flush(&mut bytes, &mut out, self.typing);
         out
     }
 }
@@ -165,6 +180,7 @@ pub fn spawn_input(targets: Targets) -> io::Result<()> {
                 for input in filter.filter(&buffer[..read]) {
                     match input {
                         Input::Guest(pending) => send(&targets, pending),
+                        Input::Keys(text) => type_keys(&targets, &text),
                         Input::Screenshot => {
                             if let (Some(screenshots), Some(display)) =
                                 (&targets.screenshots, targets.display())
@@ -230,6 +246,55 @@ fn send(targets: &Targets, mut pending: Vec<u8>) {
         if target.stop.reason().is_some() {
             return;
         }
+    }
+}
+
+/// Types `text` on the guest's PS/2 keyboard, a key at a time.
+fn type_keys(targets: &Targets, text: &[u8]) {
+    const LEFT_SHIFT: u16 = 0x2a;
+    let Some(target) = targets.get() else { return };
+    for &byte in text {
+        let Some((scancode, shift)) = key_for(byte) else {
+            continue;
+        };
+        if shift {
+            target.ps2.key(LEFT_SHIFT, true);
+        }
+        target.ps2.key(scancode, true);
+        target.ps2.key(scancode, false);
+        if shift {
+            target.ps2.key(LEFT_SHIFT, false);
+        }
+        // About as fast as a person types quickly.
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The set 1 scan code for a character on a US keyboard, and whether it needs Shift.
+fn key_for(byte: u8) -> Option<(u16, bool)> {
+    const ROWS: [(&[u8], &[u8], u16); 4] = [
+        (b"1234567890-=", b"!@#$%^&*()_+", 0x02),
+        (b"qwertyuiop[]", b"QWERTYUIOP{}", 0x10),
+        (b"asdfghjkl;'`", b"ASDFGHJKL:\"~", 0x1e),
+        (b"zxcvbnm,./", b"ZXCVBNM<>?", 0x2c),
+    ];
+    for (plain, shifted, first) in ROWS {
+        if let Some(at) = plain.iter().position(|&c| c == byte) {
+            return Some((first + at as u16, false));
+        }
+        if let Some(at) = shifted.iter().position(|&c| c == byte) {
+            return Some((first + at as u16, true));
+        }
+    }
+    match byte {
+        b'\\' => Some((0x2b, false)),
+        b'|' => Some((0x2b, true)),
+        b' ' => Some((0x39, false)),
+        b'\r' | b'\n' => Some((0x1c, false)),
+        b'\t' => Some((0x0f, false)),
+        0x08 | 0x7f => Some((0x0e, false)),
+        0x1b => Some((0x01, false)),
+        _ => None,
     }
 }
 
@@ -361,6 +426,31 @@ mod tests {
     fn ctrl_a_r_dumps_state() {
         let mut filter = EscapeFilter::default();
         assert_eq!(filter.filter(b"\x01R"), [Input::DumpState]);
+    }
+
+    #[test]
+    fn ctrl_a_k_switches_input_to_the_keyboard_and_back() {
+        let mut filter = EscapeFilter::default();
+        assert_eq!(
+            filter.filter(b"ls\x01kvmmc\r\x01kpwd"),
+            [guest(b"ls"), Input::Keys(b"vmmc\r".to_vec()), guest(b"pwd")]
+        );
+    }
+
+    #[test]
+    fn characters_map_to_us_keyboard_scan_codes() {
+        assert_eq!(key_for(b'a'), Some((0x1e, false)));
+        assert_eq!(key_for(b'A'), Some((0x1e, true)));
+        assert_eq!(key_for(b'1'), Some((0x02, false)));
+        assert_eq!(key_for(b'0'), Some((0x0b, false)));
+        assert_eq!(key_for(b')'), Some((0x0b, true)));
+        assert_eq!(key_for(b'm'), Some((0x32, false)));
+        assert_eq!(key_for(b'/'), Some((0x35, false)));
+        assert_eq!(key_for(b'"'), Some((0x28, true)));
+        assert_eq!(key_for(b'~'), Some((0x29, true)));
+        assert_eq!(key_for(b' '), Some((0x39, false)));
+        assert_eq!(key_for(b'\r'), Some((0x1c, false)));
+        assert_eq!(key_for(0), None);
     }
 
     #[test]

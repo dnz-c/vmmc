@@ -67,6 +67,11 @@ linux-loader = { path = "third_party/linux-loader" }
 virtio-queue = { path = "third_party/virtio-queue" }
 
 # Unpacking the test initrd is far too slow unoptimized.
+# Dependencies are built optimized even in dev builds: the console window's renderer
+# (Slint) is unusably slow without, and they're rarely what's being debugged.
+[profile.dev.package."*"]
+opt-level = 2
+
 [profile.dev.package.ruzstd]
 opt-level = 3
 

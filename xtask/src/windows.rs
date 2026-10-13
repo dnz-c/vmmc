@@ -50,15 +50,22 @@ const CD_PROMPT_TIMEOUT: Duration = Duration::from_secs(180);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(90 * 60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(300);
 /// What the first-logon script must report, in order.
-const MARKERS: [&str; 7] = [
+const MARKERS: [&str; 10] = [
     "VMMC-WIN: booted",
     "VMMC-WIN: cpus=4",
     "VMMC-WIN: secureboot=True",
     "VMMC-WIN: tpm=True",
     "VMMC-WIN: usb-tablet=True",
+    "VMMC-WIN: screen=1920x1080",
+    KEYBOARD_READY,
+    "VMMC-WIN: keyboard=vmmc ps2",
     "VMMC-WIN: net=ok",
     "VMMC-WIN: done",
 ];
+/// The first-logon script waits for a line on the keyboard after this.
+const KEYBOARD_READY: &str = "VMMC-WIN: keyboard-ready";
+/// The resolution the display's EDID asks for, and Windows should end up in.
+const RESOLUTION: &str = "1920x1080";
 
 /// The first language `lang.ini` lists, as a tag like `de-DE`.
 fn parse_lang_ini(text: &str) -> Option<String> {
@@ -201,6 +208,7 @@ pub fn test() -> Result<(), String> {
         .arg(format!("{},nvme", disk.display()))
         .args(["--cpus", CPUS, "--memory", MEMORY_MIB])
         .args(["--nic", "e1000e"])
+        .args(["--resolution", RESOLUTION])
         .arg("--screenshot")
         .arg(dir.join("screens"))
         .args(["--screenshot-every", "30"]);
@@ -233,6 +241,11 @@ pub fn test() -> Result<(), String> {
         let mut at = at;
         for marker in MARKERS {
             at = vm.expect(marker, at, INSTALL_TIMEOUT)?;
+            if marker == KEYBOARD_READY {
+                // Typed on the PS/2 keyboard: Ctrl-A k switches the console to it,
+                // and back.
+                vm.send("\x01kvmmc ps2\r\x01k")?;
+            }
             if marker == MARKERS[0] {
                 eprintln!(
                     "xtask: installed and logged on after {}s",

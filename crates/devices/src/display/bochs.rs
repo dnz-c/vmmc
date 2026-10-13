@@ -3,19 +3,27 @@
 //! (QemuVideoDxe) and hands the framebuffer to the OS as GOP, which is all Windows'
 //! basic display driver needs; Linux has a DRM driver for it.
 //!
-//! - **BAR 0:** the framebuffer, 16 MiB, mapped into the guest as plain RAM so drawing
-//!   never exits. The device remaps it whenever the guest moves the BAR.
-//! - **BAR 2:** MMIO registers: the DISPI registers at 0x500 (16 bits each) and QEMU's
-//!   extension registers at 0x600 (framebuffer byte order).
+//! - **BAR 0:** the framebuffer, 32 MiB (enough for 3840x2160), mapped into the guest
+//!   as plain RAM so drawing never exits. The device remaps it whenever the guest moves
+//!   the BAR.
+//! - **BAR 2:** MMIO registers: an EDID at 0x000 naming the preferred resolution (OVMF
+//!   boots in it, Linux's driver prefers it, and Windows keeps the firmware's mode),
+//!   the DISPI registers at 0x500 (16 bits each) and QEMU's extension registers at
+//!   0x600 (framebuffer byte order).
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use vm_core::{MemoryAccess, RamMapper, RamRegion};
 
+use super::edid::{EDID_SIZE, edid};
 use crate::pci::{BarKind, ConfigSpace, Identity, PciDevice};
 
 pub const FRAMEBUFFER_BAR: u8 = 0;
-pub const FRAMEBUFFER_SIZE: u64 = 16 << 20;
+pub const FRAMEBUFFER_SIZE: u64 = 32 << 20;
+/// The largest preferred resolution the EDID offers: what fits the framebuffer.
+pub const MAX_PREFERRED: (u32, u32) = (3840, 2160);
+/// The smallest: what UEFI's graphics console needs.
+pub const MIN_PREFERRED: (u32, u32) = (640, 480);
 pub const MMIO_BAR: u8 = 2;
 pub const MMIO_SIZE: u64 = 0x1000;
 
@@ -76,6 +84,13 @@ pub struct Display {
 impl Display {
     /// The picture now, or `None` while no graphics mode is enabled.
     pub fn snapshot(&self) -> Option<Frame> {
+        self.capture(&mut Capture::default())
+    }
+
+    /// The picture, if it changed since `last` saw it; `None` when it didn't, or
+    /// while no graphics mode is enabled. Only a changed picture is converted, so
+    /// watching a still screen costs a copy and a compare.
+    pub fn capture(&self, last: &mut Capture) -> Option<Frame> {
         let registers = lock(&self.state).registers;
         if registers[ENABLE] & ENABLED == 0 {
             return None;
@@ -97,41 +112,82 @@ impl Display {
         {
             return None;
         }
-        let mut rgb = Vec::with_capacity((width * height * 3) as usize);
-        let mut row = vec![0u8; row_bytes as usize];
-        for y in 0..u64::from(height) {
+        let geometry = [
+            u64::from(width),
+            u64::from(height),
+            bytes_per_pixel,
+            stride,
+            start,
+        ];
+        let row_bytes = row_bytes as usize;
+        let mut raw = std::mem::take(&mut last.spare);
+        raw.resize(row_bytes * height as usize, 0);
+        for (y, row) in raw.chunks_exact_mut(row_bytes).enumerate() {
             self.framebuffer
-                .read((start + y * stride) as usize, &mut row);
-            for pixel in row.chunks(bytes_per_pixel as usize) {
-                match bytes_per_pixel {
-                    // Little-endian XRGB and RGB: blue first.
-                    4 | 3 => rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]),
-                    _ => {
-                        let value = u16::from_le_bytes([pixel[0], pixel[1]]);
-                        let (r, g, b) = (value >> 11, (value >> 5) & 0x3f, value & 0x1f);
-                        rgb.extend_from_slice(&[
-                            (r << 3 | r >> 2) as u8,
-                            (g << 2 | g >> 4) as u8,
-                            (b << 3 | b >> 2) as u8,
-                        ]);
-                    }
+                .read((start + y as u64 * stride) as usize, row);
+        }
+        if last.geometry == Some(geometry) && last.raw == raw {
+            last.spare = raw;
+            return None;
+        }
+        let mut rgb = vec![0u8; (width * height * 3) as usize];
+        match bytes_per_pixel {
+            // Little-endian XRGB and RGB: blue first.
+            4 | 3 => {
+                let pixels = raw.chunks_exact(bytes_per_pixel as usize);
+                for (out, pixel) in rgb.as_chunks_mut::<3>().0.iter_mut().zip(pixels) {
+                    *out = [pixel[2], pixel[1], pixel[0]];
+                }
+            }
+            _ => {
+                for (out, pixel) in rgb
+                    .as_chunks_mut::<3>()
+                    .0
+                    .iter_mut()
+                    .zip(raw.as_chunks::<2>().0)
+                {
+                    let value = u16::from_le_bytes(*pixel);
+                    let (r, g, b) = (value >> 11, (value >> 5) & 0x3f, value & 0x1f);
+                    *out = [
+                        (r << 3 | r >> 2) as u8,
+                        (g << 2 | g >> 4) as u8,
+                        (b << 3 | b >> 2) as u8,
+                    ];
                 }
             }
         }
+        last.geometry = Some(geometry);
+        last.spare = std::mem::replace(&mut last.raw, raw);
         Some(Frame { width, height, rgb })
     }
+}
+
+/// What [`Display::capture`] saw last.
+#[derive(Default)]
+pub struct Capture {
+    /// Width, height, bytes per pixel, stride and start of the last picture.
+    geometry: Option<[u64; 5]>,
+    /// Its pixels as the framebuffer held them.
+    raw: Vec<u8>,
+    /// A buffer to read the next picture into.
+    spare: Vec<u8>,
 }
 
 pub struct BochsDisplay {
     config: ConfigSpace,
     display: Display,
+    edid: [u8; EDID_SIZE],
     mapper: RamMapper,
     /// Where the framebuffer is mapped into the guest now.
     mapped_at: Option<u64>,
 }
 
 impl BochsDisplay {
-    pub fn new(mapper: RamMapper) -> std::io::Result<Self> {
+    /// An adapter whose EDID prefers `resolution`, kept between [`MIN_PREFERRED`] and
+    /// [`MAX_PREFERRED`].
+    pub fn new(mapper: RamMapper, resolution: (u32, u32)) -> std::io::Result<Self> {
+        let width = resolution.0.clamp(MIN_PREFERRED.0, MAX_PREFERRED.0);
+        let height = resolution.1.clamp(MIN_PREFERRED.1, MAX_PREFERRED.1);
         let mut config = ConfigSpace::new(Identity {
             vendor_id: 0x1234,
             device_id: 0x1111,
@@ -160,6 +216,7 @@ impl BochsDisplay {
                 })),
                 framebuffer: RamRegion::new(FRAMEBUFFER_SIZE as usize)?,
             },
+            edid: edid(width, height),
             mapper,
             mapped_at: None,
         })
@@ -306,7 +363,7 @@ impl PciDevice for BochsDisplay {
                         }
                         QEXT..0x604 => QEXT_SIZE.to_le_bytes()[(at - QEXT) as usize],
                         0x604..0x608 => LITTLE_ENDIAN.to_le_bytes()[(at - 0x604) as usize],
-                        // No EDID: firmware picks its default resolution.
+                        at if at < EDID_SIZE as u64 => self.edid[at as usize],
                         _ => 0,
                     };
                 }
@@ -344,7 +401,7 @@ mod tests {
     use crate::pci::config;
 
     fn adapter() -> BochsDisplay {
-        BochsDisplay::new(RamMapper::detached()).unwrap()
+        BochsDisplay::new(RamMapper::detached(), (1280, 800)).unwrap()
     }
 
     fn write16(d: &mut BochsDisplay, index: usize, value: u16) {
@@ -375,7 +432,7 @@ mod tests {
     fn identifies_itself_the_way_firmware_checks() {
         let mut d = adapter();
         assert_eq!(read16(&mut d, ID) & 0xfff0, 0xb0c0);
-        assert_eq!(read16(&mut d, VIDEO_MEMORY_64K), 256, "16 MiB");
+        assert_eq!(read16(&mut d, VIDEO_MEMORY_64K), 512, "32 MiB");
         let mut class = [0u8; 4];
         d.config_read(config::REVISION, &mut class);
         assert_eq!(u32::from_le_bytes(class) >> 8, 0x03_80_00);
@@ -387,6 +444,42 @@ mod tests {
         assert_eq!(read16(&mut d, XRES), MAX_XRES);
         write16(&mut d, ENABLE, 0);
         assert_eq!(read16(&mut d, XRES), 0);
+    }
+
+    #[test]
+    fn capture_reports_only_changes() {
+        let mut d = adapter();
+        let display = d.display();
+        set_mode(&mut d, 4, 2, 32);
+        let mut last = Capture::default();
+        assert!(display.capture(&mut last).is_some(), "the first picture");
+        assert!(display.capture(&mut last).is_none(), "unchanged");
+        d.bar_write(FRAMEBUFFER_BAR, 0, &0x00ff_0000u32.to_le_bytes());
+        let frame = display.capture(&mut last).expect("a pixel changed");
+        assert_eq!(&frame.rgb[..3], &[0xff, 0, 0]);
+        assert!(display.capture(&mut last).is_none());
+        set_mode(&mut d, 2, 2, 32);
+        assert!(display.capture(&mut last).is_some(), "a new mode");
+    }
+
+    #[test]
+    fn the_edid_names_the_preferred_resolution() {
+        let mut d = BochsDisplay::new(RamMapper::detached(), (1920, 1080)).unwrap();
+        let mut edid = [0u8; EDID_SIZE];
+        d.bar_read(MMIO_BAR, 0, &mut edid);
+        assert_eq!(&edid[..2], &[0x00, 0xff], "where OVMF looks");
+        // As QemuVideoDxe reads it.
+        let width = u32::from(edid[56]) | (u32::from(edid[58] & 0xf0) << 4);
+        let height = u32::from(edid[59]) | (u32::from(edid[61] & 0xf0) << 4);
+        assert_eq!((width, height), (1920, 1080));
+        // Out of range: kept to what fits.
+        let mut d = BochsDisplay::new(RamMapper::detached(), (8000, 100)).unwrap();
+        d.bar_read(MMIO_BAR, 0, &mut edid);
+        assert_eq!(
+            u32::from(edid[56]) | (u32::from(edid[58] & 0xf0) << 4),
+            3840
+        );
+        assert_eq!(u32::from(edid[59]) | (u32::from(edid[61] & 0xf0) << 4), 480);
     }
 
     #[test]

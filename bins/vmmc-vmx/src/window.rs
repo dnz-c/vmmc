@@ -1,22 +1,24 @@
 //! The console window (`--display window`): the guest's screen, keyboard and pointer,
 //! and a toolbar, drawn by Slint's software renderer.
 //!
-//! - **Screen:** the display adapter's framebuffer, up to 60 times a second, scaled to
-//!   fit the window.
+//! - **Screen:** the display adapter's framebuffer, checked up to 60 times a second on
+//!   a thread of its own, and handed to the window only when it changed. The window
+//!   opens at the guest's resolution, one guest pixel per screen pixel, follows the
+//!   guest's mode changes, and scales the picture down if the user makes it smaller.
 //! - **Pointer:** the USB tablet, which is absolute, so the host pointer moves the
 //!   guest's and nothing is captured.
 //! - **Keyboard:** while a window of this process is in front, a low-level keyboard
 //!   hook sends physical scan codes to the PS/2 keyboard, Windows and Alt+Tab included.
 //!   Ctrl+Alt+Del never reaches a hook; the toolbar sends it.
 
-use std::cell::Cell;
 use std::collections::BTreeSet;
-use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use machine::{PAUSE, TABLET_MAX};
-use slint::{ComponentHandle, Image, Rgb8Pixel, SharedPixelBuffer, Timer, TimerMode};
+use machine::{Capture, MAX_PREFERRED, MIN_PREFERRED, PAUSE, TABLET_MAX};
+use slint::{ComponentHandle, Image, Rgb8Pixel, SharedPixelBuffer};
 use vm_core::StopReason;
 
 use crate::console::Targets;
@@ -44,7 +46,7 @@ slint::slint! {
 
         VerticalLayout {
             HorizontalBox {
-                height: 40px;
+                height: 40px; // TOOLBAR_HEIGHT
                 Button { text: "Ctrl+Alt+Del"; clicked => { root.ctrl-alt-del(); } }
                 Button { text: "Power button"; clicked => { root.power-button(); } }
                 Button { text: "Reset"; clicked => { root.reset(); } }
@@ -118,6 +120,40 @@ slint::slint! {
 /// Scan codes the toolbar's Ctrl+Alt+Del presses: left Ctrl, left Alt, Delete.
 const CTRL_ALT_DEL: [u16; 3] = [0x1d, 0x38, 0xe053];
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// The toolbar's height in logical pixels, as the Slint markup has it.
+const TOOLBAR_HEIGHT: f32 = 40.0;
+/// Resolutions the guest can be offered, largest first.
+const RESOLUTIONS: [(u32, u32); 12] = [
+    (3840, 2160),
+    (2560, 1600),
+    (2560, 1440),
+    (1920, 1200),
+    (1920, 1080),
+    (1680, 1050),
+    (1600, 900),
+    (1440, 900),
+    (1366, 768),
+    (1280, 800),
+    (1280, 720),
+    (1024, 768),
+];
+
+/// The largest of [`RESOLUTIONS`] that fits in `space` (width, height), or the
+/// smallest the firmware takes.
+fn largest_fitting(space: (u32, u32)) -> (u32, u32) {
+    RESOLUTIONS
+        .into_iter()
+        .filter(|&(w, h)| (w, h) <= MAX_PREFERRED && w >= MIN_PREFERRED.0 && h >= MIN_PREFERRED.1)
+        .find(|&(w, h)| w <= space.0 && h <= space.1)
+        .unwrap_or((1024, 768))
+}
+
+/// The resolution to give a guest shown in a window: the largest standard one that
+/// fits on the primary screen at one guest pixel per screen pixel, with the window's
+/// frame and toolbar.
+pub fn fitting_resolution() -> (u32, u32) {
+    largest_fitting(screen::space_for_picture(TOOLBAR_HEIGHT))
+}
 
 /// Where `(x, y)` in an `area`-sized view lands on the tablet, when a `frame`-sized
 /// picture is scaled to fit the view and centred (Slint's `contain`).
@@ -137,54 +173,29 @@ fn tablet_position(x: f32, y: f32, area: (f32, f32), frame: (u32, u32)) -> (u16,
 }
 
 /// Shows the window until it's closed or the VM ends (see [`close`]). Closing it asks
-/// the VM to stop.
+/// the VM to stop. `resolution` is the guest's, which the window opens at.
 pub fn run(
     targets: Targets,
     screenshots: Option<Arc<Screenshots>>,
     title: &str,
+    resolution: (u32, u32),
 ) -> Result<(), String> {
     let window = ConsoleWindow::new().map_err(|e| format!("can't open the window: {e}"))?;
-    window
-        .window()
-        .set_size(slint::LogicalSize::new(1024.0, 840.0));
+    fit_to_picture(&window, resolution);
     window.set_can_screenshot(screenshots.is_some());
     window.set_title_text(title.into());
 
-    // The frame size the pointer maps against: the last one shown.
-    let frame_size = Rc::new(Cell::new((1u32, 1u32)));
-    let timer = Timer::default();
-    {
-        let window = window.as_weak();
-        let targets = targets.clone();
-        let frame_size = frame_size.clone();
-        let mut last = Vec::new();
-        timer.start(TimerMode::Repeated, FRAME_INTERVAL, move || {
-            let (Some(window), Some(display)) = (window.upgrade(), targets.display()) else {
-                return;
-            };
-            if let Some(frame) = display.snapshot() {
-                // An unchanged picture isn't drawn again.
-                if frame.rgb == last && frame_size.get() == (frame.width, frame.height) {
-                    return;
-                }
-                let pixels = SharedPixelBuffer::<Rgb8Pixel>::clone_from_slice(
-                    &frame.rgb,
-                    frame.width,
-                    frame.height,
-                );
-                frame_size.set((frame.width, frame.height));
-                window.set_screen(Image::from_rgb8(pixels));
-                last = frame.rgb;
-            }
-        });
-    }
+    // The size of the picture shown, which the pointer maps against: width << 32 | height.
+    let frame_size = Arc::new(AtomicU64::new(pack(resolution)));
+    let capture = Capturer::start(targets.clone(), window.as_weak(), frame_size.clone());
 
     let wheel_targets = targets.clone();
     window.on_pointer(move |x, y, width, height, left, right, middle, wheel| {
         let Some(target) = wheel_targets.get() else {
             return;
         };
-        let (x, y) = tablet_position(x, y, (width, height), frame_size.get());
+        let frame = unpack(frame_size.load(Ordering::Relaxed));
+        let (x, y) = tablet_position(x, y, (width, height), frame);
         let buttons = u8::from(left) | (u8::from(right) << 1) | (u8::from(middle) << 2);
         target.usb.pointer(x, y, buttons, wheel);
     });
@@ -225,7 +236,7 @@ pub fn run(
     let hook = keyboard::install(targets.clone());
     let result = window.run().map_err(|e| format!("the window failed: {e}"));
     drop(hook);
-    drop(timer);
+    drop(capture);
     // Closing the window ends the VM.
     targets.quit();
     result
@@ -236,6 +247,144 @@ pub fn close() {
     let _ = slint::invoke_from_event_loop(|| {
         let _ = slint::quit_event_loop();
     });
+}
+
+fn pack((width, height): (u32, u32)) -> u64 {
+    (u64::from(width) << 32) | u64::from(height)
+}
+
+fn unpack(packed: u64) -> (u32, u32) {
+    ((packed >> 32) as u32, packed as u32)
+}
+
+/// Sizes the window to show a `picture`-sized frame at one pixel per screen pixel,
+/// below the toolbar, as far as the screen allows.
+fn fit_to_picture(window: &ConsoleWindow, picture: (u32, u32)) {
+    let scale = window.window().scale_factor();
+    let toolbar = (TOOLBAR_HEIGHT * scale).ceil() as u32;
+    let (space_w, space_h) = screen::space_for_picture(TOOLBAR_HEIGHT);
+    let (width, height) = (picture.0.min(space_w), picture.1.min(space_h));
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(width, height + toolbar));
+}
+
+/// Watches the guest's screen on a thread of its own and hands changed pictures to the
+/// window. Converting a frame takes a while (tens of milliseconds in a debug build);
+/// done on the window's thread, it left no time for input.
+struct Capturer {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Capturer {
+    fn start(
+        targets: Targets,
+        window: slint::Weak<ConsoleWindow>,
+        frame_size: Arc<AtomicU64>,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        // Set while a picture waits for the window to take it, so they don't queue up.
+        let pending = Arc::new(AtomicBool::new(false));
+        let thread = thread::Builder::new()
+            .name("screen-capture".into())
+            .spawn(move || {
+                let mut last = Capture::default();
+                while !stopping.load(Ordering::Relaxed) {
+                    thread::sleep(FRAME_INTERVAL);
+                    if pending.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    let Some(frame) = targets
+                        .display()
+                        .and_then(|display| display.capture(&mut last))
+                    else {
+                        continue;
+                    };
+                    let size = (frame.width, frame.height);
+                    let pixels = SharedPixelBuffer::<Rgb8Pixel>::clone_from_slice(
+                        &frame.rgb, size.0, size.1,
+                    );
+                    pending.store(true, Ordering::Release);
+                    let (window, pending, frame_size) =
+                        (window.clone(), pending.clone(), frame_size.clone());
+                    let posted = slint::invoke_from_event_loop(move || {
+                        pending.store(false, Ordering::Release);
+                        let Some(window) = window.upgrade() else {
+                            return;
+                        };
+                        // The guest changed its resolution: so does the window.
+                        if frame_size.swap(pack(size), Ordering::Relaxed) != pack(size) {
+                            fit_to_picture(&window, size);
+                        }
+                        window.set_screen(Image::from_rgb8(pixels));
+                    });
+                    if posted.is_err() {
+                        return;
+                    }
+                }
+            })
+            .ok();
+        Self { stop, thread }
+    }
+}
+
+impl Drop for Capturer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The host's screen.
+mod screen {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::HiDpi::{
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetSystemMetricsForDpi,
+        SetProcessDpiAwarenessContext,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SM_CYCAPTION, SM_CYSIZEFRAME, SPI_GETWORKAREA,
+        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+    };
+
+    /// The room for the guest's picture, in screen pixels, in a window on the primary
+    /// screen's work area: less the window's frame, its title bar and a toolbar
+    /// `toolbar` logical pixels high.
+    pub fn space_for_picture(toolbar: f32) -> (u32, u32) {
+        // SAFETY: plain calls; `area` is a valid out-pointer of the size SPI_GETWORKAREA
+        // writes.
+        unsafe {
+            // Real pixels from here on (the window library asks for the same); fails
+            // harmlessly if it's set already.
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            let mut area = RECT::default();
+            if SystemParametersInfoW(
+                SPI_GETWORKAREA,
+                0,
+                Some((&raw mut area).cast()),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            )
+            .is_err()
+            {
+                return (1280, 800);
+            }
+            let dpi = GetDpiForSystem();
+            let metric = |index| GetSystemMetricsForDpi(index, dpi).max(0) as u32;
+            let frame_x = metric(SM_CXSIZEFRAME) + metric(SM_CXPADDEDBORDER);
+            let frame_y = metric(SM_CYSIZEFRAME) + metric(SM_CXPADDEDBORDER);
+            let toolbar = (toolbar * dpi as f32 / 96.0).ceil() as u32;
+            let width = (area.right - area.left).max(0) as u32;
+            let height = (area.bottom - area.top).max(0) as u32;
+            (
+                width.saturating_sub(2 * frame_x),
+                height.saturating_sub(2 * frame_y + metric(SM_CYCAPTION) + toolbar),
+            )
+        }
+    }
 }
 
 /// The low-level keyboard hook, on a thread of its own. Windows calls a hook on the
@@ -489,6 +638,21 @@ mod keyboard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_largest_standard_resolution_that_fits_is_chosen() {
+        // A 1920x1080 screen at 100%, less the taskbar, frame, title bar and toolbar.
+        assert_eq!(largest_fitting((1904, 963)), (1600, 900));
+        // 2560x1440.
+        assert_eq!(largest_fitting((2544, 1323)), (1920, 1200));
+        // 3840x2160 at 150%: the picture still gets screen pixels one to one.
+        assert_eq!(largest_fitting((3824, 1994)), (2560, 1600));
+        assert_eq!(
+            largest_fitting((800, 600)),
+            (1024, 768),
+            "never below the floor"
+        );
+    }
 
     #[test]
     fn pointer_maps_across_the_picture_shown() {

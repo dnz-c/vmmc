@@ -33,6 +33,7 @@ fn config(cpus: u8, disks: Vec<DiskConfig>) -> MachineConfig {
         firmware: None,
         tpm: None,
         enlightenments: false,
+        resolution: (1280, 800),
     }
 }
 

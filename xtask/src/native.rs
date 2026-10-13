@@ -11,7 +11,7 @@ use std::process::Command;
 use crate::guests::{read, verify};
 
 const REPO: &str = "dnz-c/vmmc";
-const RELEASE: &str = "native-deps-4";
+const RELEASE: &str = "native-deps-5";
 
 /// `(file, SHA-256)` for each asset, from the release's SHA256SUMS.
 const ASSETS: [(&str, &str); 15] = [
@@ -37,7 +37,7 @@ const ASSETS: [(&str, &str); 15] = [
     // Secure Boot on, with Microsoft's keys and a platform key made by that build.
     (
         "OVMF_VARS.secboot.fd",
-        "4fcb01d99e64f5424bbe3c0a9b1f2a60b928aa201c080eaee45adb99c033c367",
+        "c7ac05c3dd0b6be3eaf765b72ce0b8a607d1f47e81782d45180158bafa1f41db",
     ),
     (
         "OVMF-LICENSE.txt",
@@ -50,23 +50,23 @@ const ASSETS: [(&str, &str); 15] = [
     // The TPM: ms-tpm-20-ref's libraries and OpenSSL's libcrypto, all static.
     (
         "tpm-Tpm_CoreLib.lib",
-        "44d0bdc2180f047dc72d3b6500ced0f83df7ad633ee55c5e0d556bbb190fea14",
+        "aed571f5dbcc21dac21990833901665c555daf5101cae85e4f2e7b71d08393c8",
     ),
     (
         "tpm-Tpm_CryptoLib_Math_Ossl.lib",
-        "be67a5155ad663d67b29ecbd1b9a895c522c77283de16216f88925c9a5416692",
+        "eae92d8998a2a56fd38752e0e5b6fbdc8ffbf3cfa9798a7317043066ba291264",
     ),
     (
         "tpm-Tpm_CryptoLib_TpmBigNum.lib",
-        "78011fcd35e54a004a2197673323dd8274f61c14e403cbd06c8571d16cbd1acf",
+        "ca52508c6b8e8ab0e37c004ef588e0c0f92acdcfd5a419949d451d9bc6e385b5",
     ),
     (
         "tpm-Tpm_PlatformLib.lib",
-        "75a5b17a9b4c2ac33bc07a69bc34b39156a4d0094f389ca0f93b426a09bfcec6",
+        "d58dbfdf6455153b599fab52cbeaead5afb5168d915464b72dd3881509945999",
     ),
     (
         "tpm-libcrypto.lib",
-        "37730ba588a3c27e123c688b41a461e4c860f97dbbf0c030cd56d0367835e7f0",
+        "0f7ebcc6e0bb812543d4219decf4d66d815b940487c2a02cf190964a83dfc4e7",
     ),
     (
         "TPM-REF-LICENSE.txt",
@@ -78,7 +78,7 @@ const ASSETS: [(&str, &str); 15] = [
     ),
     (
         "TPM-BUILD-INFO.txt",
-        "33e528672efa6b23ad6360ef6356478c05f6bd4451364132cef5dc3b4d5afc14",
+        "702dfdc7c016a505e6db298e7fa39a47bd0d85e3c1355bcc0ab85995d9472c48",
     ),
 ];
 

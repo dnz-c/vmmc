@@ -38,6 +38,34 @@ try {
     $mice = $present | Where-Object { $_.Class -eq 'Mouse' -and $_.Status -eq 'OK' }
     Mark "usb-tablet=$([bool]$tablet) mice=$(@($mice).Count)"
 
+    # The screen Windows draws on: the firmware's mode, which the display's EDID chose.
+    Add-Type -AssemblyName System.Windows.Forms
+    $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    Mark "screen=$($screen.Width)x$($screen.Height)"
+
+    # The PS/2 keyboard: xtask types a line into a focused text box once it sees
+    # keyboard-ready, and the box reports what arrived.
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'vmmc keyboard test'
+    $form.TopMost = $true
+    $box = New-Object System.Windows.Forms.TextBox
+    $box.Dock = 'Fill'
+    $script:entered = $false
+    $box.Add_KeyDown({ if ($_.KeyCode -eq 'Return') { $script:entered = $true } })
+    $form.Controls.Add($box)
+    $form.Show()
+    $form.Activate()
+    [void]$box.Focus()
+    [System.Windows.Forms.Application]::DoEvents()
+    Mark 'keyboard-ready'
+    $deadline = (Get-Date).AddSeconds(60)
+    while (-not $script:entered -and (Get-Date) -lt $deadline) {
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 50
+    }
+    Mark "keyboard=$($box.Text)"
+    $form.Close()
+
     $disk = Get-Disk -Number 0
     Mark "disk=$($disk.BusType) $([math]::Round($disk.Size / 1GB))GB"
 

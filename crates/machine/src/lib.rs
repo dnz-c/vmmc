@@ -25,7 +25,7 @@ use devices::clock::{Clock, HostClock};
 use devices::display::bochs::{
     BochsDisplay, FRAMEBUFFER_BAR, FRAMEBUFFER_SIZE, MMIO_BAR, MMIO_SIZE,
 };
-pub use devices::display::bochs::{Display, Frame};
+pub use devices::display::bochs::{Capture, Display, Frame, MAX_PREFERRED, MIN_PREFERRED};
 use devices::firmware::fw_cfg::{self, FW_CFG_BASE, FW_CFG_PORTS, FwCfg};
 use devices::firmware::pflash::Pflash;
 use devices::irq::{IrqLine, MsiSink};
@@ -189,6 +189,8 @@ pub struct MachineConfig {
     pub tpm: Option<SharedTpm>,
     /// Expose the hypervisor's Hyper-V enlightenments to the guest.
     pub enlightenments: bool,
+    /// The screen resolution the display's EDID prefers, which the firmware boots in.
+    pub resolution: (u32, u32),
 }
 
 /// How a run ended.
@@ -420,7 +422,8 @@ impl<P: Partition + 'static> Machine<P> {
                     .ok_or_else(|| Error::Config("out of PCI address space".into()))
             };
 
-            let mut adapter = BochsDisplay::new(vm.ram_mapper()).map_err(Error::Display)?;
+            let mut adapter =
+                BochsDisplay::new(vm.ram_mapper(), config.resolution).map_err(Error::Display)?;
             display = adapter.display();
             if direct_boot {
                 for (bar, size) in [(FRAMEBUFFER_BAR, FRAMEBUFFER_SIZE), (MMIO_BAR, MMIO_SIZE)] {

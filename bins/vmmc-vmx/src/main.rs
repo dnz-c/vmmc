@@ -83,6 +83,11 @@ struct RunArgs {
     /// Show the screen in a window, which also takes keyboard and pointer input.
     #[arg(long, value_enum, default_value_t = DisplayMode::None)]
     display: DisplayMode,
+    /// The guest's screen resolution, which its firmware boots in and its display
+    /// driver prefers [default: with a window, the largest standard resolution that
+    /// fits on the screen; without, 1280x800].
+    #[arg(long, value_name = "WxH", value_parser = parse_resolution)]
+    resolution: Option<(u32, u32)>,
     /// Exit when the guest resets, rather than restarting it.
     #[arg(long)]
     no_reboot: bool,
@@ -127,6 +132,31 @@ impl TpmBackend for VmTpm {
     fn reset(&mut self) {
         self.0.reset();
     }
+}
+
+/// The resolution of a VM without a window.
+const HEADLESS_RESOLUTION: (u32, u32) = (1280, 800);
+
+/// `WxH`, within what the display adapter offers.
+fn parse_resolution(text: &str) -> Result<(u32, u32), String> {
+    let (width, height) = text
+        .split_once(['x', 'X'])
+        .ok_or_else(|| format!("{text:?} isn't WIDTHxHEIGHT"))?;
+    let parse = |value: &str| {
+        value
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| format!("{text:?} isn't WIDTHxHEIGHT"))
+    };
+    let (width, height) = (parse(width)?, parse(height)?);
+    let (min, max) = (machine::MIN_PREFERRED, machine::MAX_PREFERRED);
+    if !(min.0..=max.0).contains(&width) || !(min.1..=max.1).contains(&height) {
+        return Err(format!(
+            "the resolution must be between {}x{} and {}x{}",
+            min.0, min.1, max.0, max.1
+        ));
+    }
+    Ok((width, height))
 }
 
 /// The MAC address of a directly booted VM's first NIC (QEMU's usual one).
@@ -372,6 +402,11 @@ fn run(args: RunArgs) -> Result<RunOutcome, Box<dyn Error>> {
         Boot::Linux { .. } => "vmmc".into(),
     };
     let display = args.display;
+    let resolution = match (args.resolution, display) {
+        (Some(resolution), _) => resolution,
+        (None, DisplayMode::Window) => window::fitting_resolution(),
+        (None, DisplayMode::None) => HEADLESS_RESOLUTION,
+    };
     let vm_targets = targets.clone();
     let vm_screenshots = screenshots.clone();
     let run_vm = move || -> Result<RunOutcome, String> {
@@ -380,6 +415,7 @@ fn run(args: RunArgs) -> Result<RunOutcome, Box<dyn Error>> {
             &args,
             &boot,
             memory,
+            resolution,
             &nics,
             tpm.as_ref(),
             &vm_targets,
@@ -396,7 +432,7 @@ fn run(args: RunArgs) -> Result<RunOutcome, Box<dyn Error>> {
                 window::close();
                 outcome
             });
-            let shown = window::run(targets.clone(), screenshots.clone(), &title);
+            let shown = window::run(targets.clone(), screenshots.clone(), &title, resolution);
             let outcome = vm
                 .join()
                 .unwrap_or_else(|_| Err("the VM thread panicked".into()));
@@ -414,6 +450,7 @@ fn run_machines(
     args: &RunArgs,
     boot: &Boot,
     memory: u64,
+    resolution: (u32, u32),
     nics: &[NicConfig],
     tpm: Option<&SharedTpm>,
     targets: &console::Targets,
@@ -435,6 +472,7 @@ fn run_machines(
                 firmware: boot.firmware_config()?,
                 tpm: tpm.cloned(),
                 enlightenments: args.enlightenments,
+                resolution,
             },
         )?;
         if let Boot::Linux {
@@ -541,6 +579,15 @@ mod tests {
         assert_eq!(disks[0].interface, DiskInterface::Cdrom);
         assert!(disks[0].read_only);
         assert_eq!(disks[1].interface, DiskInterface::Sata);
+    }
+
+    #[test]
+    fn resolutions_parse_within_the_adapter_limits() {
+        assert_eq!(parse_resolution("1920x1080"), Ok((1920, 1080)));
+        assert_eq!(parse_resolution("2560X1440"), Ok((2560, 1440)));
+        assert!(parse_resolution("1920").is_err());
+        assert!(parse_resolution("320x200").is_err());
+        assert!(parse_resolution("7680x4320").is_err());
     }
 
     #[test]

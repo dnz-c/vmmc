@@ -13,7 +13,7 @@ mod windows;
 use std::env;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Command, ExitCode};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -42,16 +42,19 @@ tasks:
 const LINUX_TIMEOUT: Duration = Duration::from_secs(90);
 const LINUX_CPUS: &str = "4";
 /// What the test guest's init prints when everything works, in order.
-const LINUX_MARKERS: [&str; 8] = [
+const LINUX_MARKERS: [&str; 9] = [
     "VMMC-TEST: booted",
     "VMMC-TEST: cpus=4",
     "VMMC-TEST: efi=no",
     "VMMC-TEST: disk=ok vda",
     "VMMC-TEST: usb=tablet,keyboard",
+    "VMMC-TEST: keyboard=vmmc ps2",
     "VMMC-TEST: net=ok",
     "VMMC-TEST: dns=ok",
     "VMMC-TEST: done",
 ];
+/// What the Linux test types on the guest's PS/2 keyboard.
+const KEYBOARD_LINE: &str = "vmmc ps2";
 /// What the host's test web server answers, and the guest checks for.
 pub(crate) const HTTP_BODY: &str = "vmmc net ok";
 
@@ -140,8 +143,8 @@ fn boot_test() -> Result<(), String> {
     firmware::cd_test()
 }
 
-/// Boots the test Linux guest headless and checks it reports a working SMP boot and
-/// disk, then powers off cleanly.
+/// Boots the test Linux guest headless and checks what it reports: SMP, the disk, USB,
+/// a line typed on the PS/2 keyboard, and the network. Then it powers off.
 fn linux_boot_test() -> Result<(), String> {
     let workspace = workspace();
     let guest = guests::prepare(&workspace)?;
@@ -151,43 +154,27 @@ fn linux_boot_test() -> Result<(), String> {
     let mut command = vmmc_vmx_command(
         &exe,
         &guest,
-        &format!("console=ttyS0 panic=-1 vmmc.http={http} vmmc.usb"),
+        &format!("console=ttyS0 panic=-1 vmmc.http={http} vmmc.usb vmmc.keyboard"),
     );
     command.args(["--nic", "virtio"]);
-    command.stdin(Stdio::null()).stdout(Stdio::piped());
     eprintln!("$ {command:?}");
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("can't start {}: {e}", exe.display()))?;
-
-    // Echo the guest console while collecting it.
-    let mut stdout = child.stdout.take().expect("stdout is piped");
-    let reader = thread::spawn(move || {
-        let mut all = Vec::new();
-        let mut chunk = [0u8; 4096];
-        while let Ok(read @ 1..) = stdout.read(&mut chunk) {
-            let _ = std::io::stdout().write_all(&chunk[..read]);
-            all.extend_from_slice(&chunk[..read]);
-        }
-        String::from_utf8_lossy(&all).into_owned()
-    });
-
+    let mut vm = firmware::Session::spawn(command)?;
     let deadline = Instant::now() + LINUX_TIMEOUT;
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            break status;
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!(
-                "the Linux guest didn't power off within {}s",
-                LINUX_TIMEOUT.as_secs()
-            ));
-        }
-        thread::sleep(Duration::from_millis(100));
+    let typed = (|| {
+        let at = vm.expect("VMMC-TEST: keyboard-ready", 0, LINUX_TIMEOUT)?;
+        // Ctrl-A k switches the console to the PS/2 keyboard, and back.
+        vm.send(&format!("\x01k{KEYBOARD_LINE}\r\x01k"))?;
+        vm.expect("VMMC-TEST: keyboard=", at, LINUX_TIMEOUT)
+    })();
+    let status = vm.wait(deadline.saturating_duration_since(Instant::now()));
+    let output = vm.text(0, vm.len());
+    typed?;
+    let Some(status) = status else {
+        return Err(format!(
+            "the Linux guest didn't power off within {}s",
+            LINUX_TIMEOUT.as_secs()
+        ));
     };
-    let output = reader.join().map_err(|_| "console reader panicked")?;
 
     let mut rest = output.as_str();
     for marker in LINUX_MARKERS {

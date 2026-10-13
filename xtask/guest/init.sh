@@ -102,6 +102,15 @@ if grep -q vmmc.usb /proc/cmdline; then
     esac
 fi
 
+# The PS/2 keyboard (vmmc.keyboard): xtask types a line on it, which reaches the first
+# virtual console through the kernel's i8042 and keyboard drivers.
+if grep -q vmmc.keyboard /proc/cmdline; then
+    line=
+    echo "VMMC-TEST: keyboard-ready"
+    read -r -t 20 line </dev/tty1
+    echo "VMMC-TEST: keyboard=$line"
+fi
+
 # The TPM (vmmc.tpm): a TPM 2.0, with PCR 0 extended by the firmware's measurements,
 # and the physical presence interface version the ACPI _DSM reports.
 if grep -q vmmc.tpm /proc/cmdline; then

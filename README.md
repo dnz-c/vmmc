@@ -97,13 +97,21 @@ add `--screenshot-every SECS` for a timed series.
 `--enlightenments` exposes Hyper-V's paravirtual interfaces (reference TSC page, synthetic
 timers, hypercalls for TLB flushes and IPIs), which the Windows hypervisor implements
 itself; Windows guests use them.
-`--display window` shows the guest's screen in a window:
+`--display window` shows the guest's screen in a window, one guest pixel per screen
+pixel, and follows the guest when it changes resolution:
 - **Pointer:** the host pointer drives a USB tablet, so it moves freely in and out.
 - **Keyboard:** while the window is in front, every key goes to the guest, the Windows
   key and Alt+Tab included.
 - **Toolbar:** Ctrl+Alt+Del (which Windows never lets an application intercept),
   the ACPI power button, reset, a screenshot (with `--screenshot`), and About.
 - **Closing:** closing the window stops the VM.
+
+`--resolution WxH` sets the resolution the display offers the guest (its EDID), which
+the firmware boots in, Windows keeps (it has no driver for this display yet) and Linux
+prefers. Without it, a VM with a window gets the largest standard resolution that fits
+on your screen, and one without gets 1280x800.
+For everyday use, run a release build (`cargo run --release -p vmmc-vmx -- run ...`):
+dev builds optimize their dependencies, but vmmc's own device code runs unoptimized.
 
 Or a Linux kernel, booted directly:
 
@@ -115,8 +123,9 @@ cargo run -p vmmc-vmx -- run --kernel bzImage --initrd initramfs.cpio `
 The guest's serial console is the terminal. **Ctrl-A x** quits, **Ctrl-A p** presses the
 ACPI power button, **Ctrl-A r** prints each vCPU's registers and the code at its RIP
 (for finding where a hung guest is stuck), **Ctrl-A m** saves guest RAM and every vCPU's
-state to a new `vmmc-memory-*` directory in the temp directory, and **Ctrl-A Ctrl-A**
-sends a Ctrl-A to the guest.
+state to a new `vmmc-memory-*` directory in the temp directory, **Ctrl-A k** switches
+between typing on the serial port and typing on the guest's PS/2 keyboard (US layout),
+and **Ctrl-A Ctrl-A** sends a Ctrl-A to the guest.
 `VMMC_LOG=debug` turns on logging to stderr.
 
 When the guest resets, the VM restarts; `--no-reboot` makes it exit instead. Exit
