@@ -7,8 +7,9 @@
 //!   guest's mode changes, and scales the picture down if the user makes it smaller.
 //! - **Pointer:** the USB tablet, which is absolute, so the host pointer moves the
 //!   guest's and nothing is captured.
-//! - **Keyboard:** while a window of this process is in front, a low-level keyboard
-//!   hook sends physical scan codes to the PS/2 keyboard, Windows and Alt+Tab included.
+//! - **Keyboard:** while the window (or its About popup) is in front, a low-level
+//!   keyboard hook sends physical scan codes to the PS/2 keyboard, Windows and Alt+Tab
+//!   included.
 //!   Ctrl+Alt+Del never reaches a hook; the toolbar sends it.
 
 use std::collections::BTreeSet;
@@ -233,9 +234,11 @@ pub fn run(
         }
     });
 
-    let hook = keyboard::install(targets.clone());
+    let hook = keyboard::install(targets.clone(), keyboard::current_thread());
     let result = window.run().map_err(|e| format!("the window failed: {e}"));
     drop(hook);
+    // After the guest's output, which can clear the terminal, so it stays readable.
+    eprint!("\r\nvmmc-vmx: {}\r\n", keyboard::summary());
     drop(capture);
     // Closing the window ends the VM.
     targets.quit();
@@ -393,36 +396,104 @@ mod screen {
 /// machine, whose locks it may have to wait for.
 mod keyboard {
     use std::cell::RefCell;
+    use std::sync::atomic::{AtomicIsize, AtomicU32};
     use std::sync::mpsc::{self, Sender};
     use std::thread::{self, JoinHandle};
 
     use super::*;
-    use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Threading::{
-        GetCurrentProcessId, GetCurrentThread, GetCurrentThreadId, SetThreadInformation,
-        SetThreadPriority, THREAD_POWER_THROTTLING_CURRENT_VERSION,
-        THREAD_POWER_THROTTLING_EXECUTION_SPEED, THREAD_POWER_THROTTLING_STATE,
-        THREAD_PRIORITY_TIME_CRITICAL, ThreadPowerThrottling,
+        GetCurrentProcessId, GetCurrentThreadId, OpenProcess, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, VK_NUMLOCK, VK_PAUSE,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW,
+        CallNextHookEx, DispatchMessageW, GetClassNameW, GetForegroundWindow, GetMessageW,
         GetWindowThreadProcessId, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP, MSG,
         PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
         WH_KEYBOARD_LL, WM_QUIT,
     };
 
-    /// The hook's state, on its thread: where keys go, and the keys the guest holds.
+    /// The hook's state, on its thread: where keys go, the keys the guest holds, and
+    /// the thread whose windows are the console window's.
     struct Sink {
         keys: Sender<(u16, bool)>,
         pressed: BTreeSet<u16>,
+        ui_thread: u32,
+    }
+
+    /// The calling thread's ID, for [`install`]'s `ui_thread`.
+    pub fn current_thread() -> u32 {
+        // SAFETY: a plain call.
+        unsafe { GetCurrentThreadId() }
     }
 
     thread_local! {
         static SINK: RefCell<Option<Sink>> = const { RefCell::new(None) };
+    }
+
+    // What the hook saw, for the summary printed when the window closes.
+    static EVENTS: AtomicU64 = AtomicU64::new(0);
+    static IN_FRONT: AtomicU64 = AtomicU64::new(0);
+    static DELIVERED: AtomicU64 = AtomicU64::new(0);
+    /// The window in front, and its process, the last time it wasn't ours.
+    static OTHER_WINDOW: AtomicIsize = AtomicIsize::new(0);
+    static OTHER_PROCESS: AtomicU32 = AtomicU32::new(0);
+
+    /// What the keyboard hook saw and passed on, for finding out why keys don't
+    /// reach the guest.
+    pub fn summary() -> String {
+        let mut text = format!(
+            "keyboard: {} key events seen, {} with this window in front, {} delivered to the guest",
+            EVENTS.load(Ordering::Relaxed),
+            IN_FRONT.load(Ordering::Relaxed),
+            DELIVERED.load(Ordering::Relaxed)
+        );
+        let process = OTHER_PROCESS.load(Ordering::Relaxed);
+        if process != 0 {
+            let window = HWND(OTHER_WINDOW.load(Ordering::Relaxed) as *mut _);
+            text += &format!(
+                "; otherwise in front: {:?} of process {process} ({}), this process is {}",
+                class_name(window),
+                process_name(process),
+                // SAFETY: a plain call.
+                unsafe { GetCurrentProcessId() }
+            );
+        }
+        text
+    }
+
+    fn class_name(window: HWND) -> String {
+        let mut buffer = [0u16; 128];
+        // SAFETY: `buffer` is a valid out-buffer; a stale handle just fails.
+        let len = unsafe { GetClassNameW(window, &mut buffer) };
+        String::from_utf16_lossy(&buffer[..len.max(0) as usize])
+    }
+
+    fn process_name(process: u32) -> String {
+        let mut buffer = [0u16; 512];
+        let mut len = buffer.len() as u32;
+        // SAFETY: plain calls; `buffer` and `len` describe a valid out-buffer, and the
+        // handle is closed after use.
+        unsafe {
+            let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process) else {
+                return "?".into();
+            };
+            let named = QueryFullProcessImageNameW(
+                handle,
+                PROCESS_NAME_WIN32,
+                windows::core::PWSTR(buffer.as_mut_ptr()),
+                &mut len,
+            );
+            let _ = CloseHandle(handle);
+            if named.is_err() {
+                return "?".into();
+            }
+        }
+        String::from_utf16_lossy(&buffer[..len as usize])
     }
 
     /// The hook's threads; dropping it unhooks and ends them.
@@ -444,7 +515,8 @@ mod keyboard {
         }
     }
 
-    pub fn install(targets: Targets) -> Option<Hook> {
+    /// Hooks the keyboard for the window that thread `ui_thread` runs.
+    pub fn install(targets: Targets, ui_thread: u32) -> Option<Hook> {
         let (keys, queued) = mpsc::channel::<(u16, bool)>();
         let delivery = thread::Builder::new()
             .name("keyboard-keys".into())
@@ -453,6 +525,7 @@ mod keyboard {
                     tracing::trace!(scancode, pressed, "window: key for the guest");
                     if let Some(target) = targets.get() {
                         target.ps2.key(scancode, pressed);
+                        DELIVERED.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             })
@@ -464,8 +537,8 @@ mod keyboard {
                 SINK.set(Some(Sink {
                     keys,
                     pressed: BTreeSet::new(),
+                    ui_thread,
                 }));
-                responsive();
                 // SAFETY: `hook` matches HOOKPROC; the module handle is this
                 // executable's. MSG is a valid out-pointer for the loop.
                 unsafe {
@@ -508,39 +581,21 @@ mod keyboard {
         }
     }
 
-    /// Keeps the calling thread quick to wake: the highest priority short of real time,
-    /// and no power throttling. Windows 11 throttles threads it thinks are background
-    /// work (EcoQoS, efficiency cores), and a hook that wakes too late is skipped: the
-    /// key goes past it.
-    fn responsive() {
-        // SAFETY: plain calls on the current thread; `state` is a valid
-        // THREAD_POWER_THROTTLING_STATE of the size passed.
-        unsafe {
-            let thread = GetCurrentThread();
-            let _ = SetThreadPriority(thread, THREAD_PRIORITY_TIME_CRITICAL);
-            let state = THREAD_POWER_THROTTLING_STATE {
-                Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
-                ControlMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
-                StateMask: 0,
-            };
-            let _ = SetThreadInformation(
-                thread,
-                ThreadPowerThrottling,
-                (&raw const state).cast(),
-                size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
-            );
-        }
-    }
-
-    /// Whether the window in front belongs to this process (the console window, if
-    /// any, belongs to the terminal).
-    fn ours_in_front() -> bool {
+    /// Whether the window in front is one `ui_thread` runs: the console window or its
+    /// popup. (Not "this process": Windows can report a classic console window as its
+    /// program's, and keys typed into the terminal aren't the guest's.)
+    fn ours_in_front(ui_thread: u32) -> bool {
         let mut process = 0u32;
         // SAFETY: plain calls; `process` is a valid out-pointer.
         unsafe {
             let window = GetForegroundWindow();
-            GetWindowThreadProcessId(window, Some(&mut process));
-            process == GetCurrentProcessId()
+            let thread = GetWindowThreadProcessId(window, Some(&mut process));
+            let ours = thread == ui_thread && process == GetCurrentProcessId();
+            if !ours {
+                OTHER_WINDOW.store(window.0 as isize, Ordering::Relaxed);
+                OTHER_PROCESS.store(process, Ordering::Relaxed);
+            }
+            ours
         }
     }
 
@@ -600,7 +655,16 @@ mod keyboard {
         if code == HC_ACTION as i32 {
             // SAFETY: for WH_KEYBOARD_LL, lparam points to a KBDLLHOOKSTRUCT.
             let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-            let ours = ours_in_front();
+            let ui_thread = SINK.with(|sink| {
+                sink.try_borrow()
+                    .ok()
+                    .and_then(|sink| sink.as_ref().map(|sink| sink.ui_thread))
+            });
+            let ours = ui_thread.is_some_and(ours_in_front);
+            EVENTS.fetch_add(1, Ordering::Relaxed);
+            if ours {
+                IN_FRONT.fetch_add(1, Ordering::Relaxed);
+            }
             // The hook isn't re-entered while it runs; if it were, the key passes on.
             let guests = SINK.with(|sink| match sink.try_borrow_mut().as_deref_mut() {
                 Ok(Some(sink)) => sink.route(info, ours),
@@ -636,6 +700,7 @@ mod keyboard {
             let mut sink = Sink {
                 keys,
                 pressed: BTreeSet::new(),
+                ui_thread: 0,
             };
             let enter = event(VK_RETURN.0, 0x1c, 0);
             let right_ctrl = event(0xa3, 0x1d, LLKHF_EXTENDED.0);

@@ -162,22 +162,34 @@ impl Targets {
     }
 }
 
+/// The next bytes typed, or `None` once input has ended.
+type InputSource = Box<dyn FnMut() -> Option<Vec<u8>> + Send>;
+
+/// Where terminal input comes from: a Windows console is read as input events (see
+/// `windows_console::reader`), anything else (a pipe, say) as a stream.
+fn input_source() -> InputSource {
+    #[cfg(windows)]
+    if let Some(reader) = windows_console::reader() {
+        return Box::new(reader);
+    }
+    let mut stdin = io::stdin();
+    let mut buffer = [0u8; 256];
+    Box::new(move || match stdin.read(&mut buffer) {
+        Ok(0) | Err(_) => None,
+        Ok(read) => Some(buffer[..read].to_vec()),
+    })
+}
+
 /// Forwards stdin to the current machine on a background thread until the user quits
-/// or stdin closes. The thread is never joined: a blocked console read can't be
-/// interrupted.
+/// or stdin closes. The thread is never joined: a blocked read can't be interrupted.
 pub fn spawn_input(targets: Targets) -> io::Result<()> {
     thread::Builder::new()
         .name("console-input".into())
         .spawn(move || {
             let mut filter = EscapeFilter::default();
-            let mut buffer = [0u8; 256];
-            let mut stdin = io::stdin().lock();
-            loop {
-                let read = match stdin.read(&mut buffer) {
-                    Ok(0) | Err(_) => return,
-                    Ok(read) => read,
-                };
-                for input in filter.filter(&buffer[..read]) {
+            let mut next = input_source();
+            while let Some(bytes) = next() {
+                for input in filter.filter(&bytes) {
                     match input {
                         Input::Guest(pending) => send(&targets, pending),
                         Input::Keys(text) => type_keys(&targets, &text),
@@ -343,12 +355,90 @@ impl Drop for RawConsole {
 
 #[cfg(windows)]
 mod windows_console {
-    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
     use windows::Win32::System::Console::{
         CONSOLE_MODE, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
         ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode,
-        GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
+        GetStdHandle, INPUT_RECORD, KEY_EVENT, ReadConsoleInputW, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE, SetConsoleMode,
     };
+    use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_INSERT, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_UP,
+    };
+
+    /// What keys without a character send, as a VT terminal does.
+    const SEQUENCES: [(u16, &[u8]); 10] = [
+        (VK_UP.0, b"\x1b[A"),
+        (VK_DOWN.0, b"\x1b[B"),
+        (VK_RIGHT.0, b"\x1b[C"),
+        (VK_LEFT.0, b"\x1b[D"),
+        (VK_HOME.0, b"\x1b[H"),
+        (VK_END.0, b"\x1b[F"),
+        (VK_INSERT.0, b"\x1b[2~"),
+        (VK_DELETE.0, b"\x1b[3~"),
+        (VK_PRIOR.0, b"\x1b[5~"),
+        (VK_NEXT.0, b"\x1b[6~"),
+    ];
+
+    /// Reads what's typed in the console as input events, waiting on the console
+    /// between them. A read left pending on a console in raw mode stops Windows from
+    /// calling the window's low-level keyboard hook, so the guest got no keys from
+    /// the window; waiting on the handle doesn't. `None` if stdin isn't a console.
+    pub fn reader() -> Option<impl FnMut() -> Option<Vec<u8>> + Send> {
+        // SAFETY: a plain call that returns the process's standard handle.
+        let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) }.ok()?;
+        mode(handle)?;
+        // Console handles are process-wide; the reader just keeps the value.
+        let handle = handle.0 as usize;
+        Some(move || {
+            let handle = HANDLE(handle as *mut _);
+            let mut records = [INPUT_RECORD::default(); 64];
+            loop {
+                let mut count = 0u32;
+                // SAFETY: a console input handle; `records` and `count` are valid
+                // out-buffers, and only key events' union members are read.
+                unsafe {
+                    if WaitForSingleObject(handle, INFINITE) != WAIT_OBJECT_0 {
+                        return None;
+                    }
+                    ReadConsoleInputW(handle, &mut records, &mut count).ok()?;
+                }
+                let mut units = Vec::new();
+                let mut bytes = Vec::new();
+                for record in &records[..count as usize] {
+                    if u32::from(record.EventType) != KEY_EVENT {
+                        continue;
+                    }
+                    // SAFETY: a key event's record holds a KEY_EVENT_RECORD.
+                    let key = unsafe { record.Event.KeyEvent };
+                    if !key.bKeyDown.as_bool() {
+                        continue;
+                    }
+                    let repeat = usize::from(key.wRepeatCount.max(1));
+                    // SAFETY: the Unicode member, as ReadConsoleInputW fills it.
+                    let unit = unsafe { key.uChar.UnicodeChar };
+                    if unit != 0 {
+                        units.extend(std::iter::repeat_n(unit, repeat));
+                    } else if let Some((_, sequence)) = SEQUENCES
+                        .iter()
+                        .find(|(key_code, _)| *key_code == key.wVirtualKeyCode)
+                    {
+                        // Characters before it stay in order.
+                        bytes.extend(String::from_utf16_lossy(&units).bytes());
+                        units.clear();
+                        for _ in 0..repeat {
+                            bytes.extend_from_slice(sequence);
+                        }
+                    }
+                }
+                bytes.extend(String::from_utf16_lossy(&units).bytes());
+                if !bytes.is_empty() {
+                    return Some(bytes);
+                }
+            }
+        })
+    }
 
     pub struct Saved {
         input: (HANDLE, CONSOLE_MODE),
