@@ -159,6 +159,19 @@ jobs:
           }
           '@ | Set-Content -Path $file
 
+      # TEMPORARY CHOICE (see docs/ROADMAP.md, M7): the TPM reports manufacturer
+      # "MSFT". The reference default "XYZ " is a placeholder Windows doesn't know, and
+      # its TPM WMI provider then can't format the firmware version, so Get-Tpm fails;
+      # an ID of vmmc's own fails the same way. The code is Microsoft's reference TPM,
+      # which Hyper-V's vTPM reports as MSFT too. Revisit before release.
+      - name: Set the TPM's manufacturer ID
+        run: |
+          $file = 'ms-tpm-20-ref/TPMCmd/Platform/src/VendorInfo.c'
+          $text = Get-Content -Raw $file
+          if ($text -notmatch '#define MANUFACTURER\s+"XYZ "') { throw 'manufacturer not found' }
+          $text = $text -replace '#define MANUFACTURER\s+"XYZ "', '#define MANUFACTURER    "MSFT"'
+          Set-Content -NoNewline -Path $file -Value $text
+
       # The OpenSSL glue reads OpenSSL's private bignum_st and refuses versions from 3.1
       # on as untested. Check the layout in the OpenSSL source vcpkg built, then let it
       # build against this version (below 3.7).
@@ -215,6 +228,7 @@ jobs:
             'triplet: x64-windows-static-md (static libraries, dynamic CRT)'
             'switches: SIMULATION NO, ALLOW_FORCE_FAILURE_MODE NO, CRYPTO_LIB_REPORTING NO, FILE_BACKED_NV 0, Release'
             'entropy: BCryptGenRandom (system-preferred RNG)'
+            'manufacturer: MSFT (temporary, see docs/ROADMAP.md)'
             "libraries: $((Get-ChildItem dist -Filter *.lib).Name -join ' ')"
           ) | Set-Content dist/TPM-BUILD-INFO.txt
           Get-Content dist/TPM-BUILD-INFO.txt
