@@ -10,9 +10,9 @@
 
 use acpi_tables::Aml;
 use acpi_tables::aml::{
-    AddressSpace, AddressSpaceCacheable, And, Arg, CreateDWordField, Device, EISAName, Else, Equal,
-    IO, If, Interrupt, Local, Memory32Fixed, Method, Name, NotEqual, Or, Package, Path,
-    ResourceTemplate, Return, Store, Uuid,
+    AddressSpace, AddressSpaceCacheable, And, Arg, BufferData, CreateDWordField, Device, EISAName,
+    Else, Equal, IO, If, Interrupt, Local, Memory32Fixed, Method, Name, NotEqual, Or, Package,
+    Path, ResourceTemplate, Return, Store, Uuid,
 };
 use devices::legacy::acpi_pm::{
     PM_TMR, PM_TMR_LEN, PM1A_CNT, PM1A_CNT_LEN, PM1A_EVT, PM1A_EVT_LEN, S5_SLEEP_TYPE,
@@ -22,6 +22,7 @@ use devices::legacy::ioapic::IOAPIC_BASE;
 use devices::legacy::rtc::RTC_BASE;
 use devices::legacy::serial::{COM1_BASE, COM1_IRQ};
 use devices::pci::root::{CONFIG_IO_BASE, NUM_SLOTS};
+use devices::tpm::{CONTROL_AREA, TPM_BASE, TPM_SIZE};
 
 const OEM_ID: [u8; 6] = *b"VMMC  ";
 const OEM_TABLE_ID: [u8; 8] = *b"VMMCPC  ";
@@ -43,6 +44,8 @@ const RESET_PORT: u16 = 0xcf9;
 const RESET_VALUE: u8 = 0x06;
 /// CMOS index of the century byte.
 const RTC_CENTURY: u8 = 0x32;
+/// TPM2 table start method 7: the Command Response Buffer interface.
+const TPM2_START_CRB: u32 = 7;
 /// PCIe features `_OSC` hands to the OS: native hot-plug, PME, AER and the PCIe
 /// capability structure (not SHPC; there are no PCI-to-PCI bridges).
 const OSC_GRANTED: u8 = 0x1d;
@@ -64,6 +67,8 @@ pub struct AcpiConfig {
     pub ecam: (u64, u64),
     /// I/O base of the ACPI PM block.
     pub pm_base: u16,
+    /// Whether there is a TPM behind the CRB at `devices::tpm::TPM_BASE`.
+    pub tpm: bool,
 }
 
 /// fw_cfg names of the loader's files, as QEMU names them.
@@ -114,7 +119,11 @@ pub fn build(config: &AcpiConfig) -> AcpiBlobs {
     let fadt = blob.add(fadt(config, facs, dsdt), 16);
     let madt = blob.add(madt(config), 16);
     let mcfg = blob.add(mcfg(config), 16);
-    let xsdt = blob.add(xsdt(&[fadt, madt, mcfg]), 16);
+    let mut tables = vec![fadt, madt, mcfg];
+    if config.tpm {
+        tables.push(blob.add(tpm2(), 16));
+    }
+    let xsdt = blob.add(xsdt(&tables), 16);
     AcpiBlobs {
         tables: blob.bytes,
         rsdp: rsdp(xsdt),
@@ -474,6 +483,18 @@ fn mcfg(config: &AcpiConfig) -> Table {
     t
 }
 
+/// TPM2 (TCG ACPI specification): a client platform's TPM behind the CRB. There's no
+/// event log area here: the firmware hands its log to the OS through UEFI.
+fn tpm2() -> Table {
+    let mut t = Table::new(b"TPM2", 4, HEADER_LEN);
+    t.push(&0u16.to_le_bytes()); // platform class: client
+    t.push(&0u16.to_le_bytes()); // reserved
+    t.push(&CONTROL_AREA.to_le_bytes());
+    t.push(&TPM2_START_CRB.to_le_bytes());
+    t.push(&[0; 12]); // start-method parameters
+    t
+}
+
 fn dsdt(config: &AcpiConfig) -> Table {
     let mut t = Table::new(b"DSDT", 2, HEADER_LEN);
     let mut aml = Vec::new();
@@ -548,6 +569,18 @@ fn dsdt_aml(config: &AcpiConfig, sink: &mut Vec<u8>) {
         sink,
     );
 
+    // The PS/2 mouse, on the 8042's second port.
+    let mouse_irq = Interrupt::new(true, true, false, false, crate::MOUSE_IRQ.into());
+    device(
+        "\\_SB_.PCI0.ISA_.PS2M",
+        &[
+            ("_HID", &EISAName::new("PNP0F13")),
+            ("_CRS", &ResourceTemplate::new(vec![&mouse_irq])),
+        ],
+        &[],
+        sink,
+    );
+
     // The CMOS RTC. Its IRQ 8 isn't listed: alarm and update interrupts aren't
     // emulated, and Linux's driver would wait for them.
     let rtc_io = IO::new(RTC_BASE, RTC_BASE, 1, 2);
@@ -561,11 +594,105 @@ fn dsdt_aml(config: &AcpiConfig, sink: &mut Vec<u8>) {
         sink,
     );
 
+    // The TPM, as Windows and Linux find a CRB TPM 2.0.
+    if config.tpm {
+        let registers = Memory32Fixed::new(true, TPM_BASE as u32, TPM_SIZE as u32);
+        let present = 0x0fu8;
+        tpm_dsm(|dsm| {
+            device(
+                "\\_SB_.TPM_",
+                &[
+                    ("_HID", &"MSFT0101"),
+                    ("_STR", &"TPM 2.0 Device"),
+                    ("_STA", &present),
+                    ("_CRS", &ResourceTemplate::new(vec![&registers])),
+                ],
+                &[dsm],
+                sink,
+            );
+        });
+    }
+
     // \_S5: soft-off uses SLP_TYP 0, what the ACPI PM device powers off on.
     let s5_type = S5_SLEEP_TYPE as u8;
     let zero = 0u8;
     let s5 = Package::new(vec![&s5_type, &s5_type, &zero, &zero]);
     Name::new(Path::new("\\_S5_"), &s5).to_aml_bytes(sink);
+}
+
+/// The TPM's `_DSM`, handed to `emit`: the TCG Physical Presence Interface 1.3 and the
+/// memory-clear (MOR) interface, with nothing behind them. No request is ever pending
+/// and every operation is reported as not implemented, since the firmware doesn't
+/// carry them out. Windows' TPM tools query them, and fail where they're missing.
+fn tpm_dsm(emit: impl FnOnce(&dyn Aml)) {
+    let ppi = Uuid::new("3DDDFAA6-361B-4EB4-A424-8D10089D1653");
+    let mor = Uuid::new("376054ED-CC13-4675-901C-4756D7F2D45D");
+    let (zero, one, two, three) = (0u8, 1u8, 2u8, 3u8);
+    let numbers: Vec<u8> = (0..=8).collect();
+    let function = |number: usize| Equal::new(&Arg(2), &numbers[number]);
+    let tests: Vec<Equal> = (0..=8).map(function).collect();
+
+    // Functions 0 to 8.
+    let ppi_functions = BufferData::new(vec![0xff, 0x01]);
+    // Get pending operation: none (two fields for revision 1, three after).
+    let pending_v1 = Package::new(vec![&zero, &zero]);
+    let pending_v2 = Package::new(vec![&zero, &zero, &zero]);
+    let revision_1 = Equal::new(&Arg(1), &one);
+    let return_pending_v1 = Return::new(&pending_v1);
+    let return_pending_v2 = Return::new(&pending_v2);
+    let pending = If::new(&revision_1, vec![&return_pending_v1]);
+    // The last operation's result: none.
+    let last = Package::new(vec![&zero, &zero, &zero]);
+    let returns: Vec<Return> = vec![
+        Return::new(&ppi_functions),
+        // Version.
+        Return::new(&"1.3"),
+        // Submit a request (1.0 form): not implemented.
+        Return::new(&one),
+        // (pending, above)
+        Return::new(&zero),
+        // The transition to the pre-OS environment: a reboot.
+        Return::new(&two),
+        Return::new(&last),
+        // Preferred language: not implemented.
+        Return::new(&three),
+        // Submit a request: not implemented.
+        Return::new(&one),
+        // Whether an operation is allowed: not implemented, for every operation.
+        Return::new(&zero),
+    ];
+    let cases: Vec<If> = (0..=8)
+        .map(|number| {
+            let body: Vec<&dyn Aml> = if number == 3 {
+                vec![&pending, &return_pending_v2]
+            } else {
+                vec![&returns[number]]
+            };
+            If::new(&tests[number], body)
+        })
+        .collect();
+    let is_ppi = Equal::new(&Arg(0), &ppi);
+    let ppi_body: Vec<&dyn Aml> = cases.iter().map(|case| case as &dyn Aml).collect();
+    let if_ppi = If::new(&is_ppi, ppi_body);
+
+    // Memory clear: functions 0 and 1; setting the bit isn't supported.
+    let mor_functions = BufferData::new(vec![0x03]);
+    let return_mor_functions = Return::new(&mor_functions);
+    let mor_query = If::new(&tests[0], vec![&return_mor_functions]);
+    let return_failure = Return::new(&one);
+    let mor_set = If::new(&tests[1], vec![&return_failure]);
+    let is_mor = Equal::new(&Arg(0), &mor);
+    let if_mor = If::new(&is_mor, vec![&mor_query, &mor_set]);
+
+    let nothing = BufferData::new(vec![0]);
+    let return_nothing = Return::new(&nothing);
+    let dsm = Method::new(
+        Path::new("_DSM"),
+        4,
+        true,
+        vec![&if_ppi, &if_mor, &return_nothing],
+    );
+    emit(&dsm);
 }
 
 /// \_SB.PCI0: the PCIe root complex, the windows it decodes, its INTx routing and the
@@ -700,6 +827,7 @@ mod tests {
             mmio64: (0x1_0000_0000, 0x9_0000_0000),
             ecam: ECAM,
             pm_base: PM_BASE,
+            tpm: false,
         }
     }
 
@@ -918,6 +1046,7 @@ mod tests {
             b"MBRS",
             b"COM1",
             b"KBD_",
+            b"PS2M",
             b"RTC_",
             b"_S5_",
             b"_CRS",
@@ -936,6 +1065,32 @@ mod tests {
         assert!(contains(&[
             b'_', b'S', b'5', b'_', 0x12, 0x06, 0x04, 0, 0, 0, 0
         ]));
+    }
+
+    #[test]
+    fn a_tpm_gets_its_table_and_device() {
+        let without = tables(1);
+        assert!(!xsdt_entries(&without).iter().any(|(s, _)| s == "TPM2"));
+        assert!(!dsdt(&without).windows(8).any(|w| w == b"MSFT0101"));
+
+        let with = build(&AcpiConfig {
+            tpm: true,
+            ..config(1)
+        })
+        .place(BASE);
+        let tpm2 = table(&with, find(&with, "TPM2"), b"TPM2");
+        assert_eq!(tpm2.len(), 64);
+        assert_eq!(u64_at(tpm2, 40), CONTROL_AREA);
+        assert_eq!(u32_at(tpm2, 48), TPM2_START_CRB);
+        assert!(dsdt(&with).windows(8).any(|w| w == b"MSFT0101"));
+        // The PPI _DSM: its name and its UUID (3DDDFAA6-...), as AML stores it.
+        assert!(dsdt(&with).windows(4).any(|w| w == b"_DSM"));
+        assert!(
+            dsdt(&with)
+                .windows(4)
+                .any(|w| w == [0xa6, 0xfa, 0xdd, 0x3d])
+        );
+        assert!(dsdt(&with).windows(3).any(|w| w == b"1.3"));
     }
 
     #[test]

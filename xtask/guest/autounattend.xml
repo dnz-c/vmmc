@@ -17,7 +17,6 @@
       <UserLocale>@@LANGUAGE@@</UserLocale>
     </component>
     <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-@@LABCONFIG@@
       <DiskConfiguration>
         <Disk wcm:action="add">
           <DiskID>0</DiskID>

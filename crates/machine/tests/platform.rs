@@ -31,6 +31,8 @@ fn config(cpus: u8, disks: Vec<DiskConfig>) -> MachineConfig {
         nics: Vec::new(),
         serial_output: Box::new(io::sink()),
         firmware: None,
+        tpm: None,
+        enlightenments: false,
     }
 }
 

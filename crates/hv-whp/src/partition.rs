@@ -5,10 +5,12 @@ use std::sync::Arc;
 use hv::{LocalApicMode, MemoryAccess, PartitionConfig};
 use windows::Win32::System::Hypervisor::{
     WHV_MAP_GPA_RANGE_FLAGS, WHV_PARTITION_HANDLE, WHV_PARTITION_PROPERTY_CODE,
-    WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite,
-    WHvPartitionPropertyCodeCpuidExitList, WHvPartitionPropertyCodeExtendedVmExits,
-    WHvPartitionPropertyCodeLocalApicEmulationMode, WHvPartitionPropertyCodeProcessorCount,
-    WHvX64LocalApicEmulationModeX2Apic, WHvX64LocalApicEmulationModeXApic,
+    WHvCapabilityCodeSyntheticProcessorFeaturesBanks, WHvMapGpaRangeFlagExecute,
+    WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite, WHvPartitionPropertyCodeCpuidExitList,
+    WHvPartitionPropertyCodeExtendedVmExits, WHvPartitionPropertyCodeLocalApicEmulationMode,
+    WHvPartitionPropertyCodeProcessorCount,
+    WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks, WHvX64LocalApicEmulationModeX2Apic,
+    WHvX64LocalApicEmulationModeXApic,
 };
 
 use crate::api::{Api, check};
@@ -18,6 +20,45 @@ use crate::vcpu::WhpVcpu;
 
 /// `WHV_EXTENDED_VM_EXITS` with only `X64CpuidExit` (bit 0) set.
 const CPUID_EXIT: u64 = 1;
+
+/// The Hyper-V enlightenments a Windows guest gets, as bits of the first
+/// `WHV_SYNTHETIC_PROCESSOR_FEATURES` bank: the hypervisor's CPUID leaves,
+/// hypercalls, VP index and runtime, the reference counter and TSC page, frequency
+/// MSRs, the guest idle MSR, the synthetic interrupt controller with direct-mode
+/// synthetic timers, the APIC-access MSRs and VP assist page, and the TLB-flush and
+/// IPI hypercalls. Left out: what needs a VMBus host (event signalling), nested
+/// virtualization, and device-interrupt retargeting.
+///
+/// Windows needs the guest idle MSR whenever it sees the hypervisor: without it,
+/// Windows 10 22H2 stops with KMODE_EXCEPTION_NOT_HANDLED during boot.
+const ENLIGHTENMENTS: u64 = (1 << 0) // HypervisorPresent
+    | (1 << 1) // Hv1
+    | (1 << 2) // AccessVpRunTimeReg
+    | (1 << 3) // AccessPartitionReferenceCounter
+    | (1 << 4) // AccessSynicRegs
+    | (1 << 5) // AccessSyntheticTimerRegs
+    | (1 << 6) // AccessIntrCtrlRegs
+    | (1 << 7) // AccessHypercallRegs
+    | (1 << 8) // AccessVpIndex
+    | (1 << 9) // AccessPartitionReferenceTsc
+    | (1 << 10) // AccessGuestIdleReg
+    | (1 << 11) // AccessFrequencyRegs
+    | (1 << 15) // EnableExtendedGvaRangesForFlushVirtualAddressList
+    | (1 << 18) // FastHypercallOutput
+    | (1 << 22) // DirectSyntheticTimers
+    | (1 << 24) // ExtendedProcessorMasks
+    | (1 << 25) // TbFlushHypercalls
+    | (1 << 26) // SyntheticClusterIpi
+    | (1 << 27); // NotifyLongSpinWait
+
+/// `WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS` with one bank.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FeatureBanks {
+    count: u32,
+    reserved: u32,
+    bank0: u64,
+}
 
 /// What `WHvMapGpaRange` returns when another partition in this process already has
 /// guest memory mapped: only one may at a time. (The status's own text, about a VID
@@ -54,6 +95,24 @@ impl PartitionInner {
     }
 }
 
+impl PartitionInner {
+    /// The synthetic processor features (first bank) this host's WHP can expose.
+    fn supported_features(&self) -> hv::Result<u64> {
+        let mut banks = FeatureBanks::default();
+        let mut written = 0u32;
+        // SAFETY: `banks` is a writable buffer of the size passed.
+        check("WHvGetCapability", unsafe {
+            (self.api.WHvGetCapability)(
+                WHvCapabilityCodeSyntheticProcessorFeaturesBanks,
+                (&raw mut banks).cast::<c_void>(),
+                size_of::<FeatureBanks>() as u32,
+                &mut written,
+            )
+        })?;
+        Ok(if banks.count >= 1 { banks.bank0 } else { 0 })
+    }
+}
+
 impl Drop for PartitionInner {
     fn drop(&mut self) {
         // SAFETY: the handle came from WHvCreatePartition and nothing else uses it now.
@@ -83,6 +142,12 @@ impl WhpPartition {
                 "a VM needs at least one vCPU".into(),
             ));
         }
+        // WHvSetupPartition would only say "invalid parameter".
+        if config.enlightenments && config.local_apic == LocalApicMode::Disabled {
+            return Err(hv::Error::InvalidArgument(
+                "Hyper-V enlightenments need a local APIC".into(),
+            ));
+        }
 
         let mut handle = WHV_PARTITION_HANDLE::default();
         // SAFETY: `handle` is a valid out-pointer.
@@ -104,6 +169,20 @@ impl WhpPartition {
         };
         if let Some(mode) = apic_mode {
             inner.set_property(WHvPartitionPropertyCodeLocalApicEmulationMode, &mode)?;
+        }
+
+        if config.enlightenments {
+            // Windows before 10 2004 has no synthetic processor features: the
+            // capability query fails, and so does the VM.
+            let banks = FeatureBanks {
+                count: 1,
+                reserved: 0,
+                bank0: ENLIGHTENMENTS & inner.supported_features()?,
+            };
+            inner.set_property(
+                WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks,
+                &banks,
+            )?;
         }
 
         // The VMM answers a few CPUID leaves itself (see `cpuid`).

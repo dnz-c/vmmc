@@ -183,7 +183,9 @@ Scope moved out of Phase 1:
   - Windows 11 (current ISO) installs unattended onto NVMe and reaches the desktop with NAT internet. `msinfo32` shows Secure Boot On and TPM 2.0.
   - Ubuntu 26.04 Desktop installs from ISO.
 
-**Milestones done so far (verified on WHP, 2026-10-11):**
+**Where Phase 2 stands (2026-10-13):** Ubuntu Desktop installs and runs (M10). Windows 10 22H2 installs with Secure Boot on, a TPM 2.0, its USB tablet and network all working; the Windows test's one failing check is `Get-Tpm`, which needs a decision on the TPM's manufacturer ID (see M7). Still to do: a Windows 11 ISO run, and a Windows driver for the display adapter.
+
+**Milestones done so far (verified on WHP, 2026-10-12):**
 
 - **M0, repo and native dependencies:** the private GitHub repo, and the `native-deps` workflow. It builds OVMF from `edk2-stable202608` (SMM off, TPM 2.0) as three variants: release with Secure Boot (what VMs run), the same as a debug build, and a debug test build without Secure Boot. The test build exists because edk2 leaves the UEFI shell out of Secure Boot builds. Key enrollment uses `virt-fw-vars`: a generated vmmc platform key plus Microsoft's 2011 and 2023 KEK and db certificates. `cargo xtask fetch-native` downloads the release through `gh` and checks pinned SHA-256s. The builds are reproducible: a rebuild gave byte-identical code volumes.
 - **M1, OVMF boots to the UEFI shell:** `cargo xtask firmware-test` passes in about 13 s. It boots to the shell, writes a non-volatile variable, and warm-resets, which rebuilds the machine. The second boot reads the variable back from `nvram.fd`, then `reset -s` powers the VM off through ACPI. The debug log has no ASSERT.
@@ -258,7 +260,7 @@ Scope moved out of Phase 1:
 - **M5, the unattended Windows install (passes with Windows 10 22H2; a Windows 11 ISO is still to be tried):** `cargo xtask win11-test` needs `VMMC_WIN11_ISO`, and `VMMC_WIN11_IMAGE` for an edition other than Windows 11 Pro.
   - **Answer disc:** an ISO with `autounattend.xml` (GPT on the NVMe disk, the edition's public generic key, a local administrator, no online-account OOBE, and LabConfig bypasses until M7) and a first-logon PowerShell script. The script reports to COM1: CPUs, Secure Boot, TPM, disk bus, network, and any device without a working driver. Then it shuts down.
   - **The run:** a 64 GiB sparse disk on NVMe, an e1000e NIC, a screenshot every 30 s, and a key press for the disc's "Press any key to boot from CD or DVD" prompt. Setup runs in the ISO's language, read from its `sources/lang.ini` (or `VMMC_WIN11_LANG`).
-  - **Result:** Windows 10 Pro 22H2 (German ISO) installs in about 4 minutes and reports 4 CPUs, 8 GB, NVMe, the vmmc SMBIOS model, and a DHCP address; it fetches a page from xtask through the NAT gateway (`net=ok`, a required marker). An internet check (www.microsoft.com:443) is reported too but not required: it depends on the host. Open item: the display adapter has no Windows driver (Windows draws through the firmware framebuffer instead).
+  - **Result:** Windows 10 Pro 22H2 (German ISO) installs in 3 to 6 minutes, with Secure Boot on and a TPM 2.0 since M7, and reports 4 CPUs, 8 GB, NVMe, the vmmc SMBIOS model, the USB tablet, and a DHCP address; it fetches a page from xtask through the NAT gateway (`net=ok`, a required marker). An internet check (www.microsoft.com:443) is reported too but not required: it depends on the host. Open item: the display adapter has no Windows driver (Windows draws through the firmware framebuffer instead).
   - **Platform fixes Windows needed:**
     - **RTC periodic interrupt on IRQ 8.** With no HPET, Windows builds its clock on it; without it the HAL stopped with HAL_INITIALIZATION_FAILED (0x5C).
     - **Legacy devices behind the LPC bridge.** COM1, the keyboard controller and the RTC moved to `\_SB.PCI0.ISA_`. As siblings of PCI0 their ports overlapped its I/O window, and Windows refused to start the root bridge (problem 12), so no PCI device got a driver.
@@ -288,7 +290,55 @@ Scope moved out of Phase 1:
   - **Bugs found:**
     - The NAT treated SYN-RECEIVED as "guest closed" and shut the host side.
     - The e1000e raised a link change when the driver unmasked it, rather than latching it at link-up. That broke Linux's MSI self-test half the time.
-  - **Host note:** the workspace's A: volume rescans a whole file on its first write after it's opened, at about 1 MB/s. Guest disk writes stalled 30-60 s and looked like lost interrupts. xtask now keeps guest-written images in `%TEMP%mmc-test-images` (or `VMMC_TEST_IMAGES`).
+  - **Host note:** the workspace's A: volume rescans a whole file on its first write after it's opened, at about 1 MB/s. Guest disk writes stalled 30-60 s and looked like lost interrupts. xtask now keeps guest-written images in `%TEMP%\vmmc-test-images` (or `VMMC_TEST_IMAGES`).
+- **M7, TPM 2.0 and Secure Boot:**
+  - **The TPM engine** (`crates/tpm`): Microsoft's reference implementation (ms-tpm-20-ref v1.83r1) with OpenSSL 3.6, built by the `native-deps` workflow as static MSVC libraries and linked when `fetch-native` has fetched them (a stub otherwise).
+    - Built as a device, not a simulator: `SIMULATION`, forced failure mode and crypto-library reporting are off.
+    - Its entropy comes from `BCryptGenRandom`. The reference platform's own source is `rand()` seeded with the time and process ID, which would make every seed and key predictable.
+    - Its NV memory (16 KiB) lives in the VM directory as `tpm-state.bin`, written through a temporary file whenever a command changes it. A missing file means a newly manufactured TPM.
+    - **An endorsement key certificate**, as a TPM vendor provides. At manufacture, vmmc creates TCG's default RSA 2048 EK, builds an X.509 certificate for it (EK Credential Profile: the TPM's manufacturer, model and version in a critical alternative name, and the EK certificate purpose), signs it with an ECDSA P-256 key the TPM derives from its platform seed, and writes it to NV index 0x01C00002 under platform authorization, locked. The DER is written by hand and the TPM does the signing, so there's no new crypto dependency; OpenSSL parses the result. Without it, Windows calls the TPM not ready for attestation.
+    - The OpenSSL glue reads OpenSSL's private bignum layout and only allows versions it was tested with. CI checks the layout in the OpenSSL source it built before letting it through.
+  - **The device** (`devices::tpm`): a CRB interface at 0xFED40000 (locality 0), described by an ACPI TPM2 table (start method 7) and an MSFT0101 device. Each machine build is a platform reset (`_TPM_Init`), so the firmware's TPM2_Startup works after a guest reboot.
+  - **Physical presence:** the device's `_DSM` implements the TCG Physical Presence Interface 1.3 and the memory-clear interface with nothing behind them: no request is ever pending and every operation is reported as not implemented, since the firmware doesn't carry them out. Windows' TPM WMI provider fails its physical-presence queries without them; Linux reports the version (`ppi=1.3` in the UEFI Linux test).
+  - **Secure Boot:** new VMs start from `OVMF_VARS.secboot.fd` (Microsoft's 2011 and 2023 keys), so Secure Boot is on by default. The Windows answer file lost its LabConfig bypasses.
+  - **vmmc-vmx:** `--tpm`.
+  - **Open: the manufacturer ID.** The reference implementation reports manufacturer "XYZ ", a placeholder. Windows' TPM WMI provider can't format a firmware version for a manufacturer it doesn't know, so `Get-Tpm` fails (`Win32_Tpm.get_ManufacturerVersion`, NTE_NOT_FOUND) while BitLocker-style use works. Tried in the Windows test: "MSFT" passes everything, an ID of vmmc's own ("VMMC") fails like "XYZ ". Which registered ID to report is a product decision; the CI build sets it in `VendorInfo.c`.
+  - **Tests:** the TPM crate manufactures a TPM (and checks its EK certificate against the EK the guest makes), runs Startup and GetRandom, resets, and reopens it from its state file. The UEFI Linux test passes `--tpm` and checks that the kernel finds a TPM 2.0 and that PCR 0 holds OVMF's measurements (`tpm=2 pcr0=measured`). The Ubuntu install boots shim, GRUB and the kernel with Secure Boot on.
+- **M8, input:**
+  - **i8042** (`devices::legacy::i8042`), rewritten as a controller with two ports:
+    - a keyboard that takes keys from the host as scan code set 1 and sends set 1 or set 2, with the controller's set 2 to set 1 translation, LEDs, typematic and identify;
+    - a PS/2 mouse on IRQ 12 (`\_SB.PCI0.ISA_.PS2M`, PNP0F13) that becomes an IntelliMouse with a wheel when the guest knocks (sample rates 200, 100, 80);
+    - a disabled port keeps its bytes until it's enabled again.
+
+    9 unit tests.
+  - **xHCI** (`devices::usb::xhci`, 1b36:000d at 00:04.0), written from Intel's xHCI specification:
+    - command, event and transfer rings, with slot and endpoint contexts;
+    - two USB 2 ports and two USB 3 ports, with their protocol capabilities;
+    - 16 device slots, and one MSI-X vector.
+  - **USB HID devices** (`devices::usb::hid`): a tablet (absolute pointer, 0 to 32767 on both axes, three buttons and a wheel) and a boot-protocol keyboard, behind the `UsbDevice` trait.
+  - **Bugs found with Windows** (its driver set the controller up in an order Linux doesn't):
+    - **A controller reset (HCRST) also reset MSI-X**, turning it off and masking the vector. Windows enables MSI-X first and resets the controller after, so its interrupts went nowhere: every port reset timed out and the devices showed as "Unknown USB device (port reset failed)". MSI-X is PCI state and now survives a controller reset.
+    - **No INTx.** The controller only signalled through MSI-X. It now has INTA too: with MSI-X off, an event sets IMAN.IP and the line stays asserted while the interrupt is pending and enabled.
+  - **Tests:** 11 USB unit tests drive the controller the way a driver does, from reset to interrupt transfers, including INTA and Windows' MSI-X order. OVMF enumerates both devices. The direct Linux test loads `xhci_pci` and `usbhid`, and checks that both appear (`usb=tablet,keyboard`). The Windows test checks that Windows' own driver has the tablet working (`usb-tablet=True`).
+  - **Known:** the USB IDs (QEMU's xHCI ID, and pid.codes test IDs 1209:0001 and 1209:0002 for the HID devices) need replacing with vmmc's own before release, as NVMe's do.
+- **M9, the console window:** `vmmc-vmx run --display window`.
+  - **Screen:** Slint with its software renderer, on winit. It shows the framebuffer scaled to fit, up to 60 times a second, and skips frames that haven't changed.
+  - **Pointer:** the USB tablet. Clicks and the wheel go through; the position maps through the scaled picture, bands included. Nothing is captured.
+  - **Keyboard:** a low-level keyboard hook on its own thread sends physical scan codes to the PS/2 keyboard while a window of the process is in front. Windows, Alt+Tab and the like reach the guest. The hook only queues keys and another thread delivers them, because Windows silently removes a hook that's slow to answer. When another window takes the keyboard, the guest gets key-ups for every key it still holds. Ctrl+Alt+Del never reaches a hook, so the toolbar sends it.
+  - **Toolbar:** Ctrl+Alt+Del, Power button (ACPI), Reset, Screenshot (with `--screenshot`), and About with the `AboutSlint` widget that Slint's royalty-free licence asks for.
+  - **Lifetime:** closing the window stops the VM, and a VM that stops closes the window. The terminal remains the serial console.
+  - **Verified:** OVMF's screen in the window, and an Enter typed into the window opens OVMF's boot manager. The hook's routing has unit tests.
+  - **Licences:** `deny.toml` allows `LicenseRef-Slint-Royalty-free-2.0` (Slint is GPL-3.0 or royalty-free; vmmc takes the royalty-free licence) and BSL-1.0 (the clipboard crates under winit). It ignores RUSTSEC-2026-0192 (ttf-parser unmaintained), which only reaches winit's Wayland title bars.
+- **M10, Ubuntu Desktop install (passes with Ubuntu 26.04.1):** `cargo xtask ubuntu-desktop-test`.
+  - **Inputs:** the 26.04.1 desktop ISO (6.5 GB), downloaded once into the test image directory and checked against Ubuntu's published SHA-256 (or `VMMC_UBUNTU_ISO`).
+  - **Autoinstall:** a second disc labelled CIDATA holds the configuration, which cloud-init reads as a NoCloud source. xtask opens GRUB's command line over the serial console and boots the ISO's kernel with `autoinstall` (no confirmation prompt) and a serial console added.
+  - **Install:** offline, onto a 64 GiB NVMe disk, with Secure Boot on. The late commands install a first-boot service, then the installer powers off. It takes about 4 minutes.
+  - **First boot:** from the disk alone, with an e1000e adapter added. The service reports kernel 7.0, 4 CPUs, Secure Boot on, root on NVMe, the `bochs-drm` display driver, GNOME's display manager running, a page fetched from the host through the NAT, and no failed units. Then it powers off.
+  - **Bug found: ARP answers for the guest's own address.** smoltcp's AnyIP mode, which the NAT uses to terminate guest TCP, answers ARP for any address. NetworkManager checks a new DHCP address with ARP (RFC 5227), took the answer for a conflict, and left the interface without routes. The NAT now passes ARP to smoltcp only for its own addresses. The earlier tests missed it: busybox's `udhcpc` doesn't check its address, and Windows' check wasn't tripped by it.
+- **M10, Hyper-V enlightenments (an experiment; opt-in):** `vmmc-vmx run --enlightenments` has WHP expose Hyper-V's paravirtual interfaces, which the Windows hypervisor implements itself, so they cost no exits: the hypervisor CPUID leaves, hypercalls, VP index and runtime, the reference counter and TSC page, frequency MSRs, the guest idle MSR, the synthetic interrupt controller with direct-mode synthetic timers, the APIC-access MSRs, and the TLB-flush and IPI hypercalls.
+  - **Found:** Windows needs the guest idle MSR whenever it sees the hypervisor. Without it, Windows 10 stops with KMODE_EXCEPTION_NOT_HANDLED during boot; bisecting the feature set over Windows Setup boots found it.
+  - **Verified:** a WHP test checks that the guest sees "Microsoft Hv" only with the option. The Windows install test passes with it on (apart from the `Get-Tpm` check), and Windows reports a hypervisor.
+  - **Not settled: whether it's faster.** One install with enlightenments reached first logon in 178 s; without, runs took 187 to 503 s on the same host, which is too noisy to call. A back-to-back comparison was cut short, so the option stays off by default until a steadier measurement (boot time of an installed VM, several runs each) shows a gain.
 
 ### Phase 3: Desktop app alpha + VMware migration (about 3–4 months)
 

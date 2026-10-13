@@ -44,6 +44,10 @@ pub enum LocalApicMode {
 pub struct PartitionConfig {
     pub vcpu_count: u32,
     pub local_apic: LocalApicMode,
+    /// Expose Hyper-V enlightenments (a reference TSC page, synthetic timers,
+    /// hypercalls and the like), implemented by the hypervisor itself, where it
+    /// can. Windows guests use them for timekeeping and IPIs.
+    pub enlightenments: bool,
 }
 
 impl Default for PartitionConfig {
@@ -51,6 +55,7 @@ impl Default for PartitionConfig {
         Self {
             vcpu_count: 1,
             local_apic: LocalApicMode::default(),
+            enlightenments: false,
         }
     }
 }

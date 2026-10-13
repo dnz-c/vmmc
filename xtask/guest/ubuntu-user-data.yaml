@@ -1,0 +1,85 @@
+#cloud-config
+# Ubuntu Desktop autoinstall for `cargo xtask ubuntu-desktop-test`, read by cloud-init
+# from the CIDATA disc. The install runs offline (the VM has no network adapter until
+# the first boot), then a first-boot service reports to COM1 and powers off.
+autoinstall:
+  version: 1
+  early-commands:
+    - "echo 'VMMC-UBUNTU: autoinstall' > /dev/ttyS0"
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+  timezone: Etc/UTC
+  identity:
+    realname: vmmc
+    hostname: vmmc-ubuntu
+    username: vmmc
+    # "vmmc": a throwaway test VM.
+    password: "$6$vmmctestsalt$B7N3MJ/x3lLqhX2rs30Dz8iS8q79bqX3Vw./58DiO4M1XdNPy.Hz40KUmmtfKBq0Ezho5VGSPSZ.QV.eQTMmh/"
+  storage:
+    layout:
+      name: direct
+  refresh-installer:
+    update: false
+  codecs:
+    install: false
+  drivers:
+    install: false
+  late-commands:
+    - |
+      cat > /target/usr/local/sbin/vmmc-firstboot <<'EOF'
+      #!/bin/sh
+      # Reports what the installed system sees to COM1, then powers off.
+      say() { echo "VMMC-UBUNTU: $*" > /dev/ttyS0; }
+      say "booted $(uname -r)"
+      say "cpus=$(nproc)"
+      secure=$(od -An -tu1 -j4 -N1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c 2>/dev/null | tr -d ' ')
+      say "secureboot=${secure:-none}"
+      say "root=$(findmnt -no SOURCE /)"
+      driver=$(basename "$(readlink /sys/class/drm/card0/device/driver)" 2>/dev/null)
+      say "display=${driver:-none}"
+      for i in $(seq 180); do
+          systemctl is-active -q display-manager && break
+          sleep 1
+      done
+      say "desktop=$(systemctl is-active display-manager)"
+      fetch() {
+          wget -qO- -T 5 "$1" 2>/dev/null ||
+              python3 -c 'import sys, urllib.request; print(urllib.request.urlopen(sys.argv[1], timeout=5).read().decode(), end="")' "$1" 2>/dev/null
+      }
+      for i in $(seq 60); do
+          body=$(fetch http://10.0.2.2:@@HTTP_PORT@@/)
+          [ "$body" = "@@HTTP_BODY@@" ] && break
+          sleep 2
+      done
+      if [ "$body" = "@@HTTP_BODY@@" ]; then say "net=ok"; else say "net=failed"; fi
+      say "address=$(ip -4 -o addr show scope global | awk '{print $2 "=" $4}' | tr '\n' ' ')"
+      for nic in /sys/class/net/*/device; do
+          say "nic=$(basename "$(dirname "$nic")") driver=$(basename "$(readlink "$nic/driver")")"
+      done
+      say "tools=$(for tool in wget curl python3; do command -v $tool > /dev/null && printf '%s ' $tool; done)"
+      say "netplan=$(ls /etc/netplan 2>/dev/null | tr '\n' ' ')"
+      say "nm=$(nmcli -t -f DEVICE,STATE device 2>/dev/null | tr '\n' ' ')"
+      say "failed-units=$(systemctl --failed --no-legend --plain | awk '{print $1}' | tr '\n' ' ')"
+      say "done"
+      systemctl disable vmmc-firstboot.service
+      systemctl poweroff
+      EOF
+    - chmod 755 /target/usr/local/sbin/vmmc-firstboot
+    - |
+      cat > /target/etc/systemd/system/vmmc-firstboot.service <<'EOF'
+      [Unit]
+      Description=vmmc test: report to COM1 and power off
+      Wants=network-online.target
+      After=network-online.target display-manager.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/vmmc-firstboot
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+    - ln -s /etc/systemd/system/vmmc-firstboot.service /target/etc/systemd/system/multi-user.target.wants/vmmc-firstboot.service
+    - "echo 'VMMC-UBUNTU: installed' > /dev/ttyS0"
+  shutdown: poweroff

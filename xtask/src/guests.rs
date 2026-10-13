@@ -32,9 +32,17 @@ const INITRD: Artifact = Artifact {
     url: "https://cloud-images.ubuntu.com/releases/26.04/release-20260927/unpacked/ubuntu-26.04-server-cloudimg-amd64-initrd-generic",
     sha256: "c9f23b4ac34a20df6a1d344b44bf2597faa48799d814cbc206b3974c6ead5215",
 };
-/// Modules the test init loads, with what they depend on.
 /// Modules the test init loads, with what they depend on. Built-in ones are skipped.
-const MODULES: [&str; 4] = ["nvme", "ahci", "isofs", "e1000e"];
+const MODULES: [&str; 8] = [
+    "nvme",
+    "ahci",
+    "isofs",
+    "e1000e",
+    "tpm_crb",
+    "xhci_pci",
+    "usbhid",
+    "hid_generic",
+];
 
 /// A static x86-64 BusyBox. busybox.net publishes no checksums for these builds; the
 /// hash pins the file as first downloaded.

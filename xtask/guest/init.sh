@@ -81,6 +81,44 @@ else
     echo "VMMC-TEST: disk=FAILED ${disk#/dev/}"
 fi
 
+# USB (vmmc.usb): the xHCI's tablet and keyboard, by their pid.codes IDs.
+if grep -q vmmc.usb /proc/cmdline; then
+    found=
+    for _ in $(seq 50); do
+        found=
+        for device in /sys/bus/usb/devices/*; do
+            [ "$(cat "$device/idVendor" 2>/dev/null)" = 1209 ] || continue
+            case "$(cat "$device/idProduct")" in
+                0001) found="$found tablet" ;;
+                0002) found="$found keyboard" ;;
+            esac
+        done
+        [ "$found" = " tablet keyboard" ] || [ "$found" = " keyboard tablet" ] && break
+        sleep 0.1
+    done
+    case "$found" in
+        *tablet*keyboard* | *keyboard*tablet*) echo "VMMC-TEST: usb=tablet,keyboard" ;;
+        *) echo "VMMC-TEST: usb=FAILED$found" ;;
+    esac
+fi
+
+# The TPM (vmmc.tpm): a TPM 2.0, with PCR 0 extended by the firmware's measurements,
+# and the physical presence interface version the ACPI _DSM reports.
+if grep -q vmmc.tpm /proc/cmdline; then
+    for _ in $(seq 50); do
+        [ -e /sys/class/tpm/tpm0 ] && break
+        sleep 0.1
+    done
+    version=$(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null)
+    pcr0=$(cat /sys/class/tpm/tpm0/pcr-sha256/0 2>/dev/null)
+    ppi=$(cat /sys/class/tpm/tpm0/ppi/version 2>/dev/null)
+    if [ "$version" = 2 ] && [ -n "$pcr0" ] && echo "$pcr0" | grep -q '[1-9A-Fa-f]'; then
+        echo "VMMC-TEST: tpm=2 pcr0=measured ppi=$ppi"
+    else
+        echo "VMMC-TEST: tpm=FAILED version=$version pcr0=$pcr0 ppi=$ppi"
+    fi
+fi
+
 # Networking (vmmc.http=PORT): DHCP from the NAT, then an HTTP fetch from the server
 # xtask runs on the host, through the gateway, and a DNS lookup.
 http=$(sed -n 's/.*vmmc\.http=\([0-9]*\).*/\1/p' /proc/cmdline)

@@ -8,6 +8,8 @@
 //! - **Answer disc:** a second ISO with `autounattend.xml` and a first-logon script that
 //!   writes `VMMC-WIN:` markers to COM1 and shuts down.
 //! - **Progress:** a screenshot every 30 s in `target/win11-test/screens`.
+//! - **Enlightenments:** `VMMC_ENLIGHTENMENTS=1` gives the VM Hyper-V enlightenments
+//!   (`--enlightenments`), for comparing install times.
 //!
 //! It takes 20 to 60 minutes.
 
@@ -16,7 +18,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::firmware::Session;
 use crate::{build_vmmc_vmx, iso, native, workspace};
@@ -24,6 +26,7 @@ use crate::{build_vmmc_vmx, iso, native, workspace};
 const ISO_VAR: &str = "VMMC_WIN11_ISO";
 const IMAGE_VAR: &str = "VMMC_WIN11_IMAGE";
 const LANGUAGE_VAR: &str = "VMMC_WIN11_LANG";
+const ENLIGHTENMENTS_VAR: &str = "VMMC_ENLIGHTENMENTS";
 /// How `sources/lang.ini` on a Windows ISO starts.
 const LANG_INI: &[u8] = b"[Available UI Languages]";
 const DEFAULT_IMAGE: &str = "Windows 11 Pro";
@@ -39,8 +42,6 @@ const GENERIC_KEYS: [(&str, &str); 6] = [
 ];
 const AUTOUNATTEND: &str = include_str!("../guest/autounattend.xml");
 const FIRST_LOGON: &str = include_str!("../guest/firstlogon.ps1");
-/// Checks Windows Setup skips while vmmc has no TPM or enrolled Secure Boot keys.
-const BYPASSES: [&str; 3] = ["BypassTPMCheck", "BypassSecureBootCheck", "BypassCPUCheck"];
 const DISK_SIZE: u64 = 64 << 30;
 const MEMORY_MIB: &str = "8192";
 const CPUS: &str = "4";
@@ -49,11 +50,12 @@ const CD_PROMPT_TIMEOUT: Duration = Duration::from_secs(180);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(90 * 60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(300);
 /// What the first-logon script must report, in order.
-const MARKERS: [&str; 6] = [
+const MARKERS: [&str; 7] = [
     "VMMC-WIN: booted",
     "VMMC-WIN: cpus=4",
-    "VMMC-WIN: secureboot=",
-    "VMMC-WIN: tpm=",
+    "VMMC-WIN: secureboot=True",
+    "VMMC-WIN: tpm=True",
+    "VMMC-WIN: usb-tablet=True",
     "VMMC-WIN: net=ok",
     "VMMC-WIN: done",
 ];
@@ -120,26 +122,11 @@ fn iso_language(iso: &Path) -> Result<String, String> {
     }
 }
 
-/// The answer file for `image` in `language`, with the check bypasses while vmmc
-/// needs them.
+/// The answer file for `image` in `language`. Windows 11's hardware checks run as
+/// they would on a PC: vmmc has the TPM 2.0 and Secure Boot they ask for.
 fn answer_file(image: &str, key: &str, language: &str) -> String {
-    let commands: String = BYPASSES
-        .iter()
-        .enumerate()
-        .map(|(i, value)| {
-            format!(
-                "        <RunSynchronousCommand wcm:action=\"add\">\n          \
-                 <Order>{}</Order>\n          \
-                 <Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v {value} /t REG_DWORD /d 1 /f</Path>\n        \
-                 </RunSynchronousCommand>\n",
-                i + 1
-            )
-        })
-        .collect();
-    let labconfig = format!("      <RunSynchronous>\n{commands}      </RunSynchronous>");
     AUTOUNATTEND
         .replace("\r\n", "\n")
-        .replace("@@LABCONFIG@@", &labconfig)
         .replace("@@IMAGE@@", image)
         .replace("@@KEY@@", key)
         .replace("@@LANGUAGE@@", language)
@@ -202,7 +189,8 @@ pub fn test() -> Result<(), String> {
         .arg("--firmware")
         .arg(native.join("OVMF_CODE.fd"))
         .arg("--vars-template")
-        .arg(native.join("OVMF_VARS.fd"))
+        .arg(native.join("OVMF_VARS.secboot.fd"))
+        .arg("--tpm")
         .arg("--vm-dir")
         .arg(dir.join("vm"))
         .arg("--cdrom")
@@ -216,11 +204,15 @@ pub fn test() -> Result<(), String> {
         .arg("--screenshot")
         .arg(dir.join("screens"))
         .args(["--screenshot-every", "30"]);
+    if env::var(ENLIGHTENMENTS_VAR).is_ok_and(|value| value == "1") {
+        command.arg("--enlightenments");
+    }
     eprintln!("$ {command:?}");
     eprintln!(
         "installing {image}; progress screenshots in {}",
         dir.join("screens").display()
     );
+    let started = Instant::now();
     let mut vm = Session::spawn(command)?;
 
     let result = (|| {
@@ -241,6 +233,12 @@ pub fn test() -> Result<(), String> {
         let mut at = at;
         for marker in MARKERS {
             at = vm.expect(marker, at, INSTALL_TIMEOUT)?;
+            if marker == MARKERS[0] {
+                eprintln!(
+                    "xtask: installed and logged on after {}s",
+                    started.elapsed().as_secs()
+                );
+            }
         }
         Ok::<usize, String>(at)
     })();
@@ -260,7 +258,10 @@ pub fn test() -> Result<(), String> {
     result?;
     match status {
         Some(status) if status.success() => {
-            eprintln!("Windows 11 install test passed");
+            eprintln!(
+                "Windows 11 install test passed in {}s",
+                started.elapsed().as_secs()
+            );
             Ok(())
         }
         Some(status) => Err(format!("vmmc-vmx exited with {status}")),
@@ -292,11 +293,11 @@ mod tests {
         assert_eq!(xml.matches("de-DE").count(), 9);
         assert!(!xml.contains("@@"));
         assert!(xml.contains("<Value>Windows 11 Pro</Value>"));
-        assert!(xml.contains("BypassTPMCheck"));
+        assert!(!xml.contains("LabConfig"), "no hardware check bypasses");
         assert_eq!(
             xml.matches("<RunSynchronousCommand").count(),
-            4,
-            "3 bypasses + BypassNRO"
+            1,
+            "just BypassNRO"
         );
         // Well-formed enough: every opened element is closed.
         for tag in [

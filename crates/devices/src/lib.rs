@@ -15,6 +15,8 @@ pub mod nic;
 pub mod pci;
 pub mod storage;
 pub mod timer;
+pub mod tpm;
+pub mod usb;
 pub mod virtio;
 
 use std::sync::Arc;

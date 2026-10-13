@@ -3,7 +3,7 @@
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::net::{TcpListener, UdpSocket};
+use std::net::{Ipv4Addr, TcpListener, UdpSocket};
 use std::sync::Mutex;
 use std::time::{Duration, Instant as StdInstant};
 
@@ -11,7 +11,10 @@ use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::{dhcpv4, tcp, udp};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint};
+use smoltcp::wire::{
+    ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
+    EthernetRepr, HardwareAddress, IpAddress, IpCidr, IpEndpoint,
+};
 
 use super::*;
 
@@ -319,4 +322,71 @@ fn udp_flows_reach_the_host_and_back() {
         "the reply comes from where the guest sent it"
     );
     echo.join().unwrap();
+}
+
+/// A broadcast ARP request from the guest's MAC: who has `target`, tell `sender`.
+fn arp_request(sender: Ipv4Addr, target: Ipv4Addr) -> Vec<u8> {
+    let mac = EthernetAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+    let arp = ArpRepr::EthernetIpv4 {
+        operation: ArpOperation::Request,
+        source_hardware_addr: mac,
+        source_protocol_addr: sender,
+        target_hardware_addr: EthernetAddress([0; 6]),
+        target_protocol_addr: target,
+    };
+    let mut frame = vec![0u8; 14 + arp.buffer_len()];
+    let mut ethernet = EthernetFrame::new_unchecked(&mut frame[..]);
+    EthernetRepr {
+        src_addr: mac,
+        dst_addr: EthernetAddress::BROADCAST,
+        ethertype: EthernetProtocol::Arp,
+    }
+    .emit(&mut ethernet);
+    arp.emit(&mut ArpPacket::new_unchecked(ethernet.payload_mut()));
+    frame
+}
+
+#[test]
+fn arp_is_answered_only_for_the_nats_own_addresses() {
+    let config = NatConfig::default();
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let sink = sent.clone();
+    let nat = Nat::start(
+        config.clone(),
+        Arc::new(move |frame: &[u8]| sink.lock().unwrap().push(frame.to_vec())),
+    )
+    .unwrap();
+    // The guest announcing its own address (RFC 5227), asking for a host that isn't
+    // there, then asking for the gateway, which is the one to answer.
+    nat.send(&arp_request(config.guest, config.guest));
+    nat.send(&arp_request(config.guest, Ipv4Addr::new(10, 0, 2, 77)));
+    nat.send(&arp_request(config.guest, config.gateway));
+
+    let deadline = StdInstant::now() + TIMEOUT;
+    let answered = loop {
+        let replies: Vec<_> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|frame| {
+                let ethernet = EthernetFrame::new_checked(&frame[..]).ok()?;
+                let packet = ArpPacket::new_checked(ethernet.payload()).ok()?;
+                match ArpRepr::parse(&packet).ok()? {
+                    ArpRepr::EthernetIpv4 {
+                        operation: ArpOperation::Reply,
+                        source_protocol_addr,
+                        ..
+                    } => Some(source_protocol_addr),
+                    _ => None,
+                }
+            })
+            .collect();
+        if !replies.is_empty() {
+            break replies;
+        }
+        assert!(StdInstant::now() < deadline, "the gateway never answered");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    // The NAT handles frames in order, so the first two were dealt with by now.
+    assert_eq!(answered, [config.gateway]);
 }

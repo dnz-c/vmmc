@@ -1,12 +1,17 @@
 # cargo-deny policy. The open-core licence model depends on the core staying free of
-# copyleft code, so only permissive licences are allowed.
+# copyleft code, so only permissive licences are allowed, plus Slint's royalty-free
+# licence for the console window (see below).
 
 [graph]
 targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
 all-features = true
 
 [advisories]
-ignore = []
+ignore = [
+    # Unmaintained, not vulnerable; it parses the title-bar font of winit's Wayland
+    # decorations (sctk-adwaita), which vmmc's Windows builds don't contain.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser: unmaintained, Linux Wayland decorations only" },
+]
 
 [licenses]
 allow = [
@@ -15,7 +20,12 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "BSL-1.0",
     "ISC",
+    # Slint, under its royalty-free licence for desktop applications rather than
+    # GPL-3.0: free for proprietary desktop apps that show Slint's attribution, which
+    # the console window's About box does with the AboutSlint widget.
+    "LicenseRef-Slint-Royalty-free-2.0",
     "MIT",
     "Unicode-3.0",
     "Zlib",

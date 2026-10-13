@@ -7,6 +7,7 @@ mod guests;
 mod iso;
 mod modules;
 mod native;
+mod ubuntu;
 mod windows;
 
 use std::env;
@@ -22,7 +23,8 @@ usage: cargo xtask <task>
 tasks:
   ci            format check, clippy, tests and cargo-deny, as CI runs them
   fetch-guests  download the test kernel and BusyBox, and build the test initramfs
-  fetch-native  download the CI-built OVMF into target/native (needs `gh auth login`)
+  fetch-native  download the CI-built OVMF and TPM into target/native (needs
+                `gh auth login`)
   boot-test     every WHP test below, plus the hypervisor backend's own; fails if the
                 Windows hypervisor isn't running
   linux-test    boot the test Linux directly on WHP (virtio disk)
@@ -31,17 +33,21 @@ tasks:
                 boot the test Linux through OVMF from an EFI system partition on NVMe
   uefi-cd-test  boot the test Linux through OVMF from an ISO in the AHCI DVD drive
   win11-test    install Windows 11 unattended from $VMMC_WIN11_ISO (20-60 minutes)
+  ubuntu-desktop-test
+                download Ubuntu 26.04 Desktop, install it with autoinstall and boot it
+                (15-60 minutes)
   linux-shell   boot the test Linux guest with a shell on this terminal";
 
 /// How long the Linux test guest gets to boot, test its disk and power off.
 const LINUX_TIMEOUT: Duration = Duration::from_secs(90);
 const LINUX_CPUS: &str = "4";
 /// What the test guest's init prints when everything works, in order.
-const LINUX_MARKERS: [&str; 7] = [
+const LINUX_MARKERS: [&str; 8] = [
     "VMMC-TEST: booted",
     "VMMC-TEST: cpus=4",
     "VMMC-TEST: efi=no",
     "VMMC-TEST: disk=ok vda",
+    "VMMC-TEST: usb=tablet,keyboard",
     "VMMC-TEST: net=ok",
     "VMMC-TEST: dns=ok",
     "VMMC-TEST: done",
@@ -67,6 +73,7 @@ fn main() -> ExitCode {
         Some("uefi-linux-test") => firmware::linux_test(),
         Some("uefi-cd-test") => firmware::cd_test(),
         Some("win11-test") => windows::test(),
+        Some("ubuntu-desktop-test") => ubuntu::test(),
         Some("linux-shell") => linux_shell(),
         _ => {
             eprintln!("{USAGE}");
@@ -144,7 +151,7 @@ fn linux_boot_test() -> Result<(), String> {
     let mut command = vmmc_vmx_command(
         &exe,
         &guest,
-        &format!("console=ttyS0 panic=-1 vmmc.http={http}"),
+        &format!("console=ttyS0 panic=-1 vmmc.http={http} vmmc.usb"),
     );
     command.args(["--nic", "virtio"]);
     command.stdin(Stdio::null()).stdout(Stdio::piped());

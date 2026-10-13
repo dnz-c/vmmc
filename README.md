@@ -16,18 +16,23 @@ Workstation Pro for everyday VM users. `vmmc` is a working codename.
 Phase 1 of [the roadmap](docs/ROADMAP.md) is done: **Linux boots on the Windows
 Hypervisor Platform**. Ubuntu 26.04's kernel reaches userspace in about a third of a
 second on 4 vCPUs, uses a virtio disk, and powers off cleanly. Phase 2 (installing
-Windows 11 from an ISO) is under way: **UEFI firmware (OVMF) boots**, keeps its
-variables per VM, and runs its shell, and **Windows installs unattended** from an ISO onto
-NVMe (verified with Windows 10 22H2).
+Windows 11 from an ISO) is nearly done:
+- **Windows installs unattended** from an ISO onto NVMe, with Secure Boot on and a TPM
+  2.0, and comes up with its USB tablet and network working (verified with Windows 10
+  22H2; a Windows 11 ISO is still to be tried).
+- **Ubuntu 26.04 Desktop installs** with autoinstall and boots to GNOME.
+- **A console window** shows the screen and takes the keyboard and pointer.
 
 What exists:
 - **Platform:** a Q35 PC (MCH host bridge, ICH9 LPC) with ACPI, SMP, an IOAPIC, PIT,
   RTC, 16550 serial console, PCIe (port I/O and ECAM), NVMe and virtio-blk disks, and
   an AHCI controller for SATA disks and DVD drives, a linear-framebuffer display
-  adapter, and virtio-net or Intel e1000e network adapters on user-mode NAT.
+  adapter, virtio-net or Intel e1000e network adapters on user-mode NAT, a PS/2
+  keyboard and mouse, an xHCI controller with a USB tablet and keyboard, and a TPM 2.0.
 - **Boot:** UEFI firmware from flash (fw_cfg, ACPI through the table loader, SMBIOS), or
   direct Linux boot (bzImage + initramfs) in 64-bit mode.
-- **Worker:** `vmmc-vmx`, which puts the guest's serial console on your terminal.
+- **Worker:** `vmmc-vmx`, which puts the guest's serial console on your terminal and,
+  with `--display window`, its screen in a window.
 
 ## Requirements
 
@@ -50,19 +55,21 @@ What exists:
 cargo test --workspace                          # unit and fake-hypervisor tests
 cargo xtask ci                                  # fmt, clippy, tests, cargo-deny
 cargo xtask fetch-guests                        # test kernel, BusyBox initramfs, disk
-cargo xtask fetch-native                        # CI-built OVMF (needs `gh auth login`)
+cargo xtask fetch-native                        # CI-built OVMF and TPM (needs `gh auth login`)
 cargo xtask boot-test                           # every WHP boot test below
 cargo xtask linux-test                          # test Linux, booted directly
 cargo xtask firmware-test                       # OVMF's shell and variable store
 cargo xtask uefi-linux-test                     # test Linux through OVMF, from NVMe
 cargo xtask uefi-cd-test                        # test Linux through OVMF, from an ISO
 cargo xtask win11-test                          # unattended Windows 11 install (needs VMMC_WIN11_ISO)
+cargo xtask ubuntu-desktop-test                 # Ubuntu 26.04 Desktop autoinstall (downloads 6.5 GB)
 cargo xtask linux-shell                         # test Linux with a shell on this terminal
 ```
 
 `cargo xtask ci` needs `cargo-deny` (`cargo install cargo-deny --locked`).
-`fetch-native` and `firmware-test` download OVMF from this repository's releases with the
-GitHub CLI, so they need an account with access to it.
+`fetch-native` and `firmware-test` download OVMF and the TPM libraries from this
+repository's releases with the GitHub CLI, so they need an account with access to it.
+Build after fetching: a `vmmc-vmx` built without the TPM libraries refuses `--tpm`.
 
 ## Running a VM
 
@@ -78,13 +85,25 @@ Windows and Linux all have drivers for. `--disk PATH,sata` puts it on the AHCI
 controller, and plain `--disk PATH` makes it virtio-blk. `--cdrom ISO` adds a DVD drive
 with that disc.
 `--vm-dir` holds what the VM keeps between runs: its UEFI variable store (`nvram.fd`,
-copied from `OVMF_VARS.fd` next to the firmware on first use; `--vars-template` picks
-another, such as `OVMF_VARS.secboot.fd` for Secure Boot) and its SMBIOS UUID.
+copied on first use from `OVMF_VARS.secboot.fd` next to the firmware, which has Secure
+Boot on with Microsoft's keys, or else `OVMF_VARS.fd`; `--vars-template` picks another)
+and its SMBIOS UUID. `--tpm` gives the VM a TPM 2.0 whose state lives there too
+(`tpm-state.bin`).
 `--firmware-log FILE` saves the firmware's debug output when it's a debug build.
 `--nic e1000e` (or `virtio`) adds a network adapter behind a user-mode NAT: DHCP gives the
 guest 10.0.2.15, DNS uses the host's resolver, and 10.0.2.2 reaches the host itself.
 `--screenshot DIR` saves the screen as PNG when the VM stops and on each Ctrl-A s;
 add `--screenshot-every SECS` for a timed series.
+`--enlightenments` exposes Hyper-V's paravirtual interfaces (reference TSC page, synthetic
+timers, hypercalls for TLB flushes and IPIs), which the Windows hypervisor implements
+itself; Windows guests use them.
+`--display window` shows the guest's screen in a window:
+- **Pointer:** the host pointer drives a USB tablet, so it moves freely in and out.
+- **Keyboard:** while the window is in front, every key goes to the guest, the Windows
+  key and Alt+Tab included.
+- **Toolbar:** Ctrl+Alt+Del (which Windows never lets an application intercept),
+  the ACPI power button, reset, a screenshot (with `--screenshot`), and About.
+- **Closing:** closing the window stops the VM.
 
 Or a Linux kernel, booted directly:
 
@@ -111,11 +130,12 @@ status: 0 when the guest powers off (or you quit), 2 when it resets with `--no-r
 | `crates/hv` | Backend-neutral hypervisor traits: partition, vCPU, exits, interrupts |
 | `crates/hv-whp` | Windows Hypervisor Platform backend, including its instruction emulator |
 | `crates/vm-core` | Guest memory, port/MMIO buses and the vCPU run loop |
-| `crates/devices` | Device models: chipset, firmware interfaces (fw_cfg, flash), PCI, NVMe, AHCI/ATAPI, virtio |
+| `crates/devices` | Device models: chipset, firmware interfaces (fw_cfg, flash), PCI, NVMe, AHCI/ATAPI, e1000e, xHCI and USB HID, PS/2, TPM CRB, virtio |
 | `crates/disk` | Disk images: the block backend trait, raw (sparse) image files |
 | `crates/net` | User-mode NAT networking (smoltcp): DHCP, DNS, TCP/UDP to host sockets |
+| `crates/tpm` | The TPM 2.0 engine: Microsoft's reference implementation, linked from the CI build |
 | `crates/machine` | The x86 PC platform: memory map, ACPI, SMBIOS, firmware and Linux boot, vCPU threads |
-| `bins/vmmc-vmx` | Runs one VM with its console on the terminal |
+| `bins/vmmc-vmx` | Runs one VM, with its serial console on the terminal and optionally its screen in a Slint window |
 | `xtask` | Developer tasks and test guest artifacts |
 | `third_party` | Upstream crates with small Windows-build patches (see each `VMMC-PATCH.md`) |
 
@@ -123,6 +143,9 @@ status: 0 when the guest powers off (or you quit), 2 when it resets with `--no-r
 
 Apache-2.0, see [LICENSE](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md) before sending
 changes.
+
+The console window uses [Slint](https://slint.dev) under its royalty-free licence; the
+window's About box carries Slint's attribution.
 
 VMware and VMware Workstation are trademarks of Broadcom Inc. This project is not
 affiliated with or endorsed by Broadcom.

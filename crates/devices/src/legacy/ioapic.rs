@@ -131,6 +131,11 @@ impl IoApic {
                     (old & !0xffff_ffff) | u64::from(value)
                 };
                 self.redirection[pin] = (new & !READ_ONLY) | (old & READ_ONLY);
+                tracing::trace!(
+                    pin,
+                    entry = format_args!("{:#x}", self.redirection[pin]),
+                    "IOAPIC redirection"
+                );
                 // Unmasking (or switching to level) a pin that is already high fires it.
                 if self.redirection[pin] & TRIGGER_LEVEL != 0 {
                     self.service_level(pin);

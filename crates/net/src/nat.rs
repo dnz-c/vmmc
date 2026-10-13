@@ -7,7 +7,8 @@
 //!   resets follow. Connections to the gateway address go to the host's loopback.
 //! - **UDP:** handled without smoltcp. DHCP (port 67) and DNS (to the DNS address) are
 //!   answered here; every other datagram goes out through a host UDP socket per flow.
-//! - **ARP and ping to the gateway:** smoltcp.
+//! - **ARP and ping to the gateway:** smoltcp. ARP is only answered for the NAT's
+//!   own addresses (see [`Engine::guest_frame`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -22,8 +23,8 @@ use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, IpAddress, IpCidr,
-    IpListenEndpoint, IpProtocol, Ipv4Packet, TcpPacket, UdpPacket,
+    ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress,
+    IpAddress, IpCidr, IpListenEndpoint, IpProtocol, Ipv4Packet, TcpPacket, UdpPacket,
 };
 
 use crate::frames::{self, UdpDatagram};
@@ -341,6 +342,21 @@ impl Engine {
         let source = ethernet.src_addr();
         if source.is_unicast() {
             self.guest_mac = Some(source);
+        }
+        // AnyIP makes smoltcp answer ARP for every address, the guest's own included.
+        // A guest checking its new address (RFC 5227, as NetworkManager does) takes
+        // that for a conflict and leaves the interface without routes. So ARP only
+        // reaches smoltcp for the NAT's own addresses.
+        if ethernet.ethertype() == EthernetProtocol::Arp
+            && let Ok(packet) = ArpPacket::new_checked(ethernet.payload())
+            && let Ok(ArpRepr::EthernetIpv4 {
+                target_protocol_addr,
+                ..
+            }) = ArpRepr::parse(&packet)
+            && target_protocol_addr != self.config.gateway
+            && target_protocol_addr != self.config.dns
+        {
+            return;
         }
         if ethernet.ethertype() == EthernetProtocol::Ipv4
             && let Ok(ip) = Ipv4Packet::new_checked(ethernet.payload())

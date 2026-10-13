@@ -74,6 +74,11 @@ impl MsixTable {
         self.entries.is_empty()
     }
 
+    /// Whether MSI-X is on, so the device signals through it rather than INTx.
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// Applies the capability's enable and function-mask bits.
     pub fn set_control(&mut self, enabled: bool, function_masked: bool) {
         self.enabled = enabled;
@@ -96,7 +101,16 @@ impl MsixTable {
             tracing::debug!(vector, "MSI-X vector out of range");
             return;
         };
-        if self.deliverable(entry) {
+        let deliverable = self.deliverable(entry);
+        tracing::trace!(
+            vector,
+            deliverable,
+            enabled = self.enabled,
+            function_masked = self.function_masked,
+            entry_masked = entry[3] & VECTOR_MASKED != 0,
+            "MSI-X notify"
+        );
+        if deliverable {
             self.sink.send(message(entry));
         } else {
             self.pending[usize::from(vector)] = true;

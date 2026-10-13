@@ -29,12 +29,13 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 /// From the shell starting Linux to Linux powering off.
 const LINUX_TIMEOUT: Duration = Duration::from_secs(90);
 /// What the test Linux must print when booted through UEFI, in order.
-const LINUX_MARKERS: [&str; 8] = [
+const LINUX_MARKERS: [&str; 9] = [
     "VMMC-TEST: booted",
     "VMMC-TEST: cpus=4",
     "VMMC-TEST: efi=yes",
     "VMMC-TEST: dmi=vmmc Virtual Machine",
     "VMMC-TEST: disk=ok nvme0n2",
+    "VMMC-TEST: tpm=2 pcr0=measured ppi=1.3",
     "VMMC-TEST: net=ok",
     "VMMC-TEST: dns=ok",
     "VMMC-TEST: done",
@@ -204,7 +205,7 @@ fn boot_linux(command: Command, dir: &Path, markers: &[&str]) -> Result<(), Stri
 pub fn linux_test() -> Result<(), String> {
     let dir = test_dir("uefi-linux-test")?;
     let http = crate::serve_http()?;
-    let files = linux_boot_files(&format!(" vmmc.http={http}"))?;
+    let files = linux_boot_files(&format!(" vmmc.http={http} vmmc.tpm"))?;
     let files: Vec<(&str, &[u8])> = files.iter().map(|(n, d)| (*n, d.as_slice())).collect();
     let esp = dir.join("esp.raw");
     esp::build(&esp, ESP_SIZE, &files)?;
@@ -215,7 +216,8 @@ pub fn linux_test() -> Result<(), String> {
         .arg(format!("{},nvme", esp.display()))
         .arg("--disk")
         .arg(format!("{},nvme", scratch.display()))
-        .args(["--nic", "e1000e"]);
+        .args(["--nic", "e1000e"])
+        .arg("--tpm");
     boot_linux(command, &dir, &LINUX_MARKERS)?;
     eprintln!("UEFI Linux test passed");
     Ok(())

@@ -1,7 +1,8 @@
-//! Native dependencies built by the `native-deps` workflow: OVMF today, the TPM
-//! simulator later. They are release assets of the (private) GitHub repo, fetched
-//! through the logged-in `gh` CLI into `target/native/` and checked against the hashes
-//! pinned here.
+//! Native dependencies built by the `native-deps` workflow: OVMF, and the TPM 2.0
+//! reference implementation with OpenSSL as static libraries (which the `tpm` crate
+//! links). They are release assets of the (private) GitHub repo, fetched through the
+//! logged-in `gh` CLI into `target/native/` and checked against the hashes pinned
+//! here. A build made before they're fetched has no TPM: rebuild after fetching.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,10 +11,10 @@ use std::process::Command;
 use crate::guests::{read, verify};
 
 const REPO: &str = "dnz-c/vmmc";
-const RELEASE: &str = "native-deps-2";
+const RELEASE: &str = "native-deps-4";
 
 /// `(file, SHA-256)` for each asset, from the release's SHA256SUMS.
-const ASSETS: [(&str, &str); 7] = [
+const ASSETS: [(&str, &str); 15] = [
     // Release build, Secure Boot capable: what VMs run.
     (
         "OVMF_CODE.fd",
@@ -33,9 +34,10 @@ const ASSETS: [(&str, &str); 7] = [
         "OVMF_VARS.fd",
         "5d2ac383371b408398accee7ec27c8c09ea5b74a0de0ceea6513388b15be5d1e",
     ),
+    // Secure Boot on, with Microsoft's keys and a platform key made by that build.
     (
         "OVMF_VARS.secboot.fd",
-        "c5f7b33221c90fca199a155099e7ed40163561038a63c686ea347708f0c423e5",
+        "4fcb01d99e64f5424bbe3c0a9b1f2a60b928aa201c080eaee45adb99c033c367",
     ),
     (
         "OVMF-LICENSE.txt",
@@ -44,6 +46,39 @@ const ASSETS: [(&str, &str); 7] = [
     (
         "OVMF-BUILD-INFO.txt",
         "17c376f51dddadf5edc7deeb8586afae2d8cac1ef66292bcc336f2b52ed87789",
+    ),
+    // The TPM: ms-tpm-20-ref's libraries and OpenSSL's libcrypto, all static.
+    (
+        "tpm-Tpm_CoreLib.lib",
+        "44d0bdc2180f047dc72d3b6500ced0f83df7ad633ee55c5e0d556bbb190fea14",
+    ),
+    (
+        "tpm-Tpm_CryptoLib_Math_Ossl.lib",
+        "be67a5155ad663d67b29ecbd1b9a895c522c77283de16216f88925c9a5416692",
+    ),
+    (
+        "tpm-Tpm_CryptoLib_TpmBigNum.lib",
+        "78011fcd35e54a004a2197673323dd8274f61c14e403cbd06c8571d16cbd1acf",
+    ),
+    (
+        "tpm-Tpm_PlatformLib.lib",
+        "75a5b17a9b4c2ac33bc07a69bc34b39156a4d0094f389ca0f93b426a09bfcec6",
+    ),
+    (
+        "tpm-libcrypto.lib",
+        "37730ba588a3c27e123c688b41a461e4c860f97dbbf0c030cd56d0367835e7f0",
+    ),
+    (
+        "TPM-REF-LICENSE.txt",
+        "5a41674aeaf33a1d56fdf01cdcbe4d3f1e3d03f36eed3fa837bfa46999868b7b",
+    ),
+    (
+        "OPENSSL-LICENSE.txt",
+        "7d5450cb2d142651b8afa315b5f238efc805dad827d91ba367d8516bc9d49e7a",
+    ),
+    (
+        "TPM-BUILD-INFO.txt",
+        "33e528672efa6b23ad6360ef6356478c05f6bd4451364132cef5dc3b4d5afc14",
     ),
 ];
 

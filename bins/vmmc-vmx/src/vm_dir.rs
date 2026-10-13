@@ -4,6 +4,8 @@
 //! - `uuid`: the SMBIOS system UUID, generated on first use.
 //! - `mac`: the first network adapter's MAC address, derived from the UUID on first
 //!   use (QEMU's 52:54:00 prefix, locally administered).
+//! - `tpm-state.bin`: the TPM's NV memory, with `--tpm`; a new TPM is manufactured
+//!   when it's missing.
 
 use std::fs;
 use std::hash::{BuildHasher, RandomState};
@@ -12,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 pub struct VmDir {
     pub nvram: PathBuf,
+    pub tpm_state: PathBuf,
     pub uuid: [u8; 16],
     pub mac: [u8; 6],
 }
@@ -55,7 +58,13 @@ pub fn open(dir: &Path, vars_template: &Path) -> Result<VmDir, String> {
         }
         Err(e) => return Err(context("can't read", &mac_path, e)),
     };
-    Ok(VmDir { nvram, uuid, mac })
+    let tpm_state = dir.join("tpm-state.bin");
+    Ok(VmDir {
+        nvram,
+        tpm_state,
+        uuid,
+        mac,
+    })
 }
 
 /// A version 4 (random) UUID. The randomness comes from the standard library's

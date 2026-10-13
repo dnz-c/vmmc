@@ -31,6 +31,7 @@ use devices::firmware::pflash::Pflash;
 use devices::irq::{IrqLine, MsiSink};
 use devices::legacy::acpi_pm::{AcpiPm, PM_BASE, PM_PORTS};
 use devices::legacy::debugcon::{DebugConsole, OVMF_DEBUG_PORT};
+pub use devices::legacy::i8042::PAUSE;
 use devices::legacy::i8042::{I8042, I8042_COMMAND, I8042_DATA, I8042CommandPort};
 use devices::legacy::ioapic::{IOAPIC_BASE, IOAPIC_SIZE, IoApic};
 use devices::legacy::pic::{
@@ -52,6 +53,11 @@ use devices::storage::ata::AtaDisk;
 use devices::storage::atapi::Cdrom;
 use devices::storage::nvme::{NVME_BAR, NVME_BAR_SIZE, Namespace, Nvme};
 use devices::timer::ThreadTicker;
+use devices::tpm::{Crb, TPM_BASE, TPM_SIZE};
+pub use devices::tpm::{SharedTpm, TpmBackend};
+pub use devices::usb::hid::TABLET_MAX;
+use devices::usb::hid::{Keyboard as UsbKeyboard, KeyboardInput, Tablet, TabletInput};
+use devices::usb::xhci::{XHCI_BAR, XHCI_BAR_SIZE, Xhci};
 use devices::virtio::blk::VirtioBlk;
 use devices::virtio::net::VirtioNet;
 use devices::virtio::pci::{CONFIG_BAR, CONFIG_BAR_SIZE, MSIX_BAR, MSIX_BAR_SIZE, VirtioPci};
@@ -74,12 +80,16 @@ pub const MAX_CPUS: u8 = 32;
 /// The PIT's IRQ 0 reaches IOAPIC pin 2 (see the MADT override).
 const PIT_IOAPIC_PIN: u8 = 2;
 const KEYBOARD_IRQ: u8 = 1;
+/// The PS/2 mouse's ISA interrupt.
+pub const MOUSE_IRQ: u8 = 12;
 /// PCI slot of the display adapter.
 pub const DISPLAY_SLOT: u8 = 1;
 /// PCI slot of the NVMe controller.
 pub const NVME_SLOT: u8 = 2;
 /// PCI slot of the e1000e network adapter.
 pub const E1000E_SLOT: u8 = 3;
+/// PCI slot of the xHCI USB controller (with the tablet and keyboard).
+pub const XHCI_SLOT: u8 = 4;
 /// PCI slot of the first virtio disk. Slots 1 to 4 are for the display, NVMe, network
 /// and USB controllers.
 pub const FIRST_VIRTIO_SLOT: u8 = 5;
@@ -174,6 +184,11 @@ pub struct MachineConfig {
     pub serial_output: Box<dyn Write + Send>,
     /// Boot this firmware. Without it, load a kernel with [`Machine::load_linux`].
     pub firmware: Option<FirmwareConfig>,
+    /// A TPM 2.0, behind a CRB. It outlives the machine: each new machine resets it,
+    /// as a platform reset would.
+    pub tpm: Option<SharedTpm>,
+    /// Expose the hypervisor's Hyper-V enlightenments to the guest.
+    pub enlightenments: bool,
 }
 
 /// How a run ended.
@@ -185,6 +200,48 @@ pub enum RunOutcome {
     /// The host asked to stop, with this code.
     Requested(u32),
     Error(String),
+}
+
+/// Host keyboard and mouse input for the guest's PS/2 devices, from any thread.
+#[derive(Clone)]
+pub struct Ps2Input(Arc<Mutex<I8042>>);
+
+impl Ps2Input {
+    /// A key went down or up: its scan code in set 1, `0xE0nn` for extended keys,
+    /// [`PAUSE`] for Pause.
+    pub fn key(&self, scancode: u16, pressed: bool) {
+        lock(&self.0).key(scancode, pressed);
+    }
+
+    /// The pointer moved (right and down positive) and the wheel turned (towards the
+    /// user positive), with these buttons held: bit 0 left, 1 right, 2 middle.
+    pub fn mouse_motion(&self, dx: i32, dy: i32, dz: i32, buttons: u8) {
+        lock(&self.0).mouse_motion(dx, dy, dz, buttons);
+    }
+}
+
+/// Host input for the guest's USB tablet and keyboard, from any thread.
+#[derive(Clone)]
+pub struct UsbInput {
+    xhci: Arc<Mutex<Xhci>>,
+    tablet: TabletInput,
+    keyboard: KeyboardInput,
+}
+
+impl UsbInput {
+    /// The pointer is at `(x, y)`, each 0 to [`TABLET_MAX`] across the screen, with
+    /// these buttons held (bit 0 left, 1 right, 2 middle), and the wheel turned by
+    /// `wheel` notches (away from the user positive).
+    pub fn pointer(&self, x: u16, y: u16, buttons: u8, wheel: i32) {
+        self.tablet.update(x, y, buttons, wheel);
+        lock(&self.xhci).service();
+    }
+
+    /// A key went down or up: its scan code in set 1, `0xE0nn` for extended keys.
+    pub fn key(&self, scancode: u16, pressed: bool) {
+        self.keyboard.key(scancode, pressed);
+        lock(&self.xhci).service();
+    }
 }
 
 /// Feeds host input to the guest's serial console.
@@ -224,6 +281,8 @@ pub struct Machine<P: Partition> {
     serial: Arc<Mutex<Serial>>,
     acpi_pm: Arc<Mutex<AcpiPm>>,
     display: Display,
+    ps2: Ps2Input,
+    usb: UsbInput,
     boot: Option<BootEntry>,
     /// What went wrong, if a vCPU stopped the machine with an error.
     error: Arc<Mutex<Option<String>>>,
@@ -259,6 +318,7 @@ impl<P: Partition + 'static> Machine<P> {
             &PartitionConfig {
                 vcpu_count: config.cpus.into(),
                 local_apic: LocalApicMode::XApic,
+                enlightenments: config.enlightenments,
             },
             &layout.ram,
         )?;
@@ -275,6 +335,12 @@ impl<P: Partition + 'static> Machine<P> {
 
         let ioapic = shared(IoApic::new(acpi::IOAPIC_ID, sink.clone()));
         vm.mmio().insert(IOAPIC_BASE, IOAPIC_SIZE, ioapic.clone())?;
+        let tpm = config.tpm.take();
+        if let Some(tpm) = &tpm {
+            tpm.lock().unwrap_or_else(PoisonError::into_inner).reset();
+            vm.mmio()
+                .insert(TPM_BASE, TPM_SIZE, shared(Crb::new(tpm.clone())))?;
+        }
         vm.set_eoi_handler({
             let ioapic = ioapic.clone();
             move |vector| {
@@ -316,7 +382,8 @@ impl<P: Partition + 'static> Machine<P> {
         // The ACPI PM block decodes wherever the LPC bridge puts it.
         let acpi_pm = shared(AcpiPm::new(clock, irq(acpi::SCI_IRQ), power.clone()));
 
-        let i8042 = shared(I8042::new(irq(KEYBOARD_IRQ), power.clone()));
+        let i8042 = shared(I8042::new(irq(KEYBOARD_IRQ), irq(MOUSE_IRQ), power.clone()));
+        let ps2 = Ps2Input(i8042.clone());
         pio.insert(I8042_DATA.into(), 1, i8042.clone())?;
         pio.insert(I8042_COMMAND.into(), 1, shared(I8042CommandPort(i8042)))?;
 
@@ -326,6 +393,7 @@ impl<P: Partition + 'static> Machine<P> {
 
         let root = Arc::new(Mutex::new(PciRoot::new(vm.mmio().clone())));
         let display;
+        let usb;
         pio.insert(
             CONFIG_IO_BASE.into(),
             CONFIG_IO_PORTS.into(),
@@ -423,6 +491,26 @@ impl<P: Partition + 'static> Machine<P> {
                 }
                 root.add_device(NVME_SLOT, Arc::new(Mutex::new(nvme)));
             }
+            // USB: a tablet, so the pointer needs no capture, and a keyboard.
+            let (tablet, tablet_input) = Tablet::new();
+            let (keyboard, keyboard_input) = UsbKeyboard::new();
+            let mut xhci = Xhci::new(
+                vm.memory().clone(),
+                sink.clone(),
+                Some(irq(acpi::intx_gsi(XHCI_SLOT, 0) as u8)),
+                vec![Box::new(tablet), Box::new(keyboard)],
+            );
+            if direct_boot {
+                xhci.config_mut()
+                    .set_bar_address(XHCI_BAR.into(), allocate(XHCI_BAR_SIZE)?);
+            }
+            let xhci = Arc::new(Mutex::new(xhci));
+            root.add_device(XHCI_SLOT, xhci.clone());
+            usb = UsbInput {
+                xhci,
+                tablet: tablet_input,
+                keyboard: keyboard_input,
+            };
             let mut next_virtio_slot = FIRST_VIRTIO_SLOT;
             for (index, backend) in virtio_disks.into_iter().enumerate() {
                 let blk = VirtioBlk::new(Arc::new(backend), &format!("vmmc-disk{index}"));
@@ -495,6 +583,7 @@ impl<P: Partition + 'static> Machine<P> {
 
         let platform = Arc::new(PlatformState {
             cpus: config.cpus,
+            tpm: tpm.is_some(),
             low_ram_end: layout.low_ram_end,
             mmio64: layout.mmio64,
             root,
@@ -525,6 +614,8 @@ impl<P: Partition + 'static> Machine<P> {
             serial,
             acpi_pm,
             display,
+            ps2,
+            usb,
             boot: None,
             error: Arc::default(),
         })
@@ -571,6 +662,16 @@ impl<P: Partition + 'static> Machine<P> {
 
     pub fn power_button(&self) -> PowerButton {
         PowerButton(self.acpi_pm.clone())
+    }
+
+    /// A handle that moves the guest's USB tablet and types on its USB keyboard.
+    pub fn usb_input(&self) -> UsbInput {
+        self.usb.clone()
+    }
+
+    /// A handle that types on the guest's PS/2 keyboard and moves its PS/2 mouse.
+    pub fn ps2_input(&self) -> Ps2Input {
+        self.ps2.clone()
     }
 
     /// Runs the guest until it powers off, resets or fails, or the host stops it.
@@ -645,6 +746,7 @@ impl<P: Partition + 'static> Machine<P> {
 /// The parts of the platform the ACPI tables describe that the guest can change.
 struct PlatformState {
     cpus: u8,
+    tpm: bool,
     low_ram_end: u64,
     /// The default 64-bit PCI window.
     mmio64: (u64, u64),
@@ -681,6 +783,7 @@ impl PlatformState {
             mmio64: (start, end),
             ecam,
             pm_base,
+            tpm: self.tpm,
         }
     }
 }

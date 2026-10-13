@@ -14,15 +14,17 @@ mod console;
 mod memdump;
 mod screenshot;
 mod vm_dir;
+#[cfg(windows)]
+mod window;
 
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use clap::{Args, Parser, Subcommand};
-use machine::{DiskConfig, DiskInterface, NicConfig, NicModel, RunOutcome};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use machine::{DiskConfig, DiskInterface, NicConfig, NicModel, RunOutcome, SharedTpm, TpmBackend};
 
 #[derive(Parser)]
 #[command(version, about = "Runs one vmmc virtual machine")]
@@ -35,6 +37,16 @@ struct Cli {
 enum Command {
     /// Boot UEFI firmware or a Linux kernel, with the serial console on this terminal.
     Run(RunArgs),
+}
+
+/// Where the guest's screen goes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum DisplayMode {
+    /// Nowhere (screenshots still work).
+    #[default]
+    None,
+    /// A window, with the guest's keyboard and pointer.
+    Window,
 }
 
 #[derive(Args)]
@@ -55,19 +67,29 @@ struct RunArgs {
     /// UEFI firmware code (OVMF_CODE.fd) to boot.
     #[arg(long, requires = "vm_dir")]
     firmware: Option<PathBuf>,
-    /// Variable store a new VM starts from [default: OVMF_VARS.fd next to the
-    /// firmware].
+    /// Variable store a new VM starts from [default: OVMF_VARS.secboot.fd next to
+    /// the firmware (Secure Boot on), or OVMF_VARS.fd if there is none].
     #[arg(long, requires = "firmware")]
     vars_template: Option<PathBuf>,
     /// The VM's state directory (variable store, UUID); created if missing.
     #[arg(long, requires = "firmware")]
     vm_dir: Option<PathBuf>,
+    /// Give the VM a TPM 2.0, its state kept in the VM directory (tpm-state.bin).
+    #[arg(long, requires = "vm_dir")]
+    tpm: bool,
     /// Write the firmware's debug log (port 0x402) to this file.
     #[arg(long, requires = "firmware")]
     firmware_log: Option<PathBuf>,
+    /// Show the screen in a window, which also takes keyboard and pointer input.
+    #[arg(long, value_enum, default_value_t = DisplayMode::None)]
+    display: DisplayMode,
     /// Exit when the guest resets, rather than restarting it.
     #[arg(long)]
     no_reboot: bool,
+    /// Expose Hyper-V enlightenments (reference TSC, synthetic timers, hypercalls),
+    /// which the Windows hypervisor implements itself.
+    #[arg(long)]
+    enlightenments: bool,
     /// Save screenshots (PNG) here: one when the VM stops, and one on each Ctrl-A s.
     #[arg(long, value_name = "DIR")]
     screenshot: Option<PathBuf>,
@@ -92,6 +114,19 @@ struct RunArgs {
     /// Memory in MiB.
     #[arg(long, default_value_t = 1024)]
     memory: u64,
+}
+
+/// The process's TPM, as the machine's CRB uses it.
+struct VmTpm(tpm::Tpm);
+
+impl TpmBackend for VmTpm {
+    fn execute(&mut self, locality: u8, command: &[u8]) -> Vec<u8> {
+        self.0.execute(locality, command)
+    }
+
+    fn reset(&mut self) {
+        self.0.reset();
+    }
 }
 
 /// The MAC address of a directly booted VM's first NIC (QEMU's usual one).
@@ -207,7 +242,11 @@ impl Boot {
         };
         let template = match &args.vars_template {
             Some(template) => template.clone(),
-            None => firmware.with_file_name("OVMF_VARS.fd"),
+            None => ["OVMF_VARS.secboot.fd", "OVMF_VARS.fd"]
+                .map(|name| firmware.with_file_name(name))
+                .into_iter()
+                .find(|path| path.is_file())
+                .unwrap_or_else(|| firmware.with_file_name("OVMF_VARS.fd")),
         };
         let log = args.firmware_log.clone();
         if let Some(log) = &log {
@@ -281,7 +320,7 @@ fn spawn_periodic_screenshots(
 
 #[cfg(windows)]
 fn run(args: RunArgs) -> Result<RunOutcome, Box<dyn Error>> {
-    use machine::{Machine, MachineConfig, layout::MIB};
+    use machine::layout::MIB;
 
     let boot = Boot::load(&args)?;
     let memory = args
@@ -313,18 +352,89 @@ fn run(args: RunArgs) -> Result<RunOutcome, Box<dyn Error>> {
     if let (Some(screenshots), Some(every)) = (&screenshots, args.screenshot_every) {
         spawn_periodic_screenshots(screenshots.clone(), targets.clone(), every.max(1))?;
     }
+    // The TPM outlives each machine: a guest reset is a platform reset to it.
+    let tpm = match (&boot, args.tpm) {
+        (Boot::Firmware { dir, .. }, true) => {
+            let tpm = tpm::Tpm::open(&dir.tpm_state).map_err(|e| e.to_string())?;
+            Some(Arc::new(Mutex::new(VmTpm(tpm))) as SharedTpm)
+        }
+        _ => None,
+    };
+    let title = match &boot {
+        Boot::Firmware { .. } => args
+            .vm_dir
+            .as_deref()
+            .and_then(|dir| dir.file_name())
+            .map_or_else(
+                || "vmmc".into(),
+                |name| format!("vmmc: {}", name.to_string_lossy()),
+            ),
+        Boot::Linux { .. } => "vmmc".into(),
+    };
+    let display = args.display;
+    let vm_targets = targets.clone();
+    let vm_screenshots = screenshots.clone();
+    let run_vm = move || -> Result<RunOutcome, String> {
+        run_machines(
+            &whp,
+            &args,
+            &boot,
+            memory,
+            &nics,
+            tpm.as_ref(),
+            &vm_targets,
+            vm_screenshots.as_deref(),
+        )
+        .map_err(|e| e.to_string())
+    };
+    let outcome = match display {
+        DisplayMode::None => run_vm(),
+        // The window has the main thread; the VM runs beside it.
+        DisplayMode::Window => std::thread::scope(|scope| {
+            let vm = scope.spawn(move || {
+                let outcome = run_vm();
+                window::close();
+                outcome
+            });
+            let shown = window::run(targets.clone(), screenshots.clone(), &title);
+            let outcome = vm
+                .join()
+                .unwrap_or_else(|_| Err("the VM thread panicked".into()));
+            shown.and(outcome)
+        }),
+    };
+    Ok(outcome?)
+}
+
+/// Runs the VM, building a new machine each time the guest resets.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn run_machines(
+    whp: &hv_whp::Whp,
+    args: &RunArgs,
+    boot: &Boot,
+    memory: u64,
+    nics: &[NicConfig],
+    tpm: Option<&SharedTpm>,
+    targets: &console::Targets,
+    screenshots: Option<&screenshot::Screenshots>,
+) -> Result<RunOutcome, Box<dyn Error>> {
+    use machine::{Machine, MachineConfig};
+
     loop {
         // Only one VM may have memory mapped per process, so the previous machine is
         // gone before the next one is built.
         let mut machine = Machine::new(
-            &whp,
+            whp,
             MachineConfig {
                 cpus: args.cpus,
                 memory,
-                disks: disks(&args),
-                nics: nics.clone(),
+                disks: disks(args),
+                nics: nics.to_vec(),
                 serial_output: Box::new(console::ConsoleOutput),
                 firmware: boot.firmware_config()?,
+                tpm: tpm.cloned(),
+                enlightenments: args.enlightenments,
             },
         )?;
         if let Boot::Linux {
@@ -341,13 +451,15 @@ fn run(args: RunArgs) -> Result<RunOutcome, Box<dyn Error>> {
             stop: machine.stop_handle(),
             display: machine.display(),
             memory: machine.memory().clone(),
+            ps2: machine.ps2_input(),
+            usb: machine.usb_input(),
         }));
         let outcome = machine.run();
         targets.set(None);
         let restart =
             matches!(outcome, Ok(RunOutcome::Reset)) && !args.no_reboot && !targets.quitting();
         if !restart
-            && let Some(screenshots) = &screenshots
+            && let Some(screenshots) = screenshots
             && let Err(e) = screenshots.save(&machine.display(), "exit", false)
         {
             eprint!("\r\nvmmc-vmx: screenshot failed: {e}\r\n");

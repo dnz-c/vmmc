@@ -5,6 +5,8 @@
 //! The listing tests run everywhere: they check the hand-assembled guest code.
 #![cfg(windows)]
 
+#[path = "support/cpuid_guest.rs"]
+mod cpuid_guest;
 #[path = "support/hello_guest.rs"]
 mod hello_guest;
 #[path = "support/io_guest.rs"]
@@ -103,6 +105,44 @@ fn io_guest_code_matches_its_listing() {
         0x102f,
         "the prefix must start where `mov si` points"
     );
+}
+
+#[test]
+fn cpuid_guest_code_matches_its_listing() {
+    assert_eq!(
+        listing(&cpuid_guest::CODE, cpuid_guest::LOAD_ADDR),
+        [
+            "cli",
+            "xor ax,ax",
+            "mov ds,ax",
+            "mov eax,40000000h",
+            "cpuid",
+            "mov [2000h],ebx",
+            "mov [2004h],ecx",
+            "mov [2008h],edx",
+            "mov si,2000h",
+            "mov cx,0Ch",
+            "mov dx,0E9h",
+            "lodsb [si]",
+            "out dx,al",
+            "loop 1025h",
+            "mov al,0",
+            "out 0F4h,al",
+            "hlt",
+            "jmp short 102Dh",
+        ]
+    );
+}
+
+#[test]
+fn enlightenments_present_hyper_v_only_when_asked_for() {
+    let Some(whp) = whp() else { return };
+    let (exit, plain) = cpuid_guest::run(&whp, false).expect("running the guest failed");
+    assert_eq!(exit, VmExit::Stopped(StopReason::Requested(0)));
+    assert_ne!(plain, "Microsoft Hv", "no enlightenments by default");
+    let (exit, enlightened) = cpuid_guest::run(&whp, true).expect("running the guest failed");
+    assert_eq!(exit, VmExit::Stopped(StopReason::Requested(0)));
+    assert_eq!(enlightened, "Microsoft Hv");
 }
 
 #[test]

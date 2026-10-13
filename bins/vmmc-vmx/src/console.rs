@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
-use machine::{Display, PowerButton, SerialInput};
+use machine::{Display, PowerButton, Ps2Input, SerialInput, UsbInput};
 
 use crate::screenshot::Screenshots;
 use vm_core::{GuestMemoryMmap, StopHandle, StopReason};
@@ -95,6 +95,8 @@ pub struct Target {
     pub stop: StopHandle,
     pub display: Display,
     pub memory: GuestMemoryMmap,
+    pub ps2: Ps2Input,
+    pub usb: UsbInput,
 }
 
 /// Where console input goes. A guest reset rebuilds the machine, so the target changes
@@ -129,6 +131,14 @@ impl Targets {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// Stops the VM for good: the user closed its window.
+    pub fn quit(&self) {
+        self.quit.store(true, Ordering::Relaxed);
+        if let Some(target) = self.get() {
+            target.stop.request_stop(StopReason::Requested(QUIT_CODE));
+        }
     }
 
     /// Whether the user asked to quit, so the VM must not be restarted.
