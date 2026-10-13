@@ -399,7 +399,12 @@ mod keyboard {
     use super::*;
     use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
+    use windows::Win32::System::Threading::{
+        GetCurrentProcessId, GetCurrentThread, GetCurrentThreadId, SetThreadInformation,
+        SetThreadPriority, THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        THREAD_POWER_THROTTLING_EXECUTION_SPEED, THREAD_POWER_THROTTLING_STATE,
+        THREAD_PRIORITY_TIME_CRITICAL, ThreadPowerThrottling,
+    };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, VK_NUMLOCK, VK_PAUSE,
     };
@@ -460,6 +465,7 @@ mod keyboard {
                     keys,
                     pressed: BTreeSet::new(),
                 }));
+                responsive();
                 // SAFETY: `hook` matches HOOKPROC; the module handle is this
                 // executable's. MSG is a valid out-pointer for the loop.
                 unsafe {
@@ -468,6 +474,7 @@ mod keyboard {
                     });
                     match installed {
                         Ok(installed) => {
+                            tracing::debug!("keyboard hook installed");
                             let _ = ready.send(Some(GetCurrentThreadId()));
                             let mut message = MSG::default();
                             while GetMessageW(&mut message, None, 0, 0).as_bool() {
@@ -498,6 +505,30 @@ mod keyboard {
                 }
                 None
             }
+        }
+    }
+
+    /// Keeps the calling thread quick to wake: the highest priority short of real time,
+    /// and no power throttling. Windows 11 throttles threads it thinks are background
+    /// work (EcoQoS, efficiency cores), and a hook that wakes too late is skipped: the
+    /// key goes past it.
+    fn responsive() {
+        // SAFETY: plain calls on the current thread; `state` is a valid
+        // THREAD_POWER_THROTTLING_STATE of the size passed.
+        unsafe {
+            let thread = GetCurrentThread();
+            let _ = SetThreadPriority(thread, THREAD_PRIORITY_TIME_CRITICAL);
+            let state = THREAD_POWER_THROTTLING_STATE {
+                Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
+                ControlMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+                StateMask: 0,
+            };
+            let _ = SetThreadInformation(
+                thread,
+                ThreadPowerThrottling,
+                (&raw const state).cast(),
+                size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
+            );
         }
     }
 
