@@ -4789,6 +4789,7 @@ name = "vmmc-vmx"
 version = "0.0.1"
 dependencies = [
  "clap",
+ "disk",
  "hv-whp",
  "machine",
  "png",

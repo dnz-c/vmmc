@@ -3,6 +3,7 @@
 //! ```text
 //! vmmc-vmx run --kernel bzImage --initrd initramfs.cpio --disk disk.raw --cpus 4
 //! vmmc-vmx run --firmware OVMF_CODE.fd --vm-dir my-vm --disk disk.raw
+//! vmmc-vmx create-disk disk.raw --size 64G
 //! ```
 //!
 //! A guest reset restarts the VM from scratch (unless `--no-reboot`). Exit status: 0
@@ -36,7 +37,61 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Boot UEFI firmware or a Linux kernel, with the serial console on this terminal.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
+    /// Create an empty raw disk image for `run --disk`. On NTFS it's a sparse file,
+    /// which takes no space until the guest writes to it.
+    CreateDisk(CreateDiskArgs),
+}
+
+#[derive(Args)]
+struct CreateDiskArgs {
+    /// The image to create (with its directory). An existing file is never replaced.
+    path: PathBuf,
+    /// Its size: bytes, or with a K, M, G or T suffix (powers of 1024), like 64G.
+    #[arg(long, value_parser = parse_size)]
+    size: u64,
+}
+
+/// A disk size like `64G`, `500M` or `1T` (powers of 1024), in whole sectors.
+fn parse_size(text: &str) -> Result<u64, String> {
+    let invalid = || format!("{text:?} isn't a size like 64G or 500M");
+    let text = text.trim();
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let (digits, unit) = text.split_at(split);
+    let unit = unit.trim().to_ascii_uppercase();
+    let unit = unit
+        .strip_suffix("IB")
+        .or_else(|| unit.strip_suffix('B'))
+        .unwrap_or(&unit);
+    let shift = match unit {
+        "" => 0,
+        "K" => 10,
+        "M" => 20,
+        "G" => 30,
+        "T" => 40,
+        _ => return Err(invalid()),
+    };
+    let size = digits
+        .parse::<u64>()
+        .map_err(|_| invalid())?
+        .checked_mul(1 << shift)
+        .ok_or_else(invalid)?;
+    if size == 0 || !size.is_multiple_of(512) {
+        return Err(format!(
+            "{text:?}: a disk is a whole number of 512-byte sectors"
+        ));
+    }
+    Ok(size)
+}
+
+fn create_disk(args: &CreateDiskArgs) -> Result<(), String> {
+    if let Some(dir) = args.path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        fs::create_dir_all(dir).map_err(|e| format!("can't create {}: {e}", dir.display()))?;
+    }
+    disk::create_raw(&args.path, args.size)
+        .map_err(|e| format!("can't create {}: {e}", args.path.display()))
 }
 
 /// Where the guest's screen goes.
@@ -527,16 +582,31 @@ fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
-    let Command::Run(args) = Cli::parse().command;
-    match run(args) {
-        Ok(outcome) => {
-            eprintln!("\r\nvmmc-vmx: {}", describe(&outcome));
-            ExitCode::from(exit_code(&outcome))
-        }
-        Err(e) => {
-            eprintln!("vmmc-vmx: {e}");
-            ExitCode::FAILURE
-        }
+    match Cli::parse().command {
+        Command::Run(args) => match run(*args) {
+            Ok(outcome) => {
+                eprintln!("\r\nvmmc-vmx: {}", describe(&outcome));
+                ExitCode::from(exit_code(&outcome))
+            }
+            Err(e) => {
+                eprintln!("vmmc-vmx: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::CreateDisk(args) => match create_disk(&args) {
+            Ok(()) => {
+                eprintln!(
+                    "vmmc-vmx: created {} ({} GiB)",
+                    args.path.display(),
+                    args.size as f64 / f64::from(1 << 30)
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("vmmc-vmx: {e}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 
@@ -602,10 +672,35 @@ mod tests {
     fn parse(args: &[&str]) -> Result<RunArgs, clap::Error> {
         let mut full = vec!["vmmc-vmx", "run"];
         full.extend_from_slice(args);
-        Cli::try_parse_from(full).map(|cli| {
-            let Command::Run(args) = cli.command;
-            args
+        Cli::try_parse_from(full).map(|cli| match cli.command {
+            Command::Run(args) => *args,
+            Command::CreateDisk(_) => unreachable!("parsed a run command"),
         })
+    }
+
+    #[test]
+    fn disk_sizes_parse_in_powers_of_1024() {
+        assert_eq!(parse_size("64G"), Ok(64 << 30));
+        assert_eq!(parse_size("64GiB"), Ok(64 << 30));
+        assert_eq!(parse_size("500m"), Ok(500 << 20));
+        assert_eq!(parse_size("1T"), Ok(1 << 40));
+        assert_eq!(parse_size("4096"), Ok(4096));
+        assert!(parse_size("64X").is_err());
+        assert!(parse_size("G").is_err());
+        assert!(parse_size("0").is_err());
+        assert!(parse_size("1000").is_err(), "not whole sectors");
+    }
+
+    #[test]
+    fn create_disk_makes_its_directory_and_never_replaces_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = CreateDiskArgs {
+            path: dir.path().join("vm").join("disk.raw"),
+            size: 1 << 20,
+        };
+        create_disk(&args).unwrap();
+        assert_eq!(fs::metadata(&args.path).unwrap().len(), 1 << 20);
+        assert!(create_disk(&args).is_err(), "it exists already");
     }
 
     #[test]

@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 clap.workspace = true
+disk.workspace = true
 machine.workspace = true
 png.workspace = true
 tpm.workspace = true

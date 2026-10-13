@@ -113,6 +113,36 @@ on your screen, and one without gets 1280x800.
 For everyday use, run a release build (`cargo run --release -p vmmc-vmx -- run ...`):
 dev builds optimize their dependencies, but vmmc's own device code runs unoptimized.
 
+### A Windows VM from scratch
+
+After `cargo xtask fetch-native` (OVMF and the TPM libraries), from the repository:
+
+```powershell
+cargo build --release -p vmmc-vmx
+$vmmc = "target\release\vmmc-vmx.exe"
+& $vmmc create-disk C:\VMs\windows\disk.raw --size 64G
+& $vmmc run --firmware target\native\OVMF_CODE.fd --vm-dir C:\VMs\windows `
+    --disk C:\VMs\windows\disk.raw,nvme --cdrom C:\path\to\Windows.iso --tpm `
+    --nic e1000e --cpus 4 --memory 8192 --display window
+```
+
+1. When the window shows "Press any key to boot from CD or DVD", press a key (in the
+   window or the terminal). It waits only a few seconds; if you miss it, press Reset.
+2. Install as on a PC. Choose your own keyboard layout: the window sends the keys'
+   positions, so the layout set in Windows applies. Ctrl+Alt+Del is on the toolbar.
+3. Setup restarts a few times. Don't press a key at the CD prompt then, and it boots
+   from the disk.
+4. From then on, start the VM with the same command without `--cdrom`.
+
+- `create-disk` makes a sparse image: it takes space only as Windows writes (about
+  10 GB after a fresh Windows 10 install). Put it on a fast local drive.
+- The VM directory holds the VM's UEFI variables (Secure Boot is on), its TPM and its
+  identity. Keep it with the disk, and don't run two VMs on one disk.
+- Windows 11's requirements (TPM 2.0, Secure Boot, 4 GB of memory, 64 GB of disk) are
+  met. So far Windows 10 22H2 is what's been tested.
+- There's no Windows display driver yet. Windows keeps the resolution the VM starts with
+  (`--resolution WxH`; by default the largest standard one that fits your screen).
+
 Or a Linux kernel, booted directly:
 
 ```powershell
