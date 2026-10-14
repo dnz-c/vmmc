@@ -1,12 +1,16 @@
 // vmmc display driver: a WDDM display-only driver (KMDOD) for vmmc's display adapter,
 // which has the Bochs display register interface (PCI 1234:1111).
 //
-// - BAR 0 is the framebuffer, BAR 2 holds the monitor's EDID at 0x000 and the DISPI
-//   mode registers at 0x500 (16 bits each).
-// - Windows gets a list of resolutions (standard ones that fit the framebuffer, plus
-//   the EDID's preferred one), and the driver sets the one it picks through DISPI.
+// - BAR 0 is the framebuffer, BAR 2 holds the monitor's EDID at 0x000, the DISPI mode
+//   registers at 0x500 (16 bits each) and, on vmmc's adapter, vmmc's own at 0x700.
+// - Windows gets a list of resolutions (standard ones that fit the framebuffer, the
+//   EDID's preferred one, and the size the host's window asks for), and the driver
+//   sets the one it picks through DISPI. vmmc's helper (vmmcdisplay.exe) learns the
+//   window's size through an escape (vmmcdisp_escape.h) and switches to it.
 // - Windows draws into system memory; PresentDisplayOnly copies the changed rectangles
-//   into the framebuffer. There's no hardware cursor: Windows draws it.
+//   into the framebuffer.
+// - The cursor is a hardware one on vmmc's adapter: its image goes to the end of the
+//   framebuffer and the host's window draws it at the pointer.
 //
 // Written from Microsoft's documentation of the display-only driver interface.
 
@@ -17,6 +21,8 @@ extern "C" {
 #include <ntstrsafe.h>
 #endif
 }
+
+#include "vmmcdisp_escape.h"
 
 namespace {
 
@@ -60,6 +66,19 @@ constexpr USHORT DISPI_LINEAR_FRAMEBUFFER = 0x40;
 constexpr USHORT DISPI_KEEP_MEMORY = 0x80;
 constexpr ULONG MAX_WIDTH = 7680;
 constexpr ULONG MAX_HEIGHT = 4320;
+// vmmc's registers (32 bits each), and what they hold.
+constexpr ULONG VMMC_OFFSET = 0x700;
+constexpr ULONG VMMC_MAGIC = 0x434d4d56; // "VMMC"
+constexpr ULONG VMMC_REQUEST_SIZE = 0x08;
+constexpr ULONG VMMC_REQUEST_COUNT = 0x0c;
+constexpr ULONG VMMC_CURSOR_CONTROL = 0x10;
+constexpr ULONG VMMC_CURSOR_SIZE = 0x14;
+constexpr ULONG VMMC_CURSOR_HOTSPOT = 0x18;
+constexpr ULONG VMMC_CURSOR_COUNT = 0x1c;
+// The cursor's image: up to 128x128 straight-alpha BGRA pixels, in rows of 128, in
+// the framebuffer's last 64 KiB.
+constexpr ULONG CURSOR_MAX = 128;
+constexpr SIZE_T CURSOR_BYTES = CURSOR_MAX * CURSOR_MAX * 4;
 
 constexpr ULONG BYTES_PER_PIXEL = 4;
 constexpr D3DDDIFORMAT SOURCE_FORMAT = D3DDDIFMT_A8R8G8B8;
@@ -98,14 +117,32 @@ struct Adapter {
     UCHAR Edid[EDID_SIZE];
     bool EdidValid;
 
+    // The adapter has vmmc's registers: size requests and a hardware cursor.
+    bool Vmmc;
+    // Where modes may go: the framebuffer, less the cursor's image.
+    SIZE_T UsableSize;
+
+    // The standard modes, the EDID's and the firmware's.
     Mode Modes[MAX_MODES];
     ULONG ModeCount;
     Mode Preferred;
+    // The size the host asked for last, width << 32 | height (0 for none), and how
+    // many times it has asked.
+    volatile LONG64 Requested;
+    ULONG RequestCount;
+
+    // The monitor, connected except while a refresh of the modes reconnects it.
+    volatile bool Connected;
 
     // What's on the screen now.
     Mode Current;
     ULONG CurrentPitch;
     bool Visible;
+
+    // The cursor: images given so far, whether it's shown, and the image being built.
+    ULONG CursorCount;
+    bool CursorShown;
+    ULONG CursorPixels[CURSOR_MAX * CURSOR_MAX];
 };
 
 Adapter* AdapterFrom(const void* context) {
@@ -130,7 +167,36 @@ bool Fits(const Adapter* adapter, const Mode& mode) {
     return mode.Width >= 640 && mode.Height >= 480 && mode.Width <= MAX_WIDTH &&
            mode.Height <= MAX_HEIGHT &&
            static_cast<SIZE_T>(mode.Width) * mode.Height * BYTES_PER_PIXEL <=
-               adapter->FramebufferSize;
+               adapter->UsableSize;
+}
+
+ULONG ReadVmmc(Adapter* adapter, ULONG offset) {
+    return READ_REGISTER_ULONG(
+        reinterpret_cast<PULONG>(adapter->Registers + VMMC_OFFSET + offset));
+}
+
+void WriteVmmc(Adapter* adapter, ULONG offset, ULONG value) {
+    WRITE_REGISTER_ULONG(reinterpret_cast<PULONG>(adapter->Registers + VMMC_OFFSET + offset),
+                         value);
+}
+
+Mode Requested(const Adapter* adapter) {
+    LONG64 packed = InterlockedOr64(const_cast<volatile LONG64*>(&adapter->Requested), 0);
+    return {static_cast<ULONG>(packed >> 32), static_cast<ULONG>(packed & 0xffffffff)};
+}
+
+// Takes the host's request from the adapter, if it fits.
+void ReadRequest(Adapter* adapter) {
+    if (!adapter->Vmmc || adapter->Registers == nullptr) {
+        return;
+    }
+    ULONG size = ReadVmmc(adapter, VMMC_REQUEST_SIZE);
+    Mode mode = {size & 0xffff, size >> 16};
+    adapter->RequestCount = ReadVmmc(adapter, VMMC_REQUEST_COUNT);
+    if (Fits(adapter, mode)) {
+        InterlockedExchange64(&adapter->Requested,
+                              (static_cast<LONG64>(mode.Width) << 32) | mode.Height);
+    }
 }
 
 bool Offered(const Adapter* adapter, const Mode& mode) {
@@ -140,6 +206,39 @@ bool Offered(const Adapter* adapter, const Mode& mode) {
         }
     }
     return false;
+}
+
+// The modes on offer now: the fixed ones, and the size the host asked for, which is
+// then the preferred one.
+struct ModeList {
+    Mode Modes[MAX_MODES + 1];
+    ULONG Count;
+    Mode Preferred;
+
+    bool Has(const Mode& mode) const {
+        for (ULONG i = 0; i < Count; i++) {
+            if (SameSize(Modes[i], mode)) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+ModeList OfferedModes(const Adapter* adapter) {
+    ModeList list = {};
+    for (ULONG i = 0; i < adapter->ModeCount; i++) {
+        list.Modes[list.Count++] = adapter->Modes[i];
+    }
+    list.Preferred = adapter->Preferred;
+    Mode requested = Requested(adapter);
+    if (requested.Width != 0 && Fits(adapter, requested)) {
+        if (!list.Has(requested)) {
+            list.Modes[list.Count++] = requested;
+        }
+        list.Preferred = requested;
+    }
+    return list;
 }
 
 void Offer(Adapter* adapter, const Mode& mode) {
@@ -292,7 +391,7 @@ NTSTATUS AddSourceMode(D3DKMDT_HVIDPNSOURCEMODESET set,
     return status;
 }
 
-NTSTATUS AddTargetMode(const Adapter* adapter, D3DKMDT_HVIDPNTARGETMODESET set,
+NTSTATUS AddTargetMode(const Mode& preferred, D3DKMDT_HVIDPNTARGETMODESET set,
                        const DXGK_VIDPNTARGETMODESET_INTERFACE* modes, const Mode& mode) {
     D3DKMDT_VIDPN_TARGET_MODE* info = nullptr;
     NTSTATUS status = modes->pfnCreateNewModeInfo(set, &info);
@@ -300,8 +399,7 @@ NTSTATUS AddTargetMode(const Adapter* adapter, D3DKMDT_HVIDPNTARGETMODESET set,
         return status;
     }
     FillSignalInfo(&info->VideoSignalInfo, mode);
-    info->Preference =
-        SameSize(mode, adapter->Preferred) ? D3DKMDT_MP_PREFERRED : D3DKMDT_MP_NOTPREFERRED;
+    info->Preference = SameSize(mode, preferred) ? D3DKMDT_MP_PREFERRED : D3DKMDT_MP_NOTPREFERRED;
     status = modes->pfnAddMode(set, info);
     if (!NT_SUCCESS(status)) {
         DebugTrace("vmmcdisp: target mode %lux%lu refused: %lx\n", mode.Width, mode.Height, status);
@@ -317,7 +415,7 @@ bool SourceModeSupported(const Adapter* adapter, const D3DKMDT_VIDPN_SOURCE_MODE
         return false;
     }
     Mode mode = {info->Format.Graphics.PrimSurfSize.cx, info->Format.Graphics.PrimSurfSize.cy};
-    return Offered(adapter, mode) &&
+    return OfferedModes(adapter).Has(mode) &&
            SameSize(mode, {info->Format.Graphics.VisibleRegionSize.cx,
                            info->Format.Graphics.VisibleRegionSize.cy});
 }
@@ -380,6 +478,11 @@ NTSTATUS StartDevice(IN_CONST_PVOID context, IN_PDXGK_START_INFO, IN_PDXGKRNL_IN
         UnmapAll(adapter);
         return STATUS_DEVICE_CONFIGURATION_ERROR;
     }
+    adapter->Vmmc = ReadVmmc(adapter, 0) == VMMC_MAGIC &&
+                    adapter->FramebufferSize > CURSOR_BYTES + 0x100000;
+    adapter->UsableSize =
+        adapter->Vmmc ? adapter->FramebufferSize - CURSOR_BYTES : adapter->FramebufferSize;
+    adapter->Connected = true;
 
     READ_REGISTER_BUFFER_UCHAR(adapter->Registers + EDID_OFFSET, adapter->Edid, EDID_SIZE);
     Mode preferred = {};
@@ -419,6 +522,7 @@ NTSTATUS StartDevice(IN_CONST_PVOID context, IN_PDXGK_START_INFO, IN_PDXGKRNL_IN
     } else {
         SetMode(adapter, adapter->Preferred);
     }
+    ReadRequest(adapter);
     adapter->Visible = true;
     adapter->Started = true;
     DebugTrace("vmmcdisp: started: framebuffer %llx+%llx, registers %llx, EDID %d (%lux%lu), "
@@ -463,7 +567,8 @@ NTSTATUS QueryChildRelations(IN_CONST_PVOID, PDXGK_CHILD_DESCRIPTOR relations, U
         return STATUS_BUFFER_TOO_SMALL;
     }
     relations[0].ChildDeviceType = TypeVideoOutput;
-    relations[0].ChildCapabilities.HpdAwareness = HpdAwarenessAlwaysConnected;
+    // Interruptible: a refresh of the modes reconnects it (see Reconnect).
+    relations[0].ChildCapabilities.HpdAwareness = HpdAwarenessInterruptible;
     relations[0].ChildCapabilities.Type.VideoOutput.InterfaceTechnology = D3DKMDT_VOT_HD15;
     relations[0].ChildCapabilities.Type.VideoOutput.MonitorOrientationAwareness = D3DKMDT_MOA_NONE;
     relations[0].ChildCapabilities.Type.VideoOutput.SupportsSdtvModes = FALSE;
@@ -472,10 +577,10 @@ NTSTATUS QueryChildRelations(IN_CONST_PVOID, PDXGK_CHILD_DESCRIPTOR relations, U
     return STATUS_SUCCESS;
 }
 
-NTSTATUS QueryChildStatus(IN_CONST_PVOID, INOUT_PDXGK_CHILD_STATUS status, IN_BOOLEAN) {
+NTSTATUS QueryChildStatus(IN_CONST_PVOID context, INOUT_PDXGK_CHILD_STATUS status, IN_BOOLEAN) {
     switch (status->Type) {
     case StatusConnection:
-        status->HotPlug.Connected = TRUE;
+        status->HotPlug.Connected = AdapterFrom(context)->Connected;
         return STATUS_SUCCESS;
     case StatusRotation:
         status->Rotation.Angle = 0;
@@ -574,7 +679,8 @@ VOID SystemDisplayWrite(PVOID context, PVOID source, UINT width, UINT height, UI
 
 // ---- Display DDIs ----
 
-NTSTATUS APIENTRY QueryAdapterInfo(IN_CONST_HANDLE, IN_CONST_PDXGKARG_QUERYADAPTERINFO query) {
+NTSTATUS APIENTRY QueryAdapterInfo(IN_CONST_HANDLE context,
+                                   IN_CONST_PDXGKARG_QUERYADAPTERINFO query) {
     if (query->Type != DXGKQAITYPE_DRIVERCAPS) {
         return STATUS_NOT_SUPPORTED;
     }
@@ -587,15 +693,123 @@ NTSTATUS APIENTRY QueryAdapterInfo(IN_CONST_HANDLE, IN_CONST_PDXGKARG_QUERYADAPT
     caps->WDDMVersion = DXGKDDI_WDDMv1_2;
     caps->SupportNonVGA = TRUE;
     caps->SupportSmoothRotation = FALSE;
+    if (AdapterFrom(context)->Vmmc) {
+        caps->MaxPointerWidth = CURSOR_MAX;
+        caps->MaxPointerHeight = CURSOR_MAX;
+        caps->PointerCaps.Monochrome = 1;
+        caps->PointerCaps.Color = 1;
+        caps->PointerCaps.MaskedColor = 1;
+    }
     return STATUS_SUCCESS;
 }
 
-NTSTATUS APIENTRY SetPointerPosition(IN_CONST_HANDLE, IN_CONST_PDXGKARG_SETPOINTERPOSITION) {
+NTSTATUS APIENTRY SetPointerPosition(IN_CONST_HANDLE context,
+                                     IN_CONST_PDXGKARG_SETPOINTERPOSITION position) {
+    Adapter* adapter = AdapterFrom(context);
+    // The host's pointer is where the guest's is (the USB tablet), so only whether
+    // it shows matters. Written only when that changes: each write is an exit.
+    bool shown = position->Flags.Visible != 0;
+    if (adapter->Vmmc && adapter->Registers != nullptr && position->VidPnSourceId == SOURCE_ID &&
+        shown != adapter->CursorShown) {
+        adapter->CursorShown = shown;
+        WriteVmmc(adapter, VMMC_CURSOR_CONTROL, shown ? 1 : 0);
+    }
     return STATUS_SUCCESS;
 }
 
-NTSTATUS APIENTRY SetPointerShape(IN_CONST_HANDLE, IN_CONST_PDXGKARG_SETPOINTERSHAPE) {
-    return STATUS_NOT_SUPPORTED;
+bool MaskBit(const UCHAR* row, ULONG x) {
+    return (row[x / 8] & (0x80 >> (x % 8))) != 0;
+}
+
+// Takes Windows' cursor image as straight-alpha BGRA. A pixel that would invert the
+// screen behind it shows black.
+NTSTATUS APIENTRY SetPointerShape(IN_CONST_HANDLE context,
+                                  IN_CONST_PDXGKARG_SETPOINTERSHAPE shape) {
+    Adapter* adapter = AdapterFrom(context);
+    ULONG width = shape->Width;
+    ULONG height = shape->Height;
+    if (!adapter->Vmmc || adapter->Framebuffer == nullptr || shape->VidPnSourceId != SOURCE_ID ||
+        width == 0 || height == 0 || width > CURSOR_MAX || height > CURSOR_MAX) {
+        // Windows draws the cursor itself.
+        return STATUS_NOT_SUPPORTED;
+    }
+    const UCHAR* pixels = static_cast<const UCHAR*>(shape->pPixels);
+    ULONG* out = adapter->CursorPixels;
+    RtlZeroMemory(out, CURSOR_BYTES);
+    for (ULONG y = 0; y < height; y++) {
+        for (ULONG x = 0; x < width; x++) {
+            ULONG& pixel = out[y * CURSOR_MAX + x];
+            if (shape->Flags.Monochrome) {
+                // An AND mask, then an XOR mask: transparent, black, white or inverting.
+                bool keep = MaskBit(pixels + y * shape->Pitch, x);
+                bool flip = MaskBit(pixels + (height + y) * shape->Pitch, x);
+                pixel = keep ? (flip ? 0xff000000 : 0) : (flip ? 0xffffffff : 0xff000000);
+            } else {
+                ULONG value = reinterpret_cast<const ULONG*>(pixels + y * shape->Pitch)[x];
+                if (shape->Flags.Color) {
+                    pixel = value;
+                } else {
+                    // Masked colour: a top byte of 0 replaces the screen, of 0xff XORs
+                    // with it (and XORing black changes nothing).
+                    ULONG color = value & 0xffffff;
+                    pixel = (value >> 24) == 0 || color != 0 ? 0xff000000 | color : 0;
+                }
+            }
+        }
+    }
+    RtlCopyMemory(adapter->Framebuffer + adapter->FramebufferSize - CURSOR_BYTES, out,
+                  CURSOR_BYTES);
+    WriteVmmc(adapter, VMMC_CURSOR_SIZE, width | (height << 16));
+    WriteVmmc(adapter, VMMC_CURSOR_HOTSPOT, shape->XHot | (shape->YHot << 16));
+    // The host takes the new image when the count changes; never 0, which means none.
+    adapter->CursorCount = adapter->CursorCount + 1 == 0 ? 1 : adapter->CursorCount + 1;
+    WriteVmmc(adapter, VMMC_CURSOR_COUNT, adapter->CursorCount);
+    DebugTrace("vmmcdisp: pointer shape %lux%lu, flags %x, hot spot %u,%u\n", width, height,
+               shape->Flags.Value, shape->XHot, shape->YHot);
+    return STATUS_SUCCESS;
+}
+
+// Has Windows read the monitor's modes again, so a new requested size is among them.
+void Reconnect(Adapter* adapter) {
+    DXGK_CHILD_STATUS status = {};
+    status.Type = StatusConnection;
+    status.ChildUid = CHILD_UID;
+    adapter->Connected = false;
+    status.HotPlug.Connected = FALSE;
+    adapter->Dxgk.DxgkCbIndicateChildStatus(adapter->Dxgk.DeviceHandle, &status);
+    adapter->Connected = true;
+    status.HotPlug.Connected = TRUE;
+    adapter->Dxgk.DxgkCbIndicateChildStatus(adapter->Dxgk.DeviceHandle, &status);
+}
+
+// vmmcdisplay.exe's questions (vmmcdisp_escape.h).
+NTSTATUS APIENTRY Escape(IN_CONST_HANDLE context, IN_CONST_PDXGKARG_ESCAPE escape) {
+    Adapter* adapter = AdapterFrom(context);
+    if (escape->PrivateDriverDataSize != sizeof(VmmcDispEscape) ||
+        escape->pPrivateDriverData == nullptr) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    auto data = static_cast<VmmcDispEscape*>(escape->pPrivateDriverData);
+    if (data->Magic != VMMCDISP_ESCAPE_MAGIC || !adapter->Started) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    switch (data->Command) {
+    case VMMCDISP_GET_REQUEST: {
+        ReadRequest(adapter);
+        Mode requested = Requested(adapter);
+        data->Width = requested.Width;
+        data->Height = requested.Height;
+        data->Count = adapter->RequestCount;
+        return STATUS_SUCCESS;
+    }
+    case VMMCDISP_REFRESH_MODES:
+        ReadRequest(adapter);
+        DebugTrace("vmmcdisp: refreshing modes\n");
+        Reconnect(adapter);
+        return STATUS_SUCCESS;
+    default:
+        return STATUS_INVALID_PARAMETER;
+    }
 }
 
 // The VidPN's source mode set for our source, with its pinned mode if any. Release
@@ -769,10 +983,11 @@ NTSTATUS EnumPathModality(Adapter* adapter, const DXGK_VIDPN_INTERFACE* vidpn,
             return status;
         }
         // Windows may turn a mode down; the others still count.
+        ModeList offered = OfferedModes(adapter);
         ULONG added = 0;
-        for (ULONG i = 0; i < adapter->ModeCount; i++) {
-            if ((!hasTarget || SameSize(adapter->Modes[i], pinnedTarget)) &&
-                NT_SUCCESS(AddSourceMode(set, modes, adapter->Modes[i]))) {
+        for (ULONG i = 0; i < offered.Count; i++) {
+            if ((!hasTarget || SameSize(offered.Modes[i], pinnedTarget)) &&
+                NT_SUCCESS(AddSourceMode(set, modes, offered.Modes[i]))) {
                 added++;
             }
         }
@@ -792,10 +1007,11 @@ NTSTATUS EnumPathModality(Adapter* adapter, const DXGK_VIDPN_INTERFACE* vidpn,
         if (!NT_SUCCESS(status)) {
             return status;
         }
+        ModeList offered = OfferedModes(adapter);
         ULONG added = 0;
-        for (ULONG i = 0; i < adapter->ModeCount; i++) {
-            if ((!hasSource || SameSize(adapter->Modes[i], pinnedSource)) &&
-                NT_SUCCESS(AddTargetMode(adapter, set, modes, adapter->Modes[i]))) {
+        for (ULONG i = 0; i < offered.Count; i++) {
+            if ((!hasSource || SameSize(offered.Modes[i], pinnedSource)) &&
+                NT_SUCCESS(AddTargetMode(offered.Preferred, set, modes, offered.Modes[i]))) {
                 added++;
             }
         }
@@ -946,27 +1162,28 @@ NTSTATUS APIENTRY RecommendMonitorModes(IN_CONST_HANDLE context,
                                         IN_CONST_PDXGKARG_RECOMMENDMONITORMODES_CONST query) {
     Adapter* adapter = AdapterFrom(context);
     const DXGK_MONITORSOURCEMODESET_INTERFACE* modes = query->pMonitorSourceModeSetInterface;
-    for (ULONG i = 0; i < adapter->ModeCount; i++) {
+    ModeList offered = OfferedModes(adapter);
+    for (ULONG i = 0; i < offered.Count; i++) {
         D3DKMDT_MONITOR_SOURCE_MODE* info = nullptr;
         NTSTATUS status = modes->pfnCreateNewModeInfo(query->hMonitorSourceModeSet, &info);
         if (!NT_SUCCESS(status)) {
             return status;
         }
-        FillSignalInfo(&info->VideoSignalInfo, adapter->Modes[i]);
+        FillSignalInfo(&info->VideoSignalInfo, offered.Modes[i]);
         info->ColorBasis = D3DKMDT_CB_SRGB;
         info->ColorCoeffDynamicRanges.FirstChannel = 8;
         info->ColorCoeffDynamicRanges.SecondChannel = 8;
         info->ColorCoeffDynamicRanges.ThirdChannel = 8;
         info->ColorCoeffDynamicRanges.FourthChannel = 0;
         info->Origin = D3DKMDT_MCO_DRIVER;
-        info->Preference = SameSize(adapter->Modes[i], adapter->Preferred)
+        info->Preference = SameSize(offered.Modes[i], offered.Preferred)
                                ? D3DKMDT_MP_PREFERRED
                                : D3DKMDT_MP_NOTPREFERRED;
         status = modes->pfnAddMode(query->hMonitorSourceModeSet, info);
         if (!NT_SUCCESS(status)) {
             // The EDID listed it already, or Windows turned it down: the others count.
-            DebugTrace("vmmcdisp: monitor mode %lux%lu refused: %lx\n", adapter->Modes[i].Width,
-                       adapter->Modes[i].Height, status);
+            DebugTrace("vmmcdisp: monitor mode %lux%lu refused: %lx\n", offered.Modes[i].Width,
+                       offered.Modes[i].Height, status);
             modes->pfnReleaseModeInfo(query->hMonitorSourceModeSet, info);
         }
     }
@@ -1031,6 +1248,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
     init.DxgkDdiQueryAdapterInfo = QueryAdapterInfo;
     init.DxgkDdiSetPointerPosition = SetPointerPosition;
     init.DxgkDdiSetPointerShape = SetPointerShape;
+    init.DxgkDdiEscape = Escape;
     init.DxgkDdiIsSupportedVidPn = IsSupportedVidPn;
     init.DxgkDdiRecommendFunctionalVidPn = RecommendFunctionalVidPn;
     init.DxgkDdiEnumVidPnCofuncModality = EnumVidPnCofuncModality;

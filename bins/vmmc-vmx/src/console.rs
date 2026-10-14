@@ -4,8 +4,9 @@
 //! Ctrl-A p presses the ACPI power button, Ctrl-A s saves a screenshot (with
 //! `--screenshot`), Ctrl-A r prints each vCPU's registers, Ctrl-A m saves guest RAM
 //! and vCPU state to a temp directory, Ctrl-A k switches between typing on the serial
-//! port and typing on the PS/2 keyboard (US layout), Ctrl-A Ctrl-A sends a literal
-//! Ctrl-A.
+//! port and typing on the PS/2 keyboard (US layout), Ctrl-A z WIDTHxHEIGHT Enter asks
+//! the guest for that screen size (as resizing the window does), Ctrl-A Ctrl-A sends a
+//! literal Ctrl-A.
 
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,7 +35,16 @@ pub enum Input {
     Screenshot,
     DumpState,
     SaveMemory,
+    /// Ask the guest for a screen this size.
+    RequestSize(u32, u32),
     Quit,
+}
+
+/// `WIDTHxHEIGHT`, as Ctrl-A z takes it.
+fn parse_size(text: &[u8]) -> Option<(u32, u32)> {
+    let text = std::str::from_utf8(text).ok()?;
+    let (width, height) = text.trim().split_once(['x', 'X'])?;
+    Some((width.trim().parse().ok()?, height.trim().parse().ok()?))
 }
 
 /// Splits terminal input into bytes for the guest and escape commands, in order.
@@ -43,6 +53,8 @@ pub struct EscapeFilter {
     after_ctrl_a: bool,
     /// Input goes to the keyboard rather than the serial port (Ctrl-A k).
     typing: bool,
+    /// The size typed after Ctrl-A z so far, until Enter.
+    size: Option<Vec<u8>>,
 }
 
 impl EscapeFilter {
@@ -60,6 +72,18 @@ impl EscapeFilter {
             }
         };
         for &byte in input {
+            if let Some(size) = &mut self.size {
+                if byte == b'\r' || byte == b'\n' {
+                    if let Some((width, height)) = parse_size(size) {
+                        flush(&mut bytes, &mut out, self.typing);
+                        out.push(Input::RequestSize(width, height));
+                    }
+                    self.size = None;
+                } else if size.len() < 16 {
+                    size.push(byte);
+                }
+                continue;
+            }
             if std::mem::take(&mut self.after_ctrl_a) {
                 match byte {
                     b'x' | b'X' => {
@@ -87,6 +111,7 @@ impl EscapeFilter {
                         flush(&mut bytes, &mut out, self.typing);
                         self.typing = !self.typing;
                     }
+                    b'z' | b'Z' => self.size = Some(Vec::new()),
                     CTRL_A => bytes.push(CTRL_A),
                     // Unknown escapes are swallowed, like QEMU's.
                     _ => {}
@@ -228,6 +253,12 @@ pub fn spawn_input(targets: Targets) -> io::Result<()> {
                         Input::PowerButton => {
                             if let Some(target) = targets.get() {
                                 target.power.press();
+                            }
+                        }
+                        Input::RequestSize(width, height) => {
+                            if let Some(display) = targets.display() {
+                                let (width, height) = display.request_size(width, height);
+                                eprint!("\r\nvmmc-vmx: asked the guest for {width}x{height}\r\n");
                             }
                         }
                         Input::Quit => {
@@ -485,6 +516,18 @@ mod windows_console {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ctrl_a_z_asks_for_a_screen_size() {
+        let mut filter = EscapeFilter::default();
+        // The size can come in pieces; input around it still reaches the guest.
+        assert_eq!(filter.filter(b"a\x01z1500x8"), [guest(b"a")]);
+        assert_eq!(
+            filter.filter(b"44\rb"),
+            [Input::RequestSize(1500, 844), guest(b"b")]
+        );
+        assert!(filter.filter(b"\x01zbig\r").is_empty(), "not a size");
+    }
 
     fn guest(bytes: &[u8]) -> Input {
         Input::Guest(bytes.to_vec())

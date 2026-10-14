@@ -16,12 +16,16 @@ Workstation Pro for everyday VM users. `vmmc` is a working codename.
 Phase 1 of [the roadmap](docs/ROADMAP.md) is done: **Linux boots on the Windows
 Hypervisor Platform**. Ubuntu 26.04's kernel reaches userspace in about a third of a
 second on 4 vCPUs, uses a virtio disk, and powers off cleanly. Phase 2 (installing
-Windows 11 from an ISO) is nearly done:
+Windows from an ISO) is done:
 - **Windows installs unattended** from an ISO onto NVMe, with Secure Boot on and a TPM
   2.0, and comes up with its USB tablet and network working (verified with Windows 10
-  22H2; a Windows 11 ISO is still to be tried).
+  22H2).
 - **Ubuntu 26.04 Desktop installs** with autoinstall and boots to GNOME.
-- **A console window** shows the screen and takes the keyboard and pointer.
+- **A console window** shows the screen and takes the keyboard and pointer. With
+  vmmc's Windows display driver, Windows follows the window's size and its cursor is
+  drawn by the window.
+
+What a release still needs is listed in [docs/RELEASE-BLOCKERS.md](docs/RELEASE-BLOCKERS.md).
 
 What exists:
 - **Platform:** a Q35 PC (MCH host bridge, ICH9 LPC) with ACPI, SMP, an IOAPIC, PIT,
@@ -103,7 +107,12 @@ Windows and Linux use them; an idle Windows then costs the host about 2% of a CP
 rather than 10-25%. `--no-enlightenments` hides them.
 `--display window` shows the guest's screen in a window, one guest pixel per screen
 pixel, and follows the guest when it changes resolution:
+- **Size:** resizing the window asks the guest for that resolution. Windows with
+  vmmc's display driver switches to it (see [guest drivers](guest-drivers/windows/README.md));
+  other guests get it as their monitor's preferred resolution from their next boot.
 - **Pointer:** the host pointer drives a USB tablet, so it moves freely in and out.
+  With vmmc's display driver, Windows' cursor is a hardware one: the window draws it
+  at your pointer, so it doesn't lag behind.
 - **Keyboard:** while the window is in front, every key goes to the guest, the Windows
   key and Alt+Tab included.
 - **Toolbar:** Ctrl+Alt+Del (which Windows never lets an application intercept),
@@ -111,9 +120,10 @@ pixel, and follows the guest when it changes resolution:
 - **Closing:** closing the window stops the VM.
 
 `--resolution WxH` sets the resolution the display offers the guest (its EDID), which
-the firmware boots in, Windows keeps (it has no driver for this display yet) and Linux
-prefers. Without it, a VM with a window gets the largest standard resolution that fits
-on your screen, and one without gets 1280x800.
+the firmware boots in and Windows and Linux prefer. Without it, a VM with a window gets
+the largest standard resolution that fits on your screen, and one without gets
+1280x800. Linux's own `bochs-drm` driver runs the display: resolutions are chosen in
+the guest, and don't follow the window.
 For everyday use, run a release build (`cargo run --release -p vmmc-vmx -- run ...`):
 dev builds optimize their dependencies, but vmmc's own device code runs unoptimized.
 
@@ -144,8 +154,10 @@ $vmmc = "target\release\vmmc-vmx.exe"
   identity. Keep it with the disk, and don't run two VMs on one disk.
 - Windows 11's requirements (TPM 2.0, Secure Boot, 4 GB of memory, 64 GB of disk) are
   met. So far Windows 10 22H2 is what's been tested.
-- There's no Windows display driver yet. Windows keeps the resolution the VM starts with
-  (`--resolution WxH`; by default the largest standard one that fits your screen).
+- Without vmmc's display driver, Windows keeps the resolution the VM starts with
+  (`--resolution WxH`; by default the largest standard one that fits your screen). The
+  driver is test-signed for now, so it needs a VM with Secure Boot off; see
+  [guest drivers](guest-drivers/windows/README.md).
 
 Or a Linux kernel, booted directly:
 
@@ -159,7 +171,9 @@ ACPI power button, **Ctrl-A r** prints each vCPU's registers and the code at its
 (for finding where a hung guest is stuck), **Ctrl-A m** saves guest RAM and every vCPU's
 state to a new `vmmc-memory-*` directory in the temp directory, **Ctrl-A k** switches
 between typing on the serial port and typing on the guest's PS/2 keyboard (US layout),
-and **Ctrl-A Ctrl-A** sends a Ctrl-A to the guest.
+**Ctrl-A z** followed by a size such as `1500x844` and Enter asks the guest for that
+resolution (as resizing the window does), and **Ctrl-A Ctrl-A** sends a Ctrl-A to the
+guest.
 `VMMC_LOG=debug` turns on logging to stderr.
 
 When the guest resets, the VM restarts; `--no-reboot` makes it exit instead. Exit

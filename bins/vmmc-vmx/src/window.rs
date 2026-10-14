@@ -19,7 +19,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use machine::{Capture, MAX_PREFERRED, MIN_PREFERRED, PAUSE, TABLET_MAX};
-use slint::{ComponentHandle, Image, Rgb8Pixel, SharedPixelBuffer};
+use slint::{ComponentHandle, Image, Rgb8Pixel, Rgba8Pixel, SharedPixelBuffer};
 use vm_core::StopReason;
 
 use crate::console::Targets;
@@ -30,6 +30,16 @@ slint::slint! {
 
     export component ConsoleWindow inherits Window {
         in property <image> screen;
+        // The guest's picture size, which the cursor scales with.
+        in property <int> frame-width: 1;
+        in property <int> frame-height: 1;
+        // The guest's hardware cursor: drawn here at the host's pointer, in place of
+        // the host's own, once the guest has given an image.
+        in property <image> cursor-image;
+        in property <bool> cursor-hardware;
+        in property <bool> cursor-shown;
+        in property <int> cursor-hot-x;
+        in property <int> cursor-hot-y;
         in property <string> title-text;
         title: root.title-text;
         in property <bool> can-screenshot;
@@ -61,13 +71,17 @@ slint::slint! {
             }
             area := Rectangle {
                 background: black;
+                // Screen pixels per guest pixel, as the picture is scaled to fit.
+                property <float> scale: min(self.width / (root.frame-width * 1phx),
+                    self.height / (root.frame-height * 1phx));
                 Image {
                     source: root.screen;
                     width: parent.width;
                     height: parent.height;
                     image-fit: contain;
                 }
-                TouchArea {
+                touch := TouchArea {
+                    mouse-cursor: root.cursor-hardware ? MouseCursor.none : MouseCursor.default;
                     moved => {
                         root.pointer(self.mouse-x, self.mouse-y, area.width, area.height,
                             root.left, root.right, root.middle, 0);
@@ -92,6 +106,14 @@ slint::slint! {
                             root.left, root.right, root.middle, event.delta-y > 0 ? 1 : -1);
                         accept
                     }
+                }
+                Image {
+                    source: root.cursor-image;
+                    x: touch.mouse-x - root.cursor-hot-x * area.scale * 1phx;
+                    y: touch.mouse-y - root.cursor-hot-y * area.scale * 1phx;
+                    width: root.cursor-image.width * area.scale * 1phx;
+                    height: root.cursor-image.height * area.scale * 1phx;
+                    visible: root.cursor-hardware && root.cursor-shown && touch.has-hover;
                 }
             }
         }
@@ -121,6 +143,11 @@ slint::slint! {
 /// Scan codes the toolbar's Ctrl+Alt+Del presses: left Ctrl, left Alt, Delete.
 const CTRL_ALT_DEL: [u16; 3] = [0x1d, 0x38, 0xe053];
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// How often the window checks the guest's cursor.
+const CURSOR_INTERVAL: Duration = Duration::from_millis(30);
+/// How often the window checks its size; a size that holds for two checks is passed on
+/// to the guest, so dragging an edge doesn't ask for every size on the way.
+const RESIZE_INTERVAL: Duration = Duration::from_millis(300);
 /// The toolbar's height in logical pixels, as the Slint markup has it.
 const TOOLBAR_HEIGHT: f32 = 40.0;
 /// Resolutions the guest can be offered, largest first.
@@ -183,6 +210,8 @@ pub fn run(
 ) -> Result<(), String> {
     let window = ConsoleWindow::new().map_err(|e| format!("can't open the window: {e}"))?;
     fit_to_picture(&window, resolution);
+    window.set_frame_width(resolution.0 as i32);
+    window.set_frame_height(resolution.1 as i32);
     window.set_can_screenshot(screenshots.is_some());
     window.set_title_text(title.into());
 
@@ -191,11 +220,12 @@ pub fn run(
     let capture = Capturer::start(targets.clone(), window.as_weak(), frame_size.clone());
 
     let wheel_targets = targets.clone();
+    let pointer_frame = frame_size.clone();
     window.on_pointer(move |x, y, width, height, left, right, middle, wheel| {
         let Some(target) = wheel_targets.get() else {
             return;
         };
-        let frame = unpack(frame_size.load(Ordering::Relaxed));
+        let frame = unpack(pointer_frame.load(Ordering::Relaxed));
         let (x, y) = tablet_position(x, y, (width, height), frame);
         let buttons = u8::from(left) | (u8::from(right) << 1) | (u8::from(middle) << 2);
         target.usb.pointer(x, y, buttons, wheel);
@@ -235,6 +265,8 @@ pub fn run(
     });
 
     keyboard::stop_raw_input();
+    let _cursor = follow_cursor(&window, targets.clone());
+    let _resize = fit_guest_to_window(&window, targets.clone(), frame_size.clone());
     let hook = keyboard::install(targets.clone(), keyboard::current_thread());
     let result = window.run().map_err(|e| format!("the window failed: {e}"));
     drop(hook);
@@ -244,6 +276,77 @@ pub fn run(
     // Closing the window ends the VM.
     targets.quit();
     result
+}
+
+/// Shows the guest's hardware cursor in place of the host's, as long as the timer lives.
+fn follow_cursor(window: &ConsoleWindow, targets: Targets) -> slint::Timer {
+    let weak = window.as_weak();
+    let mut last_count = 0;
+    let timer = slint::Timer::default();
+    timer.start(slint::TimerMode::Repeated, CURSOR_INTERVAL, move || {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        let Some(display) = targets.display() else {
+            window.set_cursor_hardware(false);
+            return;
+        };
+        let (count, shown, image) = display.cursor(last_count);
+        if let Some(cursor) = image {
+            let pixels = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+                &cursor.rgba,
+                cursor.width,
+                cursor.height,
+            );
+            window.set_cursor_image(Image::from_rgba8(pixels));
+            window.set_cursor_hot_x(cursor.hotspot.0 as i32);
+            window.set_cursor_hot_y(cursor.hotspot.1 as i32);
+        }
+        // A guest that reset draws its cursor itself until its driver is back.
+        last_count = count;
+        window.set_cursor_hardware(count != 0);
+        window.set_cursor_shown(shown);
+    });
+    timer
+}
+
+/// Asks the guest for the window's size whenever the user resizes it (and it then
+/// holds still), so the guest's desktop fills the window. The window itself follows
+/// the guest's mode changes (see [`Capturer`]), which don't count as resizing.
+fn fit_guest_to_window(
+    window: &ConsoleWindow,
+    targets: Targets,
+    frame_size: Arc<AtomicU64>,
+) -> slint::Timer {
+    let weak = window.as_weak();
+    let mut seen = None;
+    let mut asked = None;
+    let timer = slint::Timer::default();
+    timer.start(slint::TimerMode::Repeated, RESIZE_INTERVAL, move || {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        let size = window.window().size();
+        let toolbar = (TOOLBAR_HEIGHT * window.window().scale_factor()).ceil() as u32;
+        let area = (size.width, size.height.saturating_sub(toolbar));
+        let settled = seen == Some(area);
+        seen = Some(area);
+        let picture = unpack(frame_size.load(Ordering::Relaxed));
+        if !settled
+            || window.window().is_minimized()
+            || area.0 < MIN_PREFERRED.0 / 2
+            || area == picture
+            || asked == Some(area)
+        {
+            return;
+        }
+        asked = Some(area);
+        if let Some(display) = targets.display() {
+            let (width, height) = display.request_size(area.0, area.1);
+            tracing::debug!(width, height, "window: asked the guest to fit the window");
+        }
+    });
+    timer
 }
 
 /// Closes the window from any thread, once the VM has ended.
@@ -321,6 +424,8 @@ impl Capturer {
                         // The guest changed its resolution: so does the window.
                         if frame_size.swap(pack(size), Ordering::Relaxed) != pack(size) {
                             fit_to_picture(&window, size);
+                            window.set_frame_width(size.0 as i32);
+                            window.set_frame_height(size.1 as i32);
                         }
                         window.set_screen(Image::from_rgb8(pixels));
                     });

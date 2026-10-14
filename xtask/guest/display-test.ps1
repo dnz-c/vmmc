@@ -104,7 +104,46 @@ public static class VmmcDisplay {
     Mark "set=$result now=$([VmmcDisplay]::Current())"
     # The host takes a screenshot now.
     Mark 'mode-set'
-    Start-Sleep -Seconds 15
+    # The host checks the screen, then asks for its window's size (1500x844, a size
+    # Windows doesn't know yet): the helper, which the driver's service started in this
+    # session, switches the desktop to it.
+    Start-Sleep -Seconds 5
+    $session = (Get-Process -Id $PID).SessionId
+    $service = Get-Service vmmcdisplay -ErrorAction SilentlyContinue
+    $helper = Get-Process vmmcdisplay -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session }
+    Mark "service=$($service.Status) helper=$([bool]$helper)"
+    Mark 'helper-started'
+    $deadline = (Get-Date).AddSeconds(60)
+    while ([VmmcDisplay]::Current() -ne '1500x844' -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 500
+    }
+    Mark "fitted=$([VmmcDisplay]::Current())"
+    Mark 'fit-checked'
+    Start-Sleep -Seconds 10
+    # The next boot logs on by itself, and the host checks Windows gives the driver its
+    # pointer on the desktop.
+    $winlogon = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+    Set-ItemProperty $winlogon AutoAdminLogon '1'
+    Set-ItemProperty $winlogon DefaultUserName 'vmmc'
+    Set-ItemProperty $winlogon DefaultPassword 'vmmc'
+    Remove-ItemProperty $winlogon AutoLogonCount -ErrorAction SilentlyContinue
+    # Windows shows the pointer, and so hands it over, only once the mouse moves: at
+    # that logon, a script moves it a little, and reports whether the service started
+    # the helper.
+    New-Item -ItemType Directory -Force C:\vmmc | Out-Null
+    Set-Content C:\vmmc\nudge.ps1 @'
+Add-Type -Namespace Vmmc -Name Mouse -MemberDefinition '[DllImport("user32.dll")] public static extern void mouse_event(int flags, int dx, int dy, int data, System.IntPtr extra);'
+Start-Sleep -Seconds 15
+[Vmmc.Mouse]::mouse_event(1, 20, 20, 0, [System.IntPtr]::Zero)
+$session = (Get-Process -Id $PID).SessionId
+$helper = Get-Process vmmcdisplay -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session }
+$port = New-Object System.IO.Ports.SerialPort 'COM1', 115200, 'None', 8, 'One'
+$port.Open()
+$port.WriteLine("VMMC-DISP: logon helper=$([bool]$helper)")
+$port.Close()
+'@
+    Set-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' vmmcnudge `
+        'powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\vmmc\nudge.ps1'
     Mark 'done'
 } catch {
     Mark "error=$($_.Exception.Message)"

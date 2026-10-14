@@ -9,13 +9,15 @@
 //!   rules out: until Microsoft signs them, they're for VMs with Secure Boot off.
 //! - `cargo xtask win-display-test` installs Windows as `win11-test` does, but with
 //!   Secure Boot off and test signing on, installs the display driver at first logon,
-//!   switches to 1600x900 and checks that the screen followed.
+//!   switches to 1600x900 and checks that the screen followed, then asks for 1500x844
+//!   as resizing the window does and checks the desktop follows. A second boot checks
+//!   that Windows hands the driver its pointer and that the helper starts at logon.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::firmware::Session;
 use crate::windows::{self, Install};
@@ -25,18 +27,36 @@ const CERTIFICATE_SUBJECT: &str = "CN=vmmc test driver signing";
 const KITS: &str = r"C:\Program Files (x86)\Windows Kits\10";
 const DISPLAY_TEST: &str = include_str!("../guest/display-test.ps1");
 /// What the display test's first logon reports, in order.
-const DISPLAY_MARKERS: [&str; 6] = [
+const DISPLAY_MARKERS: [&str; 10] = [
     "VMMC-DISP: booted",
     "VMMC-DISP: testsigning=True",
     "VMMC-DISP: driver=vmmcdisp status=OK",
     "VMMC-DISP: set=0 now=1600x900",
     "VMMC-DISP: mode-set",
+    "VMMC-DISP: service=Running helper=True",
+    "VMMC-DISP: helper-started",
+    "VMMC-DISP: fitted=1500x844",
+    "VMMC-DISP: fit-checked",
     "VMMC-DISP: done",
 ];
-/// The resolution the test switches to.
+/// The resolution the test switches to, then the window size the host asks for.
 const TEST_MODE: (u32, u32) = (1600, 900);
+const FIT_MODE: (u32, u32) = (1500, 844);
+/// Screenshots the screen checks take before giving up, 3 s apart.
+const SCREEN_TRIES: u32 = 5;
+/// How long the second boot gets to reach the desktop, with its pointer and the helper.
+const CURSOR_TIMEOUT: Duration = Duration::from_secs(240);
+/// What the second boot's logon script reports, followed by True or False.
+const LOGON_HELPER: &str = "VMMC-DISP: logon helper=";
 /// The version stamped into the INF.
-const DRIVER_VERSION: &str = "0.1.0.0";
+const DRIVER_VERSION: &str = "0.2.0.0";
+/// The display driver's package.
+const PACKAGE: [&str; 4] = [
+    "vmmcdisp.inf",
+    "vmmcdisp.sys",
+    "vmmcdisplay.exe",
+    "vmmcdisp.cat",
+];
 
 /// A built and signed driver package, and the certificate that signed it.
 pub struct Drivers {
@@ -208,12 +228,55 @@ pub fn build(trace: bool) -> Result<Drivers, String> {
             "BufferOverflowFastFailK.lib",
         ])
         .arg(format!("/LIBPATH:{}", libs.display())))?;
+    // The helper, a user-mode program, with the CRT linked in.
+    let msvc_root = tools
+        .msvc
+        .ancestors()
+        .nth(3)
+        .ok_or("MSVC's bin directory isn't where it should be")?
+        .to_owned();
+    let libs = tools.kits("Lib");
+    run(Command::new(tools.msvc.join("cl.exe"))
+        .args([
+            "/nologo",
+            "/O2",
+            "/W4",
+            "/WX",
+            "/MT",
+            "/GR-",
+            "/EHs-c-",
+            "/std:c++17",
+        ])
+        .args(["/DUNICODE", "/D_UNICODE", "/D_WIN32_WINNT=0x0A00"])
+        .arg(format!("/I{}", msvc_root.join("include").display()))
+        .arg(format!("/I{}", include.join("ucrt").display()))
+        .arg(format!("/I{}", include.join("um").display()))
+        .arg(format!("/I{}", include.join("shared").display()))
+        .arg(format!("/Fo{}", obj.join("vmmcdisplay.obj").display()))
+        .arg(format!("/Fe{}", display.join("vmmcdisplay.exe").display()))
+        .arg(source.join("vmmcdisplay.cpp"))
+        .args(["/link", "/SUBSYSTEM:WINDOWS"])
+        .args([
+            "user32.lib",
+            "gdi32.lib",
+            "advapi32.lib",
+            "wtsapi32.lib",
+            "userenv.lib",
+        ])
+        .arg(format!("/LIBPATH:{}", msvc_root.join(r"lib\x64").display()))
+        .arg(format!("/LIBPATH:{}", libs.join(r"um\x64").display()))
+        .arg(format!("/LIBPATH:{}", libs.join(r"ucrt\x64").display())))?;
     let inf = display.join("vmmcdisp.inf");
     fs::copy(source.join("vmmcdisp.inf"), &inf).map_err(|e| format!("can't copy the INF: {e}"))?;
     run(Command::new(tools.tool("x64", "stampinf.exe"))
         .arg("-f")
         .arg(&inf)
         .args(["-d", &utc_date(), "-a", "amd64", "-v", DRIVER_VERSION]))?;
+    // The INF rules for drivers Microsoft signs ("Windows Driver": the package keeps to
+    // its own registry keys and files, so no Run key for the helper, say).
+    run(Command::new(tools.kits("Tools").join(r"x64\infverif.exe"))
+        .arg("/w")
+        .arg(&inf))?;
     let _ = fs::remove_file(display.join("vmmcdisp.cat"));
     run(Command::new(tools.tool("x86", "Inf2Cat.exe"))
         .arg(format!("/driver:{}", display.display()))
@@ -224,6 +287,7 @@ pub fn build(trace: bool) -> Result<Drivers, String> {
     run(Command::new(tools.tool("x64", "signtool.exe"))
         .args(["sign", "/fd", "sha256", "/s", "My", "/sha1", &thumbprint])
         .arg(display.join("vmmcdisp.sys"))
+        .arg(display.join("vmmcdisplay.exe"))
         .arg(display.join("vmmcdisp.cat")))?;
     eprintln!(
         "xtask: drivers in {}, test-signed with {}",
@@ -278,7 +342,7 @@ pub fn display_test() -> Result<(), String> {
         "vmmc-test-signing.cer".to_owned(),
         read(&drivers.certificate)?,
     )];
-    for file in ["vmmcdisp.inf", "vmmcdisp.sys", "vmmcdisp.cat"] {
+    for file in PACKAGE {
         files.push((file.to_owned(), read(&drivers.display.join(file))?));
     }
     let mut modes = String::new();
@@ -306,11 +370,59 @@ pub fn display_test() -> Result<(), String> {
         |marker, vm, dir| {
             if marker == "VMMC-DISP: mode-set" {
                 modes = vm.text(0, vm.len());
-                check_screen(vm, dir)?;
+                check_screen(vm, dir, TEST_MODE)?;
+            }
+            if marker == "VMMC-DISP: helper-started" {
+                // What resizing the window does, from the console.
+                vm.send(&format!("\x01z{}x{}\r", FIT_MODE.0, FIT_MODE.1))?;
+            }
+            if marker == "VMMC-DISP: fit-checked" {
+                check_screen(vm, dir, FIT_MODE)?;
             }
             Ok(())
         },
     )?;
+    // A second boot, which logs on by itself: on the desktop, once a logon script has
+    // moved the mouse (until then Windows hides the pointer), Windows hands the driver
+    // its pointer, as a hardware cursor the window draws. (The first logon ends before
+    // the desktop shows.) The script also reports whether the driver's service started
+    // the helper at this logon.
+    let log = workspace()
+        .join("target")
+        .join("win-display-test")
+        .join("second-boot.log");
+    let mut vm = windows::boot_installed("win-display-test", &log)?;
+    let deadline = Instant::now() + CURSOR_TIMEOUT;
+    let (shape, helper) = loop {
+        let trace = fs::read_to_string(&log).unwrap_or_default();
+        let shape = trace
+            .lines()
+            .find(|line| line.contains("vmmcdisp: pointer shape"))
+            .map(|line| line.trim().to_owned());
+        let helper = vm
+            .text(0, vm.len())
+            .lines()
+            .find_map(|line| line.split_once(LOGON_HELPER))
+            .map(|(_, started)| started.trim() == "True");
+        if (shape.is_some() && helper.is_some()) || Instant::now() > deadline {
+            break (shape, helper);
+        }
+        thread::sleep(Duration::from_secs(1));
+    };
+    // The power button: Windows shuts down.
+    let _ = vm.send("\x01p");
+    if vm.wait(Duration::from_secs(180)).is_none() {
+        eprintln!("xtask: Windows didn't shut down after the second boot; stopped it");
+    }
+    match shape {
+        Some(line) => eprintln!("xtask: hardware cursor: {line}"),
+        None => return Err("Windows gave the driver no cursor image".into()),
+    }
+    match helper {
+        Some(true) => eprintln!("xtask: the service started the helper at logon"),
+        Some(false) => return Err("the service didn't start the helper at logon".into()),
+        None => return Err("the second logon didn't report".into()),
+    }
     // Windows offers the standard modes too, not just the firmware's.
     let offered = modes
         .lines()
@@ -330,10 +442,32 @@ fn read(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 /// Takes a screenshot (Ctrl-A s) and checks it's the test's resolution, with a picture.
-fn check_screen(vm: &mut Session, dir: &Path) -> Result<(), String> {
+/// Takes screenshots (Ctrl-A s) until one is `expected`'s size with a picture: the
+/// guest may still be switching, or showing a plain colour for a moment.
+fn check_screen(vm: &mut Session, dir: &Path, expected: (u32, u32)) -> Result<(), String> {
+    let mut last = String::new();
+    for _ in 0..SCREEN_TRIES {
+        vm.send("\x01s")?;
+        thread::sleep(Duration::from_secs(3));
+        match screen(dir, expected) {
+            Ok(shot) => {
+                eprintln!(
+                    "xtask: the screen is {}x{}, with a picture ({})",
+                    expected.0,
+                    expected.1,
+                    shot.display()
+                );
+                return Ok(());
+            }
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// The newest screenshot, if it's `expected`'s size and not one colour.
+fn screen(dir: &Path, expected: (u32, u32)) -> Result<PathBuf, String> {
     let screens = dir.join("screens");
-    vm.send("\x01s")?;
-    thread::sleep(Duration::from_secs(3));
     let mut shots: Vec<PathBuf> = fs::read_dir(&screens)
         .map_err(|e| format!("can't list {}: {e}", screens.display()))?
         .flatten()
@@ -356,11 +490,11 @@ fn check_screen(vm: &mut Session, dir: &Path) -> Result<(), String> {
     reader
         .next_frame(&mut pixels)
         .map_err(|e| format!("{}: {e}", shot.display()))?;
-    if (width, height) != TEST_MODE {
+    if (width, height) != expected {
         return Err(format!(
             "the screen is {width}x{height}, not {}x{} ({})",
-            TEST_MODE.0,
-            TEST_MODE.1,
+            expected.0,
+            expected.1,
             shot.display()
         ));
     }
@@ -368,11 +502,7 @@ fn check_screen(vm: &mut Session, dir: &Path) -> Result<(), String> {
     if pixels.chunks(3).all(|pixel| pixel == first) {
         return Err(format!("the screen is one colour ({})", shot.display()));
     }
-    eprintln!(
-        "xtask: the screen is {width}x{height}, with a picture ({})",
-        shot.display()
-    );
-    Ok(())
+    Ok(shot)
 }
 
 #[cfg(test)]

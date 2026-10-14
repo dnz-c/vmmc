@@ -1,5 +1,6 @@
 ;
-; vmmc display driver: resolutions and mode changes for vmmc's display adapter.
+; vmmc display driver: resolutions and mode changes for vmmc's display adapter, and
+; its helper, which keeps the desktop the size of the host's window.
 ;
 
 [Version]
@@ -19,11 +20,13 @@ VmmcDisplay.Files = 13
 
 [SourceDisksFiles]
 vmmcdisp.sys = 1
+vmmcdisplay.exe = 1
 
+; Windows 10 1709 and later: the files stay in the driver store (directory 13).
 [Manufacturer]
-%Vmmc% = Vmmc, NTamd64
+%Vmmc% = Vmmc, NTamd64.10.0...16299
 
-[Vmmc.NTamd64]
+[Vmmc.NTamd64.10.0...16299]
 %DeviceName% = VmmcDisplay, PCI\VEN_1234&DEV_1111
 
 [VmmcDisplay]
@@ -32,9 +35,13 @@ CopyFiles = VmmcDisplay.Files
 
 [VmmcDisplay.Files]
 vmmcdisp.sys
+vmmcdisplay.exe
 
 [VmmcDisplay.Services]
 AddService = vmmcdisp, 0x00000002, VmmcDisplay.Service
+; The helper's service, started now (0x800) and at every boot. It starts the helper in
+; each user's session.
+AddService = vmmcdisplay, 0x00000800, VmmcHelper.Service
 
 [VmmcDisplay.Service]
 DisplayName = %DeviceName%
@@ -43,7 +50,17 @@ StartType = 3 ; on demand
 ErrorControl = 1 ; normal
 ServiceBinary = %13%\vmmcdisp.sys
 
+[VmmcHelper.Service]
+DisplayName = %HelperName%
+Description = %HelperDescription%
+ServiceType = 0x10 ; a program of its own
+StartType = 2 ; at boot
+ErrorControl = 1 ; normal
+ServiceBinary = %13%\vmmcdisplay.exe
+
 [Strings]
 Vmmc = "vmmc"
 DiskName = "vmmc display driver"
 DeviceName = "vmmc Display Adapter"
+HelperName = "vmmc Display Helper"
+HelperDescription = "Keeps the desktop the size of vmmc's window."

@@ -68,6 +68,35 @@ const KEYBOARD_READY: &str = "VMMC-WIN: keyboard-ready";
 /// The resolution the display's EDID asks for, and Windows should end up in.
 pub(crate) const RESOLUTION: &str = "1920x1080";
 
+/// Boots the Windows a test named `name` installed, from its disk alone, with the
+/// debug console saved to `log`.
+pub(crate) fn boot_installed(name: &str, log: &Path) -> Result<Session, String> {
+    let workspace = workspace();
+    let native = native::fetch(&workspace)?;
+    let exe = build_vmmc_vmx(&workspace)?;
+    let dir = workspace.join("target").join(name);
+    let disk = crate::image_dir()?.join(format!("{name}-disk.raw"));
+    let mut command = Command::new(&exe);
+    command
+        .arg("run")
+        .arg("--firmware")
+        .arg(native.join("OVMF_CODE.fd"))
+        .arg("--tpm")
+        .arg("--vm-dir")
+        .arg(dir.join("vm"))
+        .arg("--disk")
+        .arg(format!("{},nvme", disk.display()))
+        .args(["--cpus", CPUS, "--memory", MEMORY_MIB])
+        .args(["--nic", "e1000e"])
+        .args(["--resolution", RESOLUTION])
+        .arg("--screenshot")
+        .arg(dir.join("screens"))
+        .arg("--firmware-log")
+        .arg(log);
+    eprintln!("$ {command:?}");
+    Session::spawn(command)
+}
+
 /// `text` as XML character data.
 fn xml_text(text: &str) -> String {
     text.replace('&', "&amp;")

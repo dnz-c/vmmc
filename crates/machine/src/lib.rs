@@ -25,7 +25,7 @@ use devices::clock::{Clock, HostClock};
 use devices::display::bochs::{
     BochsDisplay, FRAMEBUFFER_BAR, FRAMEBUFFER_SIZE, MMIO_BAR, MMIO_SIZE,
 };
-pub use devices::display::bochs::{Capture, Display, Frame, MAX_PREFERRED, MIN_PREFERRED};
+pub use devices::display::bochs::{Capture, Cursor, Display, Frame, MAX_PREFERRED, MIN_PREFERRED};
 use devices::firmware::fw_cfg::{self, FW_CFG_BASE, FW_CFG_PORTS, FwCfg};
 use devices::firmware::pflash::Pflash;
 use devices::irq::{IrqLine, MsiSink};
