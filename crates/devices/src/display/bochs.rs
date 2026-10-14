@@ -137,6 +137,11 @@ pub struct Display {
 }
 
 impl Display {
+    /// Whether `other` reads the same adapter. A VM that reset has a new one.
+    pub fn same_adapter(&self, other: &Display) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
     /// Asks the guest for a `width` x `height` screen: what the host's window has room
     /// for. A guest driver that knows vmmc's registers switches to it; the EDID prefers
     /// it from the next boot. Returns the size asked for, after keeping it within what
@@ -590,6 +595,9 @@ mod tests {
         assert_eq!(display.request_size(9000, 9000), MAX_PREFERRED);
         display.request_size(9000, 9000);
         assert_eq!(read32(&mut d, REQUEST_COUNT), 3);
+        // A VM that reset has a new adapter, which hasn't been asked anything.
+        assert!(display.same_adapter(&d.display()));
+        assert!(!display.same_adapter(&adapter().display()));
     }
 
     #[test]

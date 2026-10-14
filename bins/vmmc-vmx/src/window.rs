@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use machine::{Capture, MAX_PREFERRED, MIN_PREFERRED, PAUSE, TABLET_MAX};
+use machine::{Capture, Display, MAX_PREFERRED, MIN_PREFERRED, PAUSE, TABLET_MAX};
 use slint::{ComponentHandle, Image, Rgb8Pixel, Rgba8Pixel, SharedPixelBuffer};
 use vm_core::StopReason;
 
@@ -209,7 +209,11 @@ pub fn run(
     resolution: (u32, u32),
 ) -> Result<(), String> {
     let window = ConsoleWindow::new().map_err(|e| format!("can't open the window: {e}"))?;
-    fit_to_picture(&window, resolution);
+    // The window's size below the toolbar that the guest's picture matches, as far as the
+    // window knows: the size it took to show the picture, or the size it last asked the
+    // guest for. Any other size is the user's doing, and goes to the guest.
+    let matched = Arc::new(AtomicU64::new(0));
+    fit_to_picture(&window, resolution, &matched);
     window.set_frame_width(resolution.0 as i32);
     window.set_frame_height(resolution.1 as i32);
     window.set_can_screenshot(screenshots.is_some());
@@ -217,7 +221,12 @@ pub fn run(
 
     // The size of the picture shown, which the pointer maps against: width << 32 | height.
     let frame_size = Arc::new(AtomicU64::new(pack(resolution)));
-    let capture = Capturer::start(targets.clone(), window.as_weak(), frame_size.clone());
+    let capture = Capturer::start(
+        targets.clone(),
+        window.as_weak(),
+        frame_size.clone(),
+        matched.clone(),
+    );
 
     let wheel_targets = targets.clone();
     let pointer_frame = frame_size.clone();
@@ -266,7 +275,7 @@ pub fn run(
 
     keyboard::stop_raw_input();
     let _cursor = follow_cursor(&window, targets.clone());
-    let _resize = fit_guest_to_window(&window, targets.clone(), frame_size.clone());
+    let _resize = fit_guest_to_window(&window, targets.clone(), frame_size.clone(), matched);
     let hook = keyboard::install(targets.clone(), keyboard::current_thread());
     let result = window.run().map_err(|e| format!("the window failed: {e}"));
     drop(hook);
@@ -312,39 +321,52 @@ fn follow_cursor(window: &ConsoleWindow, targets: Targets) -> slint::Timer {
 
 /// Asks the guest for the window's size whenever the user resizes it (and it then
 /// holds still), so the guest's desktop fills the window. The window itself follows
-/// the guest's mode changes (see [`Capturer`]), which don't count as resizing.
+/// the guest's mode changes (see [`Capturer`]), which don't count as resizing: neither
+/// the sizes it takes then (`matched`), nor the ones it passes through while the guest
+/// switches, which can go through another mode on the way to the size asked for.
 fn fit_guest_to_window(
     window: &ConsoleWindow,
     targets: Targets,
     frame_size: Arc<AtomicU64>,
+    matched: Arc<AtomicU64>,
 ) -> slint::Timer {
     let weak = window.as_weak();
     let mut seen = None;
-    let mut asked = None;
+    // The adapter last asked for a size.
+    let mut asked: Option<Display> = None;
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, RESIZE_INTERVAL, move || {
-        let Some(window) = weak.upgrade() else {
+        let (Some(window), Some(display)) = (weak.upgrade(), targets.display()) else {
             return;
         };
+        // A VM that reset has a new adapter, which knows nothing of the window's size.
+        if asked
+            .as_ref()
+            .is_some_and(|asked| !asked.same_adapter(&display))
+        {
+            asked = None;
+            matched.store(0, Ordering::Relaxed);
+        }
         let size = window.window().size();
         let toolbar = (TOOLBAR_HEIGHT * window.window().scale_factor()).ceil() as u32;
         let area = (size.width, size.height.saturating_sub(toolbar));
-        let settled = seen == Some(area);
-        seen = Some(area);
         let picture = unpack(frame_size.load(Ordering::Relaxed));
+        // Neither the window nor the picture changed since the last check: when the
+        // picture changes, the window follows a moment later.
+        let settled = seen == Some((area, picture));
+        seen = Some((area, picture));
         if !settled
             || window.window().is_minimized()
             || area.0 < MIN_PREFERRED.0 / 2
             || area == picture
-            || asked == Some(area)
+            || pack(area) == matched.load(Ordering::Relaxed)
         {
             return;
         }
-        asked = Some(area);
-        if let Some(display) = targets.display() {
-            let (width, height) = display.request_size(area.0, area.1);
-            tracing::debug!(width, height, "window: asked the guest to fit the window");
-        }
+        matched.store(pack(area), Ordering::Relaxed);
+        let (width, height) = display.request_size(area.0, area.1);
+        tracing::debug!(width, height, "window: asked the guest to fit the window");
+        asked = Some(display);
     });
     timer
 }
@@ -365,12 +387,20 @@ fn unpack(packed: u64) -> (u32, u32) {
 }
 
 /// Sizes the window to show a `picture`-sized frame at one pixel per screen pixel,
-/// below the toolbar, as far as the screen allows.
-fn fit_to_picture(window: &ConsoleWindow, picture: (u32, u32)) {
+/// below the toolbar, as far as the screen allows, and notes that size as `matched`
+/// (see [`fit_guest_to_window`]). A maximized or full-screen window keeps its size,
+/// and the picture is scaled into it: resizing it would un-maximize it (winit does
+/// that for any new size), and the restored window would then ask the guest for its
+/// old size.
+fn fit_to_picture(window: &ConsoleWindow, picture: (u32, u32), matched: &AtomicU64) {
+    if window.window().is_maximized() || window.window().is_fullscreen() {
+        return;
+    }
     let scale = window.window().scale_factor();
     let toolbar = (TOOLBAR_HEIGHT * scale).ceil() as u32;
     let (space_w, space_h) = screen::space_for_picture(TOOLBAR_HEIGHT);
     let (width, height) = (picture.0.min(space_w), picture.1.min(space_h));
+    matched.store(pack((width, height)), Ordering::Relaxed);
     window
         .window()
         .set_size(slint::PhysicalSize::new(width, height + toolbar));
@@ -389,6 +419,7 @@ impl Capturer {
         targets: Targets,
         window: slint::Weak<ConsoleWindow>,
         frame_size: Arc<AtomicU64>,
+        matched: Arc<AtomicU64>,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
@@ -414,8 +445,12 @@ impl Capturer {
                         &frame.rgb, size.0, size.1,
                     );
                     pending.store(true, Ordering::Release);
-                    let (window, pending, frame_size) =
-                        (window.clone(), pending.clone(), frame_size.clone());
+                    let (window, pending, frame_size, matched) = (
+                        window.clone(),
+                        pending.clone(),
+                        frame_size.clone(),
+                        matched.clone(),
+                    );
                     let posted = slint::invoke_from_event_loop(move || {
                         pending.store(false, Ordering::Release);
                         let Some(window) = window.upgrade() else {
@@ -423,7 +458,7 @@ impl Capturer {
                         };
                         // The guest changed its resolution: so does the window.
                         if frame_size.swap(pack(size), Ordering::Relaxed) != pack(size) {
-                            fit_to_picture(&window, size);
+                            fit_to_picture(&window, size, &matched);
                             window.set_frame_width(size.0 as i32);
                             window.set_frame_height(size.1 as i32);
                         }
