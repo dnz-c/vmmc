@@ -26,12 +26,7 @@ pub fn open(dir: &Path, vars_template: &Path) -> Result<VmDir, String> {
     fs::create_dir_all(dir).map_err(|e| context("can't create", dir, e))?;
 
     let nvram = dir.join("nvram.fd");
-    if !nvram.exists() {
-        // Copy then rename, so an interrupted copy never leaves a short variable store.
-        let partial = dir.join("nvram.fd.partial");
-        fs::copy(vars_template, &partial).map_err(|e| context("can't copy", vars_template, e))?;
-        fs::rename(&partial, &nvram).map_err(|e| context("can't create", &nvram, e))?;
-    }
+    copy_template(&nvram, vars_template)?;
 
     let uuid_path = dir.join("uuid");
     let uuid = match fs::read_to_string(&uuid_path) {
@@ -65,6 +60,36 @@ pub fn open(dir: &Path, vars_template: &Path) -> Result<VmDir, String> {
         uuid,
         mac,
     })
+}
+
+/// The state of a VM with a `.vmmc` file: its UUID and first MAC come from the file.
+pub fn open_vm(vm: &vmconfig::Vm, vars_template: &Path) -> Result<VmDir, String> {
+    let nvram = vm.nvram();
+    copy_template(&nvram, vars_template)?;
+    let mac = vm
+        .config
+        .nics
+        .first()
+        .and_then(|nic| crate::parse_mac(&nic.mac))
+        .unwrap_or([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+    Ok(VmDir {
+        nvram,
+        tpm_state: vm.tpm_state(),
+        uuid: vm.config.uuid_bytes(),
+        mac,
+    })
+}
+
+/// Copies the variable store template to `nvram` if there's no store yet. Copy then
+/// rename, so an interrupted copy never leaves a short variable store.
+fn copy_template(nvram: &Path, vars_template: &Path) -> Result<(), String> {
+    if nvram.exists() {
+        return Ok(());
+    }
+    let partial = nvram.with_extension("fd.partial");
+    fs::copy(vars_template, &partial)
+        .map_err(|e| format!("can't copy {}: {e}", vars_template.display()))?;
+    fs::rename(&partial, nvram).map_err(|e| format!("can't create {}: {e}", nvram.display()))
 }
 
 /// A version 4 (random) UUID. The randomness comes from the standard library's

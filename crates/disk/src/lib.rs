@@ -2,11 +2,30 @@
 //!
 //! A [`BlockBackend`] is a flat array of bytes. Devices check every guest-supplied range
 //! against [`BlockBackend::len`] before calling in, so backends only see valid ranges.
+//! Images are raw files ([`RawFile`]) or VMDKs ([`vmdk`]); [`open`] tells them apart.
+
+pub mod vmdk;
 
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+pub use vmdk::{create_delta, create_sparse};
+
+/// Opens a disk image: a VMDK if its name ends in `.vmdk`, otherwise a raw image. The
+/// name decides, never the contents: a guest can write anything into a raw image,
+/// including a VMDK header whose extents name host files.
+pub fn open(path: &Path, read_only: bool) -> io::Result<Arc<dyn BlockBackend>> {
+    let is_vmdk = path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("vmdk"));
+    Ok(if is_vmdk {
+        vmdk::open(path, read_only)?
+    } else {
+        Arc::new(RawFile::open(path, read_only)?)
+    })
+}
 
 /// Where a block device's data lives.
 pub trait BlockBackend: Send + Sync {
@@ -40,6 +59,38 @@ pub trait BlockBackend: Send + Sync {
     fn discard(&self, _offset: u64, _len: u64) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// Copies a whole disk into another of at least its size, skipping zeroes so a sparse
+/// destination stays sparse. `progress` hears the bytes copied so far.
+pub fn copy(
+    from: &dyn BlockBackend,
+    to: &dyn BlockBackend,
+    mut progress: impl FnMut(u64),
+) -> io::Result<()> {
+    const CHUNK: usize = 1 << 20;
+    if to.len() < from.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the destination is smaller than the source",
+        ));
+    }
+    let mut buf = vec![0u8; CHUNK];
+    let mut offset = 0;
+    while offset < from.len() {
+        let now = (from.len() - offset).min(CHUNK as u64) as usize;
+        from.read_at(&mut buf[..now], offset)?;
+        // A new destination reads as zeroes already: only pieces holding data are
+        // written, 64 KiB (a VMDK grain) at a time, so sparse images stay sparse.
+        for (index, sector) in buf[..now].chunks(64 << 10).enumerate() {
+            if sector.iter().any(|&b| b != 0) {
+                to.write_at(sector, offset + (index * (64 << 10)) as u64)?;
+            }
+        }
+        offset += now as u64;
+        progress(offset);
+    }
+    to.flush()
 }
 
 /// A raw disk image file: byte N of the disk is byte N of the file.

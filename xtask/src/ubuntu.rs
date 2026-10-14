@@ -179,9 +179,9 @@ pub fn test() -> Result<(), String> {
         None,
     );
     fs::write(&seed, disc).map_err(|e| format!("can't write {}: {e}", seed.display()))?;
-    let disk = crate::image_dir()?.join("ubuntu-desktop-test-disk.raw");
+    let disk = crate::image_dir()?.join("ubuntu-desktop-test-disk.vmdk");
     let _ = fs::remove_file(&disk);
-    disk::create_raw(&disk, DISK_SIZE)
+    disk::create_sparse(&disk, DISK_SIZE)
         .map_err(|e| format!("can't create {}: {e}", disk.display()))?;
 
     let machine = |screens: &str| {

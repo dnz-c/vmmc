@@ -1,0 +1,19 @@
+[package]
+name = "vmmc-cli"
+description = "vmmc's command line: VMs, the library and disks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap.workspace = true
+disk.workspace = true
+vmconfig.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -62,7 +62,6 @@ use devices::virtio::blk::VirtioBlk;
 use devices::virtio::net::VirtioNet;
 use devices::virtio::pci::{CONFIG_BAR, CONFIG_BAR_SIZE, MSIX_BAR, MSIX_BAR_SIZE, VirtioPci};
 use devices::{PowerEvent, PowerHandler};
-use disk::RawFile;
 use hv::{Hypervisor, LocalApicMode, Partition, PartitionConfig};
 use net::{Nat, NatConfig};
 use vm_core::{BusDevice, StopHandle, StopReason, Vm, VmExit, VmVcpu};
@@ -438,25 +437,21 @@ impl<P: Partition + 'static> Machine<P> {
             let mut sata_drives = Vec::new();
             for disk in &config.disks {
                 let read_only = disk.read_only || disk.interface == DiskInterface::Cdrom;
-                let backend =
-                    RawFile::open(&disk.path, read_only).map_err(|source| Error::Disk {
-                        path: disk.path.clone(),
-                        source,
-                    })?;
+                let backend = disk::open(&disk.path, read_only).map_err(|source| Error::Disk {
+                    path: disk.path.clone(),
+                    source,
+                })?;
                 let id = disk_id(&disk.path);
                 let serial: String = id[..6].iter().map(|b| format!("{b:02X}")).collect();
                 match disk.interface {
-                    DiskInterface::Nvme => namespaces.push(Namespace {
-                        backend: Arc::new(backend),
-                        nguid: id,
-                    }),
+                    DiskInterface::Nvme => namespaces.push(Namespace { backend, nguid: id }),
                     DiskInterface::Virtio => virtio_disks.push(backend),
                     DiskInterface::Sata => sata_drives.push(Drive::Disk(AtaDisk {
-                        backend: Arc::new(backend),
+                        backend,
                         serial: format!("VMMC{serial}"),
                     })),
                     DiskInterface::Cdrom => sata_drives.push(Drive::Cdrom(Cdrom::new(
-                        Some(Arc::new(backend)),
+                        Some(backend),
                         &format!("VMMC{serial}"),
                     ))),
                 }
@@ -516,7 +511,7 @@ impl<P: Partition + 'static> Machine<P> {
             };
             let mut next_virtio_slot = FIRST_VIRTIO_SLOT;
             for (index, backend) in virtio_disks.into_iter().enumerate() {
-                let blk = VirtioBlk::new(Arc::new(backend), &format!("vmmc-disk{index}"));
+                let blk = VirtioBlk::new(backend, &format!("vmmc-disk{index}"));
                 let mut pci = VirtioPci::new(Box::new(blk), vm.memory().clone(), sink.clone());
                 // Firmware assigns BARs itself; for direct boot, we do it the same way.
                 if direct_boot {

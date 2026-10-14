@@ -75,7 +75,7 @@ pub(crate) fn boot_installed(name: &str, log: &Path) -> Result<Session, String> 
     let native = native::fetch(&workspace)?;
     let exe = build_vmmc_vmx(&workspace)?;
     let dir = workspace.join("target").join(name);
-    let disk = crate::image_dir()?.join(format!("{name}-disk.raw"));
+    let disk = crate::image_dir()?.join(format!("{name}-disk.vmdk"));
     let mut command = Command::new(&exe);
     command
         .arg("run")
@@ -292,9 +292,9 @@ pub(crate) fn install(
     );
     let disc = iso::build("VMMC_ANSWER", &files, None);
     fs::write(&answer, disc).map_err(|e| format!("can't write {}: {e}", answer.display()))?;
-    let disk = crate::image_dir()?.join(format!("{}-disk.raw", install.name));
+    let disk = crate::image_dir()?.join(format!("{}-disk.vmdk", install.name));
     let _ = fs::remove_file(&disk);
-    disk::create_raw(&disk, DISK_SIZE)
+    disk::create_sparse(&disk, DISK_SIZE)
         .map_err(|e| format!("can't create {}: {e}", disk.display()))?;
 
     let mut command = Command::new(&exe);

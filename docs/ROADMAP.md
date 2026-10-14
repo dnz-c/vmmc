@@ -372,7 +372,20 @@ Scope moved out of Phase 1:
   - **Linux:** the kernel's `bochs-drm` runs the adapter. Resolutions are chosen in the guest; following the window would need a hot-plug signal bochs-drm doesn't have (virtio-gpu has one), so the window's size reaches Linux only as the EDID's preference at the next boot.
   - **Before release:** see [RELEASE-BLOCKERS.md](RELEASE-BLOCKERS.md): Microsoft's attestation signature, and vmmc's own PCI IDs in place of 1234:1111.
 
-### Phase 3: Desktop app alpha + VMware migration (about 3–4 months)
+### Phase 3: Desktop app alpha + VMware migration (about 3–4 months): in progress
+
+Plan (2026-10-14), in milestones that each end verified on WHP: VM files and VMDK (M1), VMware import (M2), the worker process with IPC and a sandbox (M3), the desktop app (M4), snapshots and suspend/resume (M5), clones, disk maintenance and OVF/OVA (M6), the CLI and docs (M7). Decisions: migration first; VMware VMs open in place behind a protective snapshot (vmmc never writes VMware's files); full snapshots with memory.
+
+- **M1, VM files and VMDK: done (2026-10-14).**
+  - `crates/vmconfig`: a VM is a folder with a `.vmmc` file (TOML: name, UUID, CPUs, memory, firmware, TPM, disks, CD-ROMs, NICs, display, notes, times), `nvram.fd`, `tpm-state.bin` and its disks; the library (`%APPDATA%\vmmc\library.toml`) lists VMs in folders; OS presets; creating a VM, or adopting an old `--vm-dir`.
+  - `crates/disk` reads and writes VMDKs, written from VMware's Virtual Disk Format spec: descriptors (UTF-8 or Windows-1252), hosted sparse extents (grain directory and tables, the redundant copy kept in step, grains allocated as written), split, flat and zero extents, stream-optimized (read), and delta chains checked by the parent's CID. The CID changes on the first write. Extents are opened without shared write access, so VMware can't open a disk vmmc has open. New disks are monolithic sparse, laid out as VMware lays them out.
+  - A disk's format comes from its name (`.vmdk`), never its contents: a guest can write a VMDK header into a raw image, whose extents could then name host files.
+  - `vmmc-vmx run --vm FILE`; `vmmc-cli create | list | add | remove | disk create | info | convert`.
+  - **Tests:** unit tests for parsing, allocation, both tables, deltas, CIDs, concurrency, and hostile headers. `cargo xtask vmdk-compat-test` has VMware's `vmware-vdiskmanager` make every disk type, vmmc writes to them, and VMware finds them consistent (`-R`) and converts them to disks holding exactly vmmc's data; the same for vmmc's own disks and deltas (`-e` on the chain), and vmmc reads VMware's stream-optimized copies. The Linux, UEFI and Windows install tests run on VMDKs.
+- **M2, VMware import: done (2026-10-14).**
+  - `vmmc-cli import X.vmx`: the `.vmx` (with `|XX` escapes) becomes a `.vmmc` in a `vmmc` folder beside it, with a delta on each of VMware's disks. It maps CPUs, memory, NVMe/SATA (SCSI and IDE onto SATA, with a warning) disks, CD images, NICs (as e1000e, keeping their MACs), Secure Boot, the TPM (a new one) and the SMBIOS UUID (VMware keeps it in SMBIOS byte order). It refuses encrypted, BIOS, suspended and open VMs, and warns about what doesn't carry over (sound, 3D, shared folders, bridged networking, nested virtualization), re-activation, and BitLocker volumes it finds.
+  - **Test:** `cargo xtask vmware-import-test` imports a real VMware Workstation VM (Windows 10 22H2, hardware version 22, two 64 GB split sparse disks on NVMe and SATA, EFI, e1000e) with vmmc's files outside the VMware folder, boots it headless, and waits for the guest to take a DHCP address from vmmc's NAT: 78 s, at its desktop. The power button shuts it down, and afterwards every file in the VMware folder has its size and time (and the small ones their contents) unchanged.
+  - Found on the way: VMware Tools in the guest stops with an error at logon (it uses VMware's private hypervisor interface), so the import says to uninstall it after moving; and vmmc-vmx wrote colour codes into redirected logs, which it no longer does off a terminal.
 
 - **Slint app:**
   - library with folders and tabs, VM notes, timestamps;

@@ -25,6 +25,14 @@ Windows from an ISO) is done:
   vmmc's Windows display driver, Windows follows the window's size and its cursor is
   drawn by the window.
 
+Phase 3 (the desktop app and moving over from VMware) is under way:
+- **VMs are files:** a folder with a `.vmmc` config, made by `vmmc-cli create`, run by
+  `vmmc-vmx run --vm`.
+- **Disks are VMDKs**, VMware's format: vmmc reads and writes the kinds VMware makes,
+  and VMware's own tools accept vmmc's.
+- **VMware VMs open in place** (`vmmc-cli import`), behind delta disks that keep
+  VMware's files unchanged.
+
 What a release still needs is listed in [docs/RELEASE-BLOCKERS.md](docs/RELEASE-BLOCKERS.md).
 
 What exists:
@@ -37,6 +45,8 @@ What exists:
   direct Linux boot (bzImage + initramfs) in 64-bit mode.
 - **Worker:** `vmmc-vmx`, which puts the guest's serial console on your terminal and,
   with `--display window`, its screen in a window.
+- **Command line:** `vmmc-cli`, which makes VMs, imports VMware's, keeps the library
+  and handles disks.
 
 ## Requirements
 
@@ -70,6 +80,8 @@ cargo xtask win-perf                            # boot timings of that Windows, 
 cargo xtask guest-drivers                       # build and test-sign the Windows guest drivers (needs the WDK)
 cargo xtask win-display-test                    # install Windows with the display driver, change resolution
 cargo xtask ubuntu-desktop-test                 # Ubuntu 26.04 Desktop autoinstall (downloads 6.5 GB)
+cargo xtask vmdk-compat-test                    # vmmc's VMDKs against VMware's vdiskmanager (needs VMware)
+cargo xtask vmware-import-test                  # open a VMware VM in place and boot it (VMMC_VMWARE_VMX)
 cargo xtask linux-shell                         # test Linux with a shell on this terminal
 ```
 
@@ -80,13 +92,31 @@ Build after fetching: a `vmmc-vmx` built without the TPM libraries refuses `--tp
 
 ## Running a VM
 
-With UEFI firmware, after `cargo xtask fetch-native`:
+A VM is a folder: its config (`NAME.vmmc`, TOML), its disk (`NAME.vmdk`), its UEFI
+variables (`nvram.fd`) and its TPM (`tpm-state.bin`). After `cargo xtask fetch-native`:
+
+```powershell
+cargo build --release -p vmmc-vmx -p vmmc-cli
+target\release\vmmc-cli.exe create "Ubuntu" --os ubuntu --iso C:\ISOs\ubuntu.iso
+target\release\vmmc-vmx.exe run --vm "$HOME\Documents\vmmc VMs\Ubuntu\Ubuntu.vmmc" --display window
+```
+
+`create` picks the hardware from `--os` (`windows11`, `windows10`, `ubuntu`, `linux`,
+`other`); `--cpus`, `--memory`, `--disk-size` and `--dir` change it, and the config can
+be edited afterwards. `vmmc-cli list` shows the library, `vmmc-cli disk` creates,
+describes and converts disks, and `vmmc-cli create --from-vm-dir DIR --disk IMAGE` turns
+a VM run the old way (below) into one with a config. `vmmc-vmx` finds the firmware
+next to itself or, in a build, in `target\native`.
+
+Everything can also be given as options, without a config (the tests do this):
 
 ```powershell
 cargo run -p vmmc-vmx -- run --firmware target\native\OVMF_CODE.fd `
-    --vm-dir my-vm --disk disk.raw --cpus 4 --memory 4096
+    --vm-dir my-vm --disk disk.vmdk --cpus 4 --memory 4096
 ```
 
+With `--vm`, the options add disks, CD-ROMs and NICs to the config's, and override the
+rest.
 `--disk PATH,nvme` attaches a disk as a namespace of the NVMe controller, which UEFI,
 Windows and Linux all have drivers for. `--disk PATH,sata` puts it on the AHCI
 controller, and plain `--disk PATH` makes it virtio-blk. `--cdrom ISO` adds a DVD drive
@@ -132,13 +162,14 @@ dev builds optimize their dependencies, but vmmc's own device code runs unoptimi
 After `cargo xtask fetch-native` (OVMF and the TPM libraries), from the repository:
 
 ```powershell
-cargo build --release -p vmmc-vmx
-$vmmc = "target\release\vmmc-vmx.exe"
-& $vmmc create-disk C:\VMs\windows\disk.raw --size 64G
-& $vmmc run --firmware target\native\OVMF_CODE.fd --vm-dir C:\VMs\windows `
-    --disk C:\VMs\windows\disk.raw,nvme --cdrom C:\path\to\Windows.iso --tpm `
-    --nic e1000e --cpus 4 --memory 8192 --display window
+cargo build --release -p vmmc-vmx -p vmmc-cli
+target\release\vmmc-cli.exe create "Windows 11" --os windows11 --dir C:\VMs `
+    --iso C:\path\to\Windows.iso
+target\release\vmmc-vmx.exe run --vm "C:\VMs\Windows 11\Windows 11.vmmc" --display window
 ```
+
+The `windows11` preset is 4 vCPUs, 8 GB of memory, a 64 GB NVMe disk, an e1000e NIC,
+Secure Boot and a TPM.
 
 1. When the window shows "Press any key to boot from CD or DVD", press a key (in the
    window or the terminal). It waits only a few seconds; if you miss it, press Reset.
@@ -146,18 +177,42 @@ $vmmc = "target\release\vmmc-vmx.exe"
    positions, so the layout set in Windows applies. Ctrl+Alt+Del is on the toolbar.
 3. Setup restarts a few times. Don't press a key at the CD prompt then, and it boots
    from the disk.
-4. From then on, start the VM with the same command without `--cdrom`.
+4. Once installed, take the ISO out: delete the `[[cdrom]]` entry from the `.vmmc`.
 
-- `create-disk` makes a sparse image: it takes space only as Windows writes (about
-  10 GB after a fresh Windows 10 install). Put it on a fast local drive.
-- The VM directory holds the VM's UEFI variables (Secure Boot is on), its TPM and its
-  identity. Keep it with the disk, and don't run two VMs on one disk.
+- The disk is a sparse VMDK: it takes space only as Windows writes (about 10 GB after
+  a fresh Windows 10 install). Put the VM on a fast local drive.
+- The VM's folder holds its UEFI variables (Secure Boot is on), its TPM and, in the
+  config, its identity (UUID and MAC). Move it as a whole. A disk in use by one VM
+  can't be opened by another (or by VMware).
 - Windows 11's requirements (TPM 2.0, Secure Boot, 4 GB of memory, 64 GB of disk) are
   met. So far Windows 10 22H2 is what's been tested.
 - Without vmmc's display driver, Windows keeps the resolution the VM starts with
   (`--resolution WxH`; by default the largest standard one that fits your screen). The
   driver is test-signed for now, so it needs a VM with Secure Boot off; see
   [guest drivers](guest-drivers/windows/README.md).
+
+### Opening a VMware VM
+
+```powershell
+target\release\vmmc-cli.exe import "D:\VMs\Windows 10\Windows 10.vmx"
+target\release\vmmc-vmx.exe run --vm "D:\VMs\Windows 10\vmmc\Windows 10.vmmc" --display window
+```
+
+The import reads the `.vmx` and puts vmmc's files in a `vmmc` folder beside it: the
+config, fresh UEFI variables, and a delta disk on top of each of VMware's disks, which
+takes everything the guest writes. VMware's disks, `.vmx` and `.nvram` are never
+written, so the VM still runs in VMware as before, and deleting the `vmmc` folder undoes
+the import. (If the VM runs in VMware again afterwards, its disks change, and vmmc
+refuses the deltas it made on the old contents, as VMware would.)
+
+- **What carries over:** CPUs, memory, NVMe and SATA disks, the ISO in the DVD drive,
+  the NICs' MAC addresses (as e1000e on NAT), Secure Boot, and the system UUID.
+- **What doesn't:** sound, 3D, shared folders, bridged networking, nested
+  virtualization; the import lists what it left out. Windows sees new hardware and
+  may want to be activated again; a VM with a TPM gets a new one, so BitLocker asks
+  for its recovery key (the import warns when it finds a BitLocker volume).
+- **What it refuses:** encrypted VMs (remove the encryption in VMware first), VMs that
+  boot with BIOS, suspended VMs, and VMs VMware has open.
 
 Or a Linux kernel, booted directly:
 
@@ -188,11 +243,13 @@ status: 0 when the guest powers off (or you quit), 2 when it resets with `--no-r
 | `crates/hv-whp` | Windows Hypervisor Platform backend, including its instruction emulator |
 | `crates/vm-core` | Guest memory, port/MMIO buses and the vCPU run loop |
 | `crates/devices` | Device models: chipset, firmware interfaces (fw_cfg, flash), PCI, NVMe, AHCI/ATAPI, e1000e, xHCI and USB HID, PS/2, TPM CRB, virtio |
-| `crates/disk` | Disk images: the block backend trait, raw (sparse) image files |
+| `crates/disk` | Disk images: the block backend trait, VMDK (sparse, split, flat, stream-optimized, delta chains) and raw images |
+| `crates/vmconfig` | VM files: the `.vmmc` config, the library, OS presets, and VMware `.vmx` import |
 | `crates/net` | User-mode NAT networking (smoltcp): DHCP, DNS, TCP/UDP to host sockets |
 | `crates/tpm` | The TPM 2.0 engine: Microsoft's reference implementation, linked from the CI build |
 | `crates/machine` | The x86 PC platform: memory map, ACPI, SMBIOS, firmware and Linux boot, vCPU threads |
 | `bins/vmmc-vmx` | Runs one VM, with its serial console on the terminal and optionally its screen in a Slint window |
+| `bins/vmmc-cli` | The command line: create and import VMs, the library, disks |
 | `guest-drivers/windows` | Windows drivers for vmmc's devices: the display (resolution changes); see its README |
 | `xtask` | Developer tasks and test guest artifacts |
 | `third_party` | Upstream crates with small Windows-build patches (see each `VMMC-PATCH.md`) |

@@ -954,6 +954,7 @@ dependencies = [
 name = "disk"
 version = "0.0.1"
 dependencies = [
+ "miniz_oxide 0.8.9",
  "tempfile",
  "tracing",
  "windows",
@@ -4785,6 +4786,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "503041e3dca68fbd5425c04e4c2ad63c57a31da5b6eb13aaafbcaaf2b9cdc74f"
 
 [[package]]
+name = "vmconfig"
+version = "0.0.1"
+dependencies = [
+ "disk",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml",
+]
+
+[[package]]
+name = "vmmc-cli"
+version = "0.0.1"
+dependencies = [
+ "clap",
+ "disk",
+ "tempfile",
+ "vmconfig",
+]
+
+[[package]]
 name = "vmmc-vmx"
 version = "0.0.1"
 dependencies = [
@@ -4799,6 +4821,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vm-core",
+ "vmconfig",
  "windows",
 ]
 
@@ -5772,6 +5795,7 @@ dependencies = [
  "png",
  "ruzstd",
  "sha2",
+ "vmconfig",
 ]
 
 [[package]]

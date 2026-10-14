@@ -107,12 +107,11 @@ pub fn prepare(workspace: &Path) -> Result<Guest, String> {
     let initramfs = dir.join("initramfs.cpio");
     write(&initramfs, &archive)?;
 
-    let disk = crate::image_dir()?.join("linux-test-disk.raw");
+    // A VMDK, vmmc's own disk format, so the test goes through it.
+    let disk = crate::image_dir()?.join("linux-test-disk.vmdk");
     let _ = fs::remove_file(&disk);
-    let file =
-        fs::File::create(&disk).map_err(|e| format!("can't create {}: {e}", disk.display()))?;
-    file.set_len(DISK_SIZE)
-        .map_err(|e| format!("can't size {}: {e}", disk.display()))?;
+    disk::create_sparse(&disk, DISK_SIZE)
+        .map_err(|e| format!("can't create {}: {e}", disk.display()))?;
 
     Ok(Guest {
         kernel,

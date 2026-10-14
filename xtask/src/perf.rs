@@ -39,7 +39,7 @@ struct Run {
 pub fn test(runs: usize) -> Result<(), String> {
     let workspace = workspace();
     let native = native::fetch(&workspace)?;
-    let disk = image_dir()?.join("win11-test-disk.raw");
+    let disk = image_dir()?.join("win11-test-disk.vmdk");
     let vm_dir = workspace.join("target").join("win11-test").join("vm");
     if !disk.is_file() || !vm_dir.is_dir() {
         return Err("no installed Windows: run `cargo xtask win11-test` first".into());

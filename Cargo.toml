@@ -19,6 +19,7 @@ hv = { path = "crates/hv" }
 hv-whp = { path = "crates/hv-whp" }
 machine = { path = "crates/machine" }
 tpm = { path = "crates/tpm" }
+vmconfig = { path = "crates/vmconfig" }
 vm-core = { path = "crates/vm-core" }
 
 acpi_tables = "0.2.1"
@@ -44,9 +45,11 @@ slint = { version = "1.18.1", default-features = false, features = [
     "backend-winit",
     "renderer-software",
 ] }
+serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.11.0"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
+toml = "1.1.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 virtio-bindings = "0.2.7"

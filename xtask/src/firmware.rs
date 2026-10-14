@@ -180,10 +180,9 @@ fn scratch_disk(dir: &Path) -> Result<PathBuf, String> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("test");
-    let scratch = crate::image_dir()?.join(format!("{name}-scratch.raw"));
+    let scratch = crate::image_dir()?.join(format!("{name}-scratch.vmdk"));
     let _ = fs::remove_file(&scratch);
-    fs::File::create(&scratch)
-        .and_then(|file| file.set_len(SCRATCH_SIZE))
+    disk::create_sparse(&scratch, SCRATCH_SIZE)
         .map_err(|e| format!("can't create {}: {e}", scratch.display()))?;
     Ok(scratch)
 }
@@ -470,6 +469,12 @@ impl Session {
         }
     }
 
+    /// How vmmc-vmx exited, if it has; never waits.
+    pub(crate) fn exited(&mut self) -> Option<ExitStatus> {
+        self.child.try_wait().ok().flatten()
+    }
+
+    /// Waits up to `timeout` for vmmc-vmx to exit, and kills it if it doesn't.
     pub(crate) fn wait(&mut self, timeout: Duration) -> Option<ExitStatus> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {

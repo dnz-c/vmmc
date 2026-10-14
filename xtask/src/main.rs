@@ -10,6 +10,8 @@ mod modules;
 mod native;
 mod perf;
 mod ubuntu;
+mod vmdk_compat;
+mod vmware_import;
 mod windows;
 
 use std::env;
@@ -45,6 +47,12 @@ tasks:
   ubuntu-desktop-test
                 download Ubuntu 26.04 Desktop, install it with autoinstall and boot it
                 (15-60 minutes)
+  vmdk-compat-test
+                check vmmc's VMDKs against VMware's vmware-vdiskmanager, both ways
+                (needs VMware Workstation)
+  vmware-import-test
+                open a VMware VM ($VMMC_VMWARE_VMX) in place, boot it until it takes a
+                DHCP address, power it off, and check VMware's files are unchanged
   linux-shell   boot the test Linux guest with a shell on this terminal";
 
 /// How long the Linux test guest gets to boot, test its disk and power off.
@@ -95,6 +103,8 @@ fn main() -> ExitCode {
             Some(_) => Err("win-perf: RUNS is a number of runs, at least 1".into()),
         },
         Some("ubuntu-desktop-test") => ubuntu::test(),
+        Some("vmdk-compat-test") => vmdk_compat::test(),
+        Some("vmware-import-test") => vmware_import::test(),
         Some("linux-shell") => linux_shell(),
         _ => {
             eprintln!("{USAGE}");

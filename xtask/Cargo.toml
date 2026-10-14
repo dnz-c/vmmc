@@ -13,6 +13,7 @@ fatfs.workspace = true
 png.workspace = true
 ruzstd.workspace = true
 sha2.workspace = true
+vmconfig.workspace = true
 
 [lints]
 workspace = true

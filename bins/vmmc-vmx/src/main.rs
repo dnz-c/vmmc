@@ -1,9 +1,10 @@
 //! vmmc-vmx: runs one virtual machine, with its serial console on this terminal.
 //!
 //! ```text
+//! vmmc-vmx run --vm "My VM\My VM.vmmc" --display window
 //! vmmc-vmx run --kernel bzImage --initrd initramfs.cpio --disk disk.raw --cpus 4
-//! vmmc-vmx run --firmware OVMF_CODE.fd --vm-dir my-vm --disk disk.raw
-//! vmmc-vmx create-disk disk.raw --size 64G
+//! vmmc-vmx run --firmware OVMF_CODE.fd --vm-dir my-vm --disk disk.vmdk,nvme
+//! vmmc-vmx create-disk disk.vmdk --size 64G
 //! ```
 //!
 //! A guest reset restarts the VM from scratch (unless `--no-reboot`). Exit status: 0
@@ -38,8 +39,8 @@ struct Cli {
 enum Command {
     /// Boot UEFI firmware or a Linux kernel, with the serial console on this terminal.
     Run(Box<RunArgs>),
-    /// Create an empty raw disk image for `run --disk`. On NTFS it's a sparse file,
-    /// which takes no space until the guest writes to it.
+    /// Create an empty disk for `run --disk`: a VMDK if the name ends in `.vmdk`
+    /// (it grows as the guest writes), otherwise a raw image (a sparse file on NTFS).
     CreateDisk(CreateDiskArgs),
 }
 
@@ -48,50 +49,24 @@ struct CreateDiskArgs {
     /// The image to create (with its directory). An existing file is never replaced.
     path: PathBuf,
     /// Its size: bytes, or with a K, M, G or T suffix (powers of 1024), like 64G.
-    #[arg(long, value_parser = parse_size)]
+    #[arg(long, value_parser = vmconfig::parse_size)]
     size: u64,
-}
-
-/// A disk size like `64G`, `500M` or `1T` (powers of 1024), in whole sectors.
-fn parse_size(text: &str) -> Result<u64, String> {
-    let invalid = || format!("{text:?} isn't a size like 64G or 500M");
-    let text = text.trim();
-    let split = text
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(text.len());
-    let (digits, unit) = text.split_at(split);
-    let unit = unit.trim().to_ascii_uppercase();
-    let unit = unit
-        .strip_suffix("IB")
-        .or_else(|| unit.strip_suffix('B'))
-        .unwrap_or(&unit);
-    let shift = match unit {
-        "" => 0,
-        "K" => 10,
-        "M" => 20,
-        "G" => 30,
-        "T" => 40,
-        _ => return Err(invalid()),
-    };
-    let size = digits
-        .parse::<u64>()
-        .map_err(|_| invalid())?
-        .checked_mul(1 << shift)
-        .ok_or_else(invalid)?;
-    if size == 0 || !size.is_multiple_of(512) {
-        return Err(format!(
-            "{text:?}: a disk is a whole number of 512-byte sectors"
-        ));
-    }
-    Ok(size)
 }
 
 fn create_disk(args: &CreateDiskArgs) -> Result<(), String> {
     if let Some(dir) = args.path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
         fs::create_dir_all(dir).map_err(|e| format!("can't create {}: {e}", dir.display()))?;
     }
-    disk::create_raw(&args.path, args.size)
-        .map_err(|e| format!("can't create {}: {e}", args.path.display()))
+    let is_vmdk = args
+        .path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("vmdk"));
+    let created = if is_vmdk {
+        disk::create_sparse(&args.path, args.size)
+    } else {
+        disk::create_raw(&args.path, args.size)
+    };
+    created.map_err(|e| format!("can't create {}: {e}", args.path.display()))
 }
 
 /// Where the guest's screen goes.
@@ -106,10 +81,17 @@ enum DisplayMode {
 
 #[derive(Args)]
 struct RunArgs {
+    /// A VM's `.vmmc` file, which says what the machine is. Disks, CD-ROMs and NICs
+    /// given as options are added to its own; other options override it.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["kernel", "vm_dir"])]
+    vm: Option<PathBuf>,
+    /// The VM `--vm` names, once loaded.
+    #[arg(skip)]
+    loaded: Option<vmconfig::Vm>,
     /// Linux kernel (bzImage) to boot directly.
     #[arg(
         long,
-        required_unless_present = "firmware",
+        required_unless_present_any = ["firmware", "vm"],
         conflicts_with = "firmware"
     )]
     kernel: Option<PathBuf>,
@@ -119,21 +101,23 @@ struct RunArgs {
     /// Kernel command line.
     #[arg(long, default_value = "console=ttyS0", requires = "kernel")]
     cmdline: String,
-    /// UEFI firmware code (OVMF_CODE.fd) to boot.
-    #[arg(long, requires = "vm_dir")]
+    /// UEFI firmware code (OVMF_CODE.fd) to boot [default with --vm: OVMF_CODE.fd
+    /// next to vmmc-vmx, or in ..\native, as a build has it].
+    #[arg(long)]
     firmware: Option<PathBuf>,
     /// Variable store a new VM starts from [default: OVMF_VARS.secboot.fd next to
-    /// the firmware (Secure Boot on), or OVMF_VARS.fd if there is none].
-    #[arg(long, requires = "firmware")]
+    /// the firmware (Secure Boot on), or OVMF_VARS.fd if there is none; with --vm,
+    /// whichever its Secure Boot setting asks for].
+    #[arg(long)]
     vars_template: Option<PathBuf>,
     /// The VM's state directory (variable store, UUID); created if missing.
     #[arg(long, requires = "firmware")]
     vm_dir: Option<PathBuf>,
     /// Give the VM a TPM 2.0, its state kept in the VM directory (tpm-state.bin).
-    #[arg(long, requires = "vm_dir")]
+    #[arg(long)]
     tpm: bool,
     /// Write the firmware's debug log (port 0x402) to this file.
-    #[arg(long, requires = "firmware")]
+    #[arg(long)]
     firmware_log: Option<PathBuf>,
     /// Show the screen in a window, which also takes keyboard and pointer input.
     #[arg(long, value_enum, default_value_t = DisplayMode::None)]
@@ -169,12 +153,63 @@ struct RunArgs {
     /// Repeat for more adapters.
     #[arg(long = "nic", value_name = "MODEL[,mac=MAC]")]
     nics: Vec<String>,
-    /// Number of vCPUs.
-    #[arg(long, default_value_t = 1)]
-    cpus: u8,
-    /// Memory in MiB.
-    #[arg(long, default_value_t = 1024)]
-    memory: u64,
+    /// Number of vCPUs [default: the VM's, or 1].
+    #[arg(long)]
+    cpus: Option<u8>,
+    /// Memory in MiB [default: the VM's, or 1024].
+    #[arg(long)]
+    memory: Option<u64>,
+}
+
+/// Where a build keeps the firmware: next to the program, or in `target\native` for
+/// `target\debug` and `target\release`.
+fn default_firmware() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    [
+        dir.join("OVMF_CODE.fd"),
+        dir.parent()?.join("native").join("OVMF_CODE.fd"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+}
+
+/// Fills in what `--vm`'s file says, where the options don't.
+fn with_vm(mut args: RunArgs) -> Result<RunArgs, String> {
+    let Some(path) = &args.vm else {
+        if args.tpm && args.vm_dir.is_none() {
+            return Err("--tpm needs --vm or --vm-dir, where its state is kept".into());
+        }
+        return Ok(args);
+    };
+    let mut vm = vmconfig::Vm::load(path).map_err(|e| e.to_string())?;
+    let config = &vm.config;
+    if args.firmware.is_none() {
+        args.firmware =
+            Some(default_firmware().ok_or(
+                "no firmware found: put OVMF_CODE.fd next to vmmc-vmx, or give --firmware",
+            )?);
+    }
+    if args.vars_template.is_none()
+        && let Some(firmware) = &args.firmware
+    {
+        let name = if config.firmware.secure_boot {
+            "OVMF_VARS.secboot.fd"
+        } else {
+            "OVMF_VARS.fd"
+        };
+        args.vars_template = Some(firmware.with_file_name(name));
+    }
+    args.tpm |= config.firmware.tpm;
+    args.cpus = args.cpus.or(Some(config.cpus));
+    args.memory = args.memory.or(Some(config.memory_mib));
+    args.resolution = args.resolution.or(config.resolution());
+    args.no_enlightenments |= !config.advanced.enlightenments;
+    if let Err(e) = vm.mark_powered_on() {
+        tracing::warn!(%e, "can't note when the VM was started");
+    }
+    args.loaded = Some(vm);
+    Ok(args)
 }
 
 /// The process's TPM, as the machine's CRB uses it.
@@ -323,9 +358,12 @@ impl Boot {
                 cmdline: args.cmdline.clone(),
             });
         }
-        let (Some(firmware), Some(dir)) = (&args.firmware, &args.vm_dir) else {
-            return Err("give either --kernel, or --firmware with --vm-dir".into());
+        let Some(firmware) = &args.firmware else {
+            return Err("give --vm, --kernel, or --firmware with --vm-dir".into());
         };
+        if args.loaded.is_none() && args.vm_dir.is_none() {
+            return Err("--firmware needs --vm-dir, where the VM's state is kept".into());
+        }
         let template = match &args.vars_template {
             Some(template) => template.clone(),
             None => ["OVMF_VARS.secboot.fd", "OVMF_VARS.fd"]
@@ -339,9 +377,14 @@ impl Boot {
             // Each run of the process starts a fresh log; restarts append to it.
             fs::File::create(log).map_err(|e| format!("can't create {}: {e}", log.display()))?;
         }
+        let dir = match (&args.loaded, &args.vm_dir) {
+            (Some(vm), _) => vm_dir::open_vm(vm, &template)?,
+            (None, Some(dir)) => vm_dir::open(dir, &template)?,
+            (None, None) => unreachable!("checked above"),
+        };
         Ok(Boot::Firmware {
             code: read(firmware)?,
-            dir: vm_dir::open(dir, &template)?,
+            dir,
             log,
         })
     }
@@ -369,17 +412,58 @@ impl Boot {
     }
 }
 
-/// Every disk and disc the arguments name. CD-ROMs come first, so they take the first
-/// SATA ports.
+/// Every disk and disc the VM's file and the arguments name. CD-ROMs come first, so
+/// they take the first SATA ports.
 fn disks(args: &RunArgs) -> Vec<DiskConfig> {
-    let cdroms = args.cdroms.iter().map(|path| DiskConfig {
-        path: path.clone(),
+    let cdrom = |path: PathBuf| DiskConfig {
+        path,
         read_only: true,
         interface: DiskInterface::Cdrom,
-    });
-    cdroms
-        .chain(args.disks.iter().map(|disk| parse_disk(disk)))
-        .collect()
+    };
+    let mut cdroms = Vec::new();
+    let mut disks = Vec::new();
+    if let Some(vm) = &args.loaded {
+        cdroms.extend(
+            vm.config
+                .cdroms
+                .iter()
+                .filter_map(|drive| drive.path.as_deref())
+                .map(|path| cdrom(vm.resolve(path))),
+        );
+        disks.extend(vm.config.disks.iter().map(|disk| DiskConfig {
+            path: vm.resolve(&disk.path),
+            read_only: disk.read_only,
+            interface: match disk.bus {
+                vmconfig::Bus::Nvme => DiskInterface::Nvme,
+                vmconfig::Bus::Sata => DiskInterface::Sata,
+                vmconfig::Bus::Virtio => DiskInterface::Virtio,
+            },
+        }));
+    }
+    cdroms.extend(args.cdroms.iter().cloned().map(cdrom));
+    disks.extend(args.disks.iter().map(|disk| parse_disk(disk)));
+    cdroms.into_iter().chain(disks).collect()
+}
+
+/// The VM file's NICs, then the arguments'.
+fn nics(args: &RunArgs, default_mac: [u8; 6]) -> Result<Vec<NicConfig>, String> {
+    let mut nics = Vec::new();
+    if let Some(vm) = &args.loaded {
+        for nic in &vm.config.nics {
+            nics.push(NicConfig {
+                model: match nic.model {
+                    vmconfig::NicModel::E1000e => NicModel::E1000e,
+                    vmconfig::NicModel::Virtio => NicModel::Virtio,
+                },
+                mac: vmconfig::parse_mac(&nic.mac).ok_or("bad MAC address in the VM file")?,
+            });
+        }
+    }
+    let first = nics.len();
+    for (index, nic) in args.nics.iter().enumerate() {
+        nics.push(parse_nic(nic, default_mac, first + index)?);
+    }
+    Ok(nics)
 }
 
 /// Saves a screenshot of whichever machine is running every `every` seconds.
@@ -408,9 +492,11 @@ fn spawn_periodic_screenshots(
 fn run(args: RunArgs) -> Result<RunOutcome, Box<dyn Error>> {
     use machine::layout::MIB;
 
+    let args = with_vm(args)?;
     let boot = Boot::load(&args)?;
     let memory = args
         .memory
+        .unwrap_or(1024)
         .checked_mul(MIB)
         .ok_or("memory size is too large")?;
     let whp = hv_whp::Whp::new()?;
@@ -418,12 +504,7 @@ fn run(args: RunArgs) -> Result<RunOutcome, Box<dyn Error>> {
         Boot::Firmware { dir, .. } => dir.mac,
         Boot::Linux { .. } => DEFAULT_MAC,
     };
-    let nics = args
-        .nics
-        .iter()
-        .enumerate()
-        .map(|(index, nic)| parse_nic(nic, default_mac, index))
-        .collect::<Result<Vec<_>, _>>()?;
+    let nics = nics(&args, default_mac)?;
 
     let screenshots = match &args.screenshot {
         Some(dir) => Some(Arc::new(
@@ -446,8 +527,9 @@ fn run(args: RunArgs) -> Result<RunOutcome, Box<dyn Error>> {
         }
         _ => None,
     };
-    let title = match &boot {
-        Boot::Firmware { .. } => args
+    let title = match (&boot, &args.loaded) {
+        (_, Some(vm)) => format!("vmmc: {}", vm.config.name),
+        (Boot::Firmware { .. }, None) => args
             .vm_dir
             .as_deref()
             .and_then(|dir| dir.file_name())
@@ -455,7 +537,7 @@ fn run(args: RunArgs) -> Result<RunOutcome, Box<dyn Error>> {
                 || "vmmc".into(),
                 |name| format!("vmmc: {}", name.to_string_lossy()),
             ),
-        Boot::Linux { .. } => "vmmc".into(),
+        (Boot::Linux { .. }, None) => "vmmc".into(),
     };
     let display = args.display;
     let resolution = match (args.resolution, display) {
@@ -520,7 +602,7 @@ fn run_machines(
         let mut machine = Machine::new(
             whp,
             MachineConfig {
-                cpus: args.cpus,
+                cpus: args.cpus.unwrap_or(1),
                 memory,
                 disks: disks(args),
                 nics: nics.to_vec(),
@@ -570,7 +652,12 @@ fn run_machines(
 #[cfg(not(windows))]
 fn run(args: RunArgs) -> Result<RunOutcome, Box<dyn Error>> {
     // Keep the shared helpers in use on every platform.
-    let _ = (Boot::load(&args)?.firmware_config(), disks(&args));
+    let args = with_vm(args)?;
+    let _ = (
+        Boot::load(&args)?.firmware_config(),
+        disks(&args),
+        nics(&args, DEFAULT_MAC),
+    );
     Err("no hypervisor backend for this operating system yet".into())
 }
 
@@ -581,6 +668,8 @@ fn main() -> ExitCode {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
         .with_writer(std::io::stderr)
+        // Colours only on a terminal: a log file gets plain text.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .init();
 
     match Cli::parse().command {
@@ -680,19 +769,6 @@ mod tests {
     }
 
     #[test]
-    fn disk_sizes_parse_in_powers_of_1024() {
-        assert_eq!(parse_size("64G"), Ok(64 << 30));
-        assert_eq!(parse_size("64GiB"), Ok(64 << 30));
-        assert_eq!(parse_size("500m"), Ok(500 << 20));
-        assert_eq!(parse_size("1T"), Ok(1 << 40));
-        assert_eq!(parse_size("4096"), Ok(4096));
-        assert!(parse_size("64X").is_err());
-        assert!(parse_size("G").is_err());
-        assert!(parse_size("0").is_err());
-        assert!(parse_size("1000").is_err(), "not whole sectors");
-    }
-
-    #[test]
     fn create_disk_makes_its_directory_and_never_replaces_a_file() {
         let dir = tempfile::tempdir().unwrap();
         let args = CreateDiskArgs {
@@ -711,7 +787,10 @@ mod tests {
             "2048",
         ])
         .unwrap();
-        assert_eq!((args.cpus, args.memory, args.disks.len()), (4, 2048, 2));
+        assert_eq!(
+            (args.cpus, args.memory, args.disks.len()),
+            (Some(4), Some(2048), 2)
+        );
         assert_eq!(args.cmdline, "console=ttyS0");
         assert!(!args.no_reboot);
     }
@@ -720,9 +799,70 @@ mod tests {
     fn firmware_needs_a_vm_dir_and_excludes_a_kernel() {
         let args = parse(&["--firmware", "OVMF_CODE.fd", "--vm-dir", "vm"]).unwrap();
         assert_eq!(args.vm_dir, Some(PathBuf::from("vm")));
-        assert!(parse(&["--firmware", "OVMF_CODE.fd"]).is_err());
+        let alone = parse(&["--firmware", "OVMF_CODE.fd"]).unwrap();
+        assert!(Boot::load(&alone).err().unwrap().contains("--vm-dir"));
         assert!(parse(&["--firmware", "f", "--vm-dir", "vm", "--kernel", "k"]).is_err());
         assert!(parse(&["--vm-dir", "vm"]).is_err(), "nothing to boot");
-        assert!(parse(&["--kernel", "k", "--firmware-log", "log"]).is_err());
+        assert!(parse(&["--vm", "x.vmmc", "--kernel", "k"]).is_err());
+        assert!(parse(&["--vm", "x.vmmc", "--vm-dir", "d"]).is_err());
+        let tpm = parse(&["--kernel", "k", "--tpm"]).unwrap();
+        assert!(with_vm(tpm).err().unwrap().contains("--tpm"));
+    }
+
+    #[test]
+    fn a_vm_file_supplies_the_machine_and_options_add_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = vmconfig::VmConfig::new("Test VM", "linux", 2, 3072);
+        config.disks.push(vmconfig::Disk {
+            path: "test.vmdk".into(),
+            bus: vmconfig::Bus::Nvme,
+            read_only: false,
+        });
+        config.cdroms.push(vmconfig::Cdrom {
+            path: Some("install.iso".into()),
+        });
+        config.firmware.secure_boot = false;
+        config.display.resolution = Some("1600x900".into());
+        let path = dir.path().join("Test VM.vmmc");
+        let vm = vmconfig::Vm {
+            path: path.clone(),
+            config,
+        };
+        vm.save().unwrap();
+        let path = path.to_str().unwrap();
+        let args = parse(&[
+            "--vm",
+            path,
+            "--firmware",
+            "fw/OVMF_CODE.fd",
+            "--cdrom",
+            "answer.iso",
+            "--nic",
+            "virtio",
+            "--cpus",
+            "4",
+        ])
+        .unwrap();
+        let args = with_vm(args).unwrap();
+        assert_eq!((args.cpus, args.memory), (Some(4), Some(3072)));
+        assert!(args.tpm, "the file's TPM");
+        assert_eq!(args.resolution, Some((1600, 900)));
+        assert_eq!(
+            args.vars_template,
+            Some(PathBuf::from("fw/OVMF_VARS.fd")),
+            "Secure Boot off"
+        );
+        let disks = disks(&args);
+        assert_eq!(disks.len(), 3);
+        assert_eq!(disks[0].path, dir.path().join("install.iso"));
+        assert_eq!(disks[1].path, PathBuf::from("answer.iso"));
+        assert_eq!(disks[2].path, dir.path().join("test.vmdk"));
+        assert_eq!(disks[2].interface, DiskInterface::Nvme);
+        let nics = nics(&args, DEFAULT_MAC).unwrap();
+        assert_eq!(nics.len(), 2);
+        assert_eq!(nics[0].model, NicModel::E1000e);
+        assert_eq!(nics[1].model, NicModel::Virtio);
+        let saved = vmconfig::Vm::load(Path::new(path)).unwrap();
+        assert!(saved.config.last_powered_on.is_some(), "start noted");
     }
 }

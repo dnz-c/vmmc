@@ -16,6 +16,7 @@ tpm.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 vm-core.workspace = true
+vmconfig.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 hv-whp.workspace = true
