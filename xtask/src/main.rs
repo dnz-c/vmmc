@@ -1,12 +1,14 @@
 //! Developer tasks: `cargo xtask <task>`.
 
 mod cpio;
+mod drivers;
 mod esp;
 mod firmware;
 mod guests;
 mod iso;
 mod modules;
 mod native;
+mod perf;
 mod ubuntu;
 mod windows;
 
@@ -33,6 +35,13 @@ tasks:
                 boot the test Linux through OVMF from an EFI system partition on NVMe
   uefi-cd-test  boot the test Linux through OVMF from an ISO in the AHCI DVD drive
   win11-test    install Windows 11 unattended from $VMMC_WIN11_ISO (20-60 minutes)
+  guest-drivers build vmmc's Windows guest drivers with the WDK and test-sign them
+  win-display-test
+                install Windows with Secure Boot off and test signing on, install the
+                display driver and check that the resolution changes ($VMMC_WIN11_ISO)
+  win-perf [RUNS]
+                boot the Windows win11-test installed RUNS times (3) each without and
+                with Hyper-V enlightenments, in a release build, and compare timings
   ubuntu-desktop-test
                 download Ubuntu 26.04 Desktop, install it with autoinstall and boot it
                 (15-60 minutes)
@@ -76,6 +85,15 @@ fn main() -> ExitCode {
         Some("uefi-linux-test") => firmware::linux_test(),
         Some("uefi-cd-test") => firmware::cd_test(),
         Some("win11-test") => windows::test(),
+        Some("guest-drivers") => {
+            drivers::build(env::args().any(|arg| arg == "--trace")).map(|_| ())
+        }
+        Some("win-display-test") => drivers::display_test(),
+        Some("win-perf") => match env::args().nth(2).map(|runs| runs.parse::<usize>()) {
+            None => perf::test(3),
+            Some(Ok(runs)) if runs > 0 => perf::test(runs),
+            Some(_) => Err("win-perf: RUNS is a number of runs, at least 1".into()),
+        },
         Some("ubuntu-desktop-test") => ubuntu::test(),
         Some("linux-shell") => linux_shell(),
         _ => {
@@ -245,12 +263,21 @@ fn vmmc_vmx_command(exe: &Path, guest: &guests::Guest, cmdline: &str) -> Command
 
 fn build_vmmc_vmx(workspace: &Path) -> Result<PathBuf, String> {
     cargo(&["build", "-p", "vmmc-vmx"])?;
-    let target = env::var_os("CARGO_TARGET_DIR")
+    Ok(vmmc_vmx_path(workspace, "debug"))
+}
+
+/// Builds vmmc-vmx as users run it, for measuring.
+fn build_vmmc_vmx_release(workspace: &Path) -> Result<PathBuf, String> {
+    cargo(&["build", "--release", "-p", "vmmc-vmx"])?;
+    Ok(vmmc_vmx_path(workspace, "release"))
+}
+
+fn vmmc_vmx_path(workspace: &Path, profile: &str) -> PathBuf {
+    env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| workspace.join("target"));
-    Ok(target
-        .join("debug")
-        .join(format!("vmmc-vmx{}", env::consts::EXE_SUFFIX)))
+        .unwrap_or_else(|| workspace.join("target"))
+        .join(profile)
+        .join(format!("vmmc-vmx{}", env::consts::EXE_SUFFIX))
 }
 
 fn cargo(args: &[&str]) -> Result<(), String> {

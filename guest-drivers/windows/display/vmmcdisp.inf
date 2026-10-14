@@ -1,0 +1,49 @@
+;
+; vmmc display driver: resolutions and mode changes for vmmc's display adapter.
+;
+
+[Version]
+Signature = "$Windows NT$"
+Class = Display
+ClassGUID = {4d36e968-e325-11ce-bfc1-08002be10318}
+Provider = %Vmmc%
+DriverVer =
+CatalogFile = vmmcdisp.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+VmmcDisplay.Files = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+vmmcdisp.sys = 1
+
+[Manufacturer]
+%Vmmc% = Vmmc, NTamd64
+
+[Vmmc.NTamd64]
+%DeviceName% = VmmcDisplay, PCI\VEN_1234&DEV_1111
+
+[VmmcDisplay]
+FeatureScore = F9
+CopyFiles = VmmcDisplay.Files
+
+[VmmcDisplay.Files]
+vmmcdisp.sys
+
+[VmmcDisplay.Services]
+AddService = vmmcdisp, 0x00000002, VmmcDisplay.Service
+
+[VmmcDisplay.Service]
+DisplayName = %DeviceName%
+ServiceType = 1 ; kernel driver
+StartType = 3 ; on demand
+ErrorControl = 1 ; normal
+ServiceBinary = %13%\vmmcdisp.sys
+
+[Strings]
+Vmmc = "vmmc"
+DiskName = "vmmc display driver"
+DeviceName = "vmmc Display Adapter"

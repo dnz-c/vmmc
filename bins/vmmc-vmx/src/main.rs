@@ -146,10 +146,11 @@ struct RunArgs {
     /// Exit when the guest resets, rather than restarting it.
     #[arg(long)]
     no_reboot: bool,
-    /// Expose Hyper-V enlightenments (reference TSC, synthetic timers, hypercalls),
-    /// which the Windows hypervisor implements itself.
+    /// Hide the Hyper-V enlightenments (reference TSC, synthetic timers, hypercalls)
+    /// that the Windows hypervisor implements for guests. With them, an idle Windows
+    /// costs the host a fraction of the CPU it does without.
     #[arg(long)]
-    enlightenments: bool,
+    no_enlightenments: bool,
     /// Save screenshots (PNG) here: one when the VM stops, and one on each Ctrl-A s.
     #[arg(long, value_name = "DIR")]
     screenshot: Option<PathBuf>,
@@ -526,7 +527,7 @@ fn run_machines(
                 serial_output: Box::new(console::ConsoleOutput),
                 firmware: boot.firmware_config()?,
                 tpm: tpm.cloned(),
-                enlightenments: args.enlightenments,
+                enlightenments: !args.no_enlightenments,
                 resolution,
             },
         )?;

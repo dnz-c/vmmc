@@ -183,7 +183,7 @@ Scope moved out of Phase 1:
   - Windows 11 (current ISO) installs unattended onto NVMe and reaches the desktop with NAT internet. `msinfo32` shows Secure Boot On and TPM 2.0.
   - Ubuntu 26.04 Desktop installs from ISO.
 
-**Where Phase 2 stands (2026-10-13):** Ubuntu Desktop installs and runs (M10). The Windows test passes in full with Windows 10 22H2: Secure Boot on, `Get-Tpm` reporting a ready TPM 2.0 (with the temporary MSFT manufacturer ID, see M7), the USB tablet, the PS/2 keyboard, the EDID's resolution and the network. Still to do: a Windows 11 ISO run, and a Windows driver for the display adapter (Windows can't change resolution without one).
+**Where Phase 2 stands (2026-10-13):** both exit criteria are met. Ubuntu Desktop installs and runs (M10). The Windows test passes in full with Windows 10 22H2: Secure Boot on, `Get-Tpm` reporting a ready TPM 2.0 (with the temporary MSFT manufacturer ID, see M7), the USB tablet, the PS/2 keyboard, the EDID's resolution and the network. Decided 2026-10-13: the Windows 10 install counts for the Windows criterion, and the Windows 11 ISO run is skipped. Since then (2026-10-14): Hyper-V enlightenments are on by default after the performance pass (M10), and a Windows display driver lets Windows change resolution (M11). It's test-signed, so for now it loads only in VMs with Secure Boot off; shipping it needs Microsoft's attestation signature.
 
 **Milestones done so far (verified on WHP, 2026-10-12):**
 
@@ -342,10 +342,31 @@ Scope moved out of Phase 1:
   - **Install:** offline, onto a 64 GiB NVMe disk, with Secure Boot on. The late commands install a first-boot service, then the installer powers off. It takes about 4 minutes.
   - **First boot:** from the disk alone, with an e1000e adapter added. The service reports kernel 7.0, 4 CPUs, Secure Boot on, root on NVMe, the `bochs-drm` display driver, GNOME's display manager running, a page fetched from the host through the NAT, and no failed units. Then it powers off.
   - **Bug found: ARP answers for the guest's own address.** smoltcp's AnyIP mode, which the NAT uses to terminate guest TCP, answers ARP for any address. NetworkManager checks a new DHCP address with ARP (RFC 5227), took the answer for a conflict, and left the interface without routes. The NAT now passes ARP to smoltcp only for its own addresses. The earlier tests missed it: busybox's `udhcpc` doesn't check its address, and Windows' check wasn't tripped by it.
-- **M10, Hyper-V enlightenments (an experiment; opt-in):** `vmmc-vmx run --enlightenments` has WHP expose Hyper-V's paravirtual interfaces, which the Windows hypervisor implements itself, so they cost no exits: the hypervisor CPUID leaves, hypercalls, VP index and runtime, the reference counter and TSC page, frequency MSRs, the guest idle MSR, the synthetic interrupt controller with direct-mode synthetic timers, the APIC-access MSRs, and the TLB-flush and IPI hypercalls.
+- **M10, Hyper-V enlightenments (on by default since 2026-10-14; `--no-enlightenments` hides them):** WHP exposes Hyper-V's paravirtual interfaces, which the Windows hypervisor implements itself, so they cost no exits: the hypervisor CPUID leaves, hypercalls, VP index and runtime, the reference counter and TSC page, frequency MSRs, the guest idle MSR, the synthetic interrupt controller with direct-mode synthetic timers, the APIC-access MSRs, and the TLB-flush and IPI hypercalls.
   - **Found:** Windows needs the guest idle MSR whenever it sees the hypervisor. Without it, Windows 10 stops with KMODE_EXCEPTION_NOT_HANDLED during boot; bisecting the feature set over Windows Setup boots found it.
   - **Verified:** a WHP test checks that the guest sees "Microsoft Hv" only with the option. The Windows install test passes with it on (apart from the `Get-Tpm` check), and Windows reports a hypervisor.
-  - **Not settled: whether it's faster.** One install with enlightenments reached first logon in 178 s; without, runs took 187 to 503 s on the same host, which is too noisy to call. A back-to-back comparison was cut short, so the option stays off by default until a steadier measurement (boot time of an installed VM, several runs each) shows a gain.
+  - **Measured (`cargo xtask win-perf`, 2026-10-14):** installs were too noisy to compare, so the comparison boots an installed Windows 10 three times each way (release build, 4 vCPUs, 8 GB). A task the test's first logon registers reports at every boot to COM1: uptime, and timings of counter reads, `Sleep(1)`, wake-ups between threads, hashing and touching new memory. The host adds boot time, the VM's CPU use over a minute at the logon screen, and shutdown time. Medians:
+
+    | | without | with |
+    |---|---|---|
+    | host CPU, idle Windows | 25.8 % of a core | 1.9 % |
+    | `Sleep(1)` | 22.3 ms | 15.6 ms (Windows' tick) |
+    | boot to the report | 8.2 s | 7.7 s |
+    | shutdown | 3.3 s | 3.1 s |
+    | counter read, wake-up, hashing, new memory | the same | the same |
+
+    Without them, Windows builds its clock on the RTC's periodic interrupt: each tick goes through a host thread and costs vCPU 0 several exits (a thread profile of an idle VM showed vCPU 0 and `rtc-irq8` as nearly all its CPU use), and the host thread's timing makes the tick late. With them, the synthetic timers run in the hypervisor. Windows 10 passes the full install test with them (Secure Boot, TPM, input, network), as do the Linux tests, where Linux switches to the TSC page clock, IPI hypercalls and paravirtual spinlocks. So they're on by default.
+  - **Still worth doing without them:** the RTC's periodic interrupt is costly and late. A guest that doesn't use Hyper-V's interfaces (an older OS, or `--no-enlightenments`) would gain from an HPET, or from timing the RTC with a high-resolution host timer.
+- **M11, a Windows display driver (works; test-signed):** `guest-drivers/windows/display`, a WDDM display-only driver (KMDOD) for the display adapter, written from Microsoft's documentation of the interface (not from its MS-PL sample).
+  - **What it does:** offers the standard resolutions that fit the 32 MiB framebuffer (640x480 to 3840x2160) plus the EDID's preferred one, reports the EDID as the monitor's, sets the mode Windows commits through DISPI, and copies each present's changed rectangles from Windows' system-memory picture into the framebuffer. No hardware cursor: Windows draws it. For the blue screen, the system-display DDIs write straight to the framebuffer, and on a driver stop it hands the current mode to Windows' basic display driver.
+  - **Build:** `cargo xtask guest-drivers` calls MSVC's compiler and linker and the WDK's `stampinf`, `Inf2Cat` and `signtool` directly. The installed WDK (10.0.28000) ships MSBuild tasks only for Visual Studio 2026, while its Visual Studio integration sits in 2022, so its MSBuild route failed. Signed with a self-signed test certificate kept in the user's store.
+  - **Test (`cargo xtask win-display-test`, passes in about 4 minutes):** installs Windows 10 with Secure Boot off; Setup's specialize pass turns test signing on and trusts the certificate; the first logon installs the driver with `pnputil`, lists the modes, switches to 1600x900, and the host checks its screenshot is 1600x900 with a picture.
+  - **Found on the way:**
+    - Windows refuses target modes whose frequencies a display-only driver specifies (`STATUS_GRAPHICS_INVALID_FREQUENCY`), so the VidPN never had a working mode: no commit, no present. Display-only drivers leave the signal's frequencies unspecified.
+    - One refused mode used to fail the whole enumeration; refused modes are now skipped.
+    - The first-logon script was denied importing the certificate, and `pnputil` in the specialize pass ran without installing anything. Each step now runs where it works.
+    - Test builds trace every DDI call to the debug console (`--firmware-log`), which found the above.
+  - **Before release:** Microsoft's attestation signature (an EV certificate and a Partner Center account), and vmmc's own PCI IDs in place of 1234:1111.
 
 ### Phase 3: Desktop app alpha + VMware migration (about 3–4 months)
 

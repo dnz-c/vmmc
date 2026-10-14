@@ -62,6 +62,9 @@ cargo xtask firmware-test                       # OVMF's shell and variable stor
 cargo xtask uefi-linux-test                     # test Linux through OVMF, from NVMe
 cargo xtask uefi-cd-test                        # test Linux through OVMF, from an ISO
 cargo xtask win11-test                          # unattended Windows 11 install (needs VMMC_WIN11_ISO)
+cargo xtask win-perf                            # boot timings of that Windows, with and without enlightenments
+cargo xtask guest-drivers                       # build and test-sign the Windows guest drivers (needs the WDK)
+cargo xtask win-display-test                    # install Windows with the display driver, change resolution
 cargo xtask ubuntu-desktop-test                 # Ubuntu 26.04 Desktop autoinstall (downloads 6.5 GB)
 cargo xtask linux-shell                         # test Linux with a shell on this terminal
 ```
@@ -94,9 +97,10 @@ and its SMBIOS UUID. `--tpm` gives the VM a TPM 2.0 whose state lives there too
 guest 10.0.2.15, DNS uses the host's resolver, and 10.0.2.2 reaches the host itself.
 `--screenshot DIR` saves the screen as PNG when the VM stops and on each Ctrl-A s;
 add `--screenshot-every SECS` for a timed series.
-`--enlightenments` exposes Hyper-V's paravirtual interfaces (reference TSC page, synthetic
-timers, hypercalls for TLB flushes and IPIs), which the Windows hypervisor implements
-itself; Windows guests use them.
+Guests see Hyper-V's paravirtual interfaces (reference TSC page, synthetic timers,
+hypercalls for TLB flushes and IPIs), which the Windows hypervisor implements itself.
+Windows and Linux use them; an idle Windows then costs the host about 2% of a CPU
+rather than 10-25%. `--no-enlightenments` hides them.
 `--display window` shows the guest's screen in a window, one guest pixel per screen
 pixel, and follows the guest when it changes resolution:
 - **Pointer:** the host pointer drives a USB tablet, so it moves freely in and out.
@@ -175,6 +179,7 @@ status: 0 when the guest powers off (or you quit), 2 when it resets with `--no-r
 | `crates/tpm` | The TPM 2.0 engine: Microsoft's reference implementation, linked from the CI build |
 | `crates/machine` | The x86 PC platform: memory map, ACPI, SMBIOS, firmware and Linux boot, vCPU threads |
 | `bins/vmmc-vmx` | Runs one VM, with its serial console on the terminal and optionally its screen in a Slint window |
+| `guest-drivers/windows` | Windows drivers for vmmc's devices: the display (resolution changes); see its README |
 | `xtask` | Developer tasks and test guest artifacts |
 | `third_party` | Upstream crates with small Windows-build patches (see each `VMMC-PATCH.md`) |
 

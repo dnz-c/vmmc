@@ -95,6 +95,16 @@ try {
         $status = (Get-PnpDeviceProperty -InstanceId $device.InstanceId -KeyName DEVPKEY_Device_ProblemStatus -ErrorAction SilentlyContinue).Data
         Mark "device-problem=$($device.FriendlyName) [$($device.InstanceId)] $($device.Status) problem=$($device.Problem) status=$status"
     }
+    # Every later boot reports its timings to COM1 (vmmc-boot-report.ps1), for
+    # `cargo xtask win-perf`.
+    New-Item -ItemType Directory -Force C:\vmmc | Out-Null
+    Copy-Item (Join-Path $PSScriptRoot 'vmmc-boot-report.ps1') C:\vmmc\boot-report.ps1
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+        -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\vmmc\boot-report.ps1'
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    Register-ScheduledTask -TaskName 'vmmc boot report' -Action $action -Trigger $trigger `
+        -User 'SYSTEM' -RunLevel Highest | Out-Null
+    Mark "boot-report=$([bool](Get-ScheduledTask -TaskName 'vmmc boot report' -ErrorAction SilentlyContinue))"
     Mark 'done'
 } catch {
     Mark "error=$($_.Exception.Message)"

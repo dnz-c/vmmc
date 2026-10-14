@@ -439,6 +439,11 @@ impl Session {
         }
     }
 
+    /// vmmc-vmx's process ID.
+    pub(crate) fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// How much output there is so far, as an offset for [`Session::text`].
     pub(crate) fn len(&self) -> usize {
         self.output.lock().unwrap().len()

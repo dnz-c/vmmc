@@ -8,8 +8,8 @@
 //! - **Answer disc:** a second ISO with `autounattend.xml` and a first-logon script that
 //!   writes `VMMC-WIN:` markers to COM1 and shuts down.
 //! - **Progress:** a screenshot every 30 s in `target/win11-test/screens`.
-//! - **Enlightenments:** `VMMC_ENLIGHTENMENTS=1` gives the VM Hyper-V enlightenments
-//!   (`--enlightenments`), for comparing install times.
+//! - **Enlightenments:** `VMMC_ENLIGHTENMENTS=0` hides the Hyper-V enlightenments
+//!   (`--no-enlightenments`), for comparing.
 //!
 //! It takes 20 to 60 minutes.
 
@@ -42,9 +42,10 @@ const GENERIC_KEYS: [(&str, &str); 6] = [
 ];
 const AUTOUNATTEND: &str = include_str!("../guest/autounattend.xml");
 const FIRST_LOGON: &str = include_str!("../guest/firstlogon.ps1");
+const BOOT_REPORT: &str = include_str!("../guest/boot-report.ps1");
 const DISK_SIZE: u64 = 64 << 30;
-const MEMORY_MIB: &str = "8192";
-const CPUS: &str = "4";
+pub(crate) const MEMORY_MIB: &str = "8192";
+pub(crate) const CPUS: &str = "4";
 const CD_PROMPT: &str = "Press any key to boot from CD or DVD";
 const CD_PROMPT_TIMEOUT: Duration = Duration::from_secs(180);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(90 * 60);
@@ -65,7 +66,19 @@ const MARKERS: [&str; 10] = [
 /// The first-logon script waits for a line on the keyboard after this.
 const KEYBOARD_READY: &str = "VMMC-WIN: keyboard-ready";
 /// The resolution the display's EDID asks for, and Windows should end up in.
-const RESOLUTION: &str = "1920x1080";
+pub(crate) const RESOLUTION: &str = "1920x1080";
+
+/// `text` as XML character data.
+fn xml_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// `text` with Windows line ends, whatever the checkout has.
+pub(crate) fn crlf(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\n', "\r\n")
+}
 
 /// The first language `lang.ini` lists, as a tag like `de-DE`.
 fn parse_lang_ini(text: &str) -> Option<String> {
@@ -129,17 +142,86 @@ fn iso_language(iso: &Path) -> Result<String, String> {
     }
 }
 
-/// The answer file for `image` in `language`. Windows 11's hardware checks run as
-/// they would on a PC: vmmc has the TPM 2.0 and Secure Boot they ask for.
-fn answer_file(image: &str, key: &str, language: &str) -> String {
+/// The answer file for `image` in `language`, with `specialize` commands (description,
+/// command line) added to that pass. Windows 11's hardware checks run as they would on
+/// a PC: vmmc has the TPM 2.0 and Secure Boot they ask for.
+fn answer_file(image: &str, key: &str, language: &str, specialize: &[(&str, &str)]) -> String {
+    // After BypassNRO, which is command 1.
+    let commands: String = specialize
+        .iter()
+        .enumerate()
+        .map(|(index, (description, command))| {
+            format!(
+                "        <RunSynchronousCommand wcm:action=\"add\">\n          <Order>{}</Order>\n          <Description>{}</Description>\n          <Path>{}</Path>\n        </RunSynchronousCommand>\n",
+                index + 2,
+                xml_text(description),
+                xml_text(command)
+            )
+        })
+        .collect();
     AUTOUNATTEND
         .replace("\r\n", "\n")
         .replace("@@IMAGE@@", image)
         .replace("@@KEY@@", key)
         .replace("@@LANGUAGE@@", language)
+        .replace("@@SPECIALIZE@@", &commands)
 }
 
 pub fn test() -> Result<(), String> {
+    // The guest fetches this through the NAT's gateway.
+    let http = crate::serve_http()?;
+    let first_logon = crlf(
+        &FIRST_LOGON
+            .replace("@@HTTP_PORT@@", &http.to_string())
+            .replace("@@HTTP_BODY@@", crate::HTTP_BODY),
+    );
+    install(
+        &Install {
+            name: "win11-test",
+            vars: "OVMF_VARS.secboot.fd",
+            first_logon,
+            files: vec![(
+                "vmmc-boot-report.ps1".into(),
+                crlf(BOOT_REPORT).into_bytes(),
+            )],
+            specialize: &[],
+            markers: &MARKERS,
+        },
+        |marker, vm, _| {
+            if marker == KEYBOARD_READY {
+                // Typed on the PS/2 keyboard: Ctrl-A k switches the console to it,
+                // and back.
+                vm.send("\x01kvmmc ps2\r\x01k")?;
+            }
+            Ok(())
+        },
+    )
+}
+
+/// One unattended install, and what its first logon must report.
+pub(crate) struct Install<'a> {
+    /// Names its directory in `target` and its disk image.
+    pub name: &'a str,
+    /// The variable store the VM starts from, in `target/native`: Secure Boot on or off.
+    pub vars: &'a str,
+    /// The first-logon script, with Windows line ends.
+    pub first_logon: String,
+    /// More files for the answer disc, all in its root.
+    pub files: Vec<(String, Vec<u8>)>,
+    /// Commands for Setup's specialize pass, after the installed system's first boot:
+    /// (description, command line).
+    pub specialize: &'a [(&'a str, &'a str)],
+    /// What the first-logon script reports, in order. The first follows logon.
+    pub markers: &'a [&'a str],
+}
+
+/// Installs Windows from `VMMC_WIN11_ISO` onto a new disk as `install` says, then
+/// expects its markers. `act` runs as each marker is seen, given the VM and its
+/// directory. Passes once Windows powers off.
+pub(crate) fn install(
+    install: &Install,
+    mut act: impl FnMut(&str, &mut Session, &Path) -> Result<(), String>,
+) -> Result<(), String> {
     let windows_iso = PathBuf::from(env::var_os(ISO_VAR).ok_or_else(|| {
         format!("set {ISO_VAR} to the path of a Windows 11 ISO (x64, any recent release)")
     })?);
@@ -158,7 +240,7 @@ pub fn test() -> Result<(), String> {
     let workspace = workspace();
     let native = native::fetch(&workspace)?;
     let exe = build_vmmc_vmx(&workspace)?;
-    let dir = workspace.join("target").join("win11-test");
+    let dir = workspace.join("target").join(install.name);
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).map_err(|e| format!("can't create {}: {e}", dir.display()))?;
 
@@ -168,24 +250,20 @@ pub fn test() -> Result<(), String> {
         Err(_) => iso_language(&windows_iso)?,
     };
     eprintln!("xtask: Setup language {language}");
-    let answer_xml = answer_file(&image, key, &language);
-    // The guest fetches this through the NAT's gateway.
-    let http = crate::serve_http()?;
-    let script = FIRST_LOGON
-        .replace("@@HTTP_PORT@@", &http.to_string())
-        .replace("@@HTTP_BODY@@", crate::HTTP_BODY)
-        .replace("\r\n", "\n")
-        .replace('\n', "\r\n");
-    let disc = iso::build(
-        "VMMC_ANSWER",
-        &[
-            ("autounattend.xml", answer_xml.as_bytes()),
-            ("vmmc-firstlogon.ps1", script.as_bytes()),
-        ],
-        None,
+    let answer_xml = answer_file(&image, key, &language, install.specialize);
+    let mut files: Vec<(&str, &[u8])> = vec![
+        ("autounattend.xml", answer_xml.as_bytes()),
+        ("vmmc-firstlogon.ps1", install.first_logon.as_bytes()),
+    ];
+    files.extend(
+        install
+            .files
+            .iter()
+            .map(|(name, data)| (name.as_str(), data.as_slice())),
     );
+    let disc = iso::build("VMMC_ANSWER", &files, None);
     fs::write(&answer, disc).map_err(|e| format!("can't write {}: {e}", answer.display()))?;
-    let disk = crate::image_dir()?.join("win11-test-disk.raw");
+    let disk = crate::image_dir()?.join(format!("{}-disk.raw", install.name));
     let _ = fs::remove_file(&disk);
     disk::create_raw(&disk, DISK_SIZE)
         .map_err(|e| format!("can't create {}: {e}", disk.display()))?;
@@ -196,7 +274,7 @@ pub fn test() -> Result<(), String> {
         .arg("--firmware")
         .arg(native.join("OVMF_CODE.fd"))
         .arg("--vars-template")
-        .arg(native.join("OVMF_VARS.secboot.fd"))
+        .arg(native.join(install.vars))
         .arg("--tpm")
         .arg("--vm-dir")
         .arg(dir.join("vm"))
@@ -211,9 +289,12 @@ pub fn test() -> Result<(), String> {
         .args(["--resolution", RESOLUTION])
         .arg("--screenshot")
         .arg(dir.join("screens"))
-        .args(["--screenshot-every", "30"]);
-    if env::var(ENLIGHTENMENTS_VAR).is_ok_and(|value| value == "1") {
-        command.arg("--enlightenments");
+        .args(["--screenshot-every", "30"])
+        // The firmware's debug output, and anything else on the debug console.
+        .arg("--firmware-log")
+        .arg(dir.join("debug.log"));
+    if env::var(ENLIGHTENMENTS_VAR).is_ok_and(|value| value == "0") {
+        command.arg("--no-enlightenments");
     }
     eprintln!("$ {command:?}");
     eprintln!(
@@ -239,25 +320,24 @@ pub fn test() -> Result<(), String> {
             }
         };
         let mut at = at;
-        for marker in MARKERS {
+        for (index, marker) in install.markers.iter().enumerate() {
             at = vm.expect(marker, at, INSTALL_TIMEOUT)?;
-            if marker == KEYBOARD_READY {
-                // Typed on the PS/2 keyboard: Ctrl-A k switches the console to it,
-                // and back.
-                vm.send("\x01kvmmc ps2\r\x01k")?;
-            }
-            if marker == MARKERS[0] {
+            if index == 0 {
                 eprintln!(
                     "xtask: installed and logged on after {}s",
                     started.elapsed().as_secs()
                 );
             }
+            act(marker, &mut vm, &dir)?;
         }
         Ok::<usize, String>(at)
     })();
-    // Whatever happened, show what Windows reported.
+    // Whatever happened, show what Windows reported: the lines with the markers' prefix.
+    let prefix = install.markers[0]
+        .split_once(':')
+        .map_or(install.markers[0], |(prefix, _)| prefix);
     let reported = vm.text(0, vm.len());
-    for line in reported.lines().filter(|line| line.contains("VMMC-WIN:")) {
+    for line in reported.lines().filter(|line| line.contains(prefix)) {
         eprintln!("{}", line.trim());
     }
     let status = match &result {
@@ -272,7 +352,8 @@ pub fn test() -> Result<(), String> {
     match status {
         Some(status) if status.success() => {
             eprintln!(
-                "Windows 11 install test passed in {}s",
+                "{} passed in {}s",
+                install.name,
                 started.elapsed().as_secs()
             );
             Ok(())
@@ -301,8 +382,31 @@ mod tests {
     }
 
     #[test]
+    fn specialize_commands_follow_bypass_nro() {
+        let xml = answer_file(
+            "Windows 10 Pro",
+            "key",
+            "en-US",
+            &[("Test signing", "bcdedit /set testsigning on")],
+        );
+        assert_eq!(xml.matches("<RunSynchronousCommand").count(), 2);
+        let at = xml
+            .find("<Order>2</Order>\n          <Description>Test signing</Description>\n          <Path>bcdedit /set testsigning on</Path>")
+            .expect("the second command");
+        assert!(xml.find("BypassNRO").unwrap() < at);
+        let xml = answer_file("Windows 10 Pro", "key", "en-US", &[("a & b", "x & y > z")]);
+        assert!(xml.contains("<Description>a &amp; b</Description>"));
+        assert!(xml.contains("<Path>x &amp; y &gt; z</Path>"));
+    }
+
+    #[test]
     fn answer_file_fills_every_placeholder() {
-        let xml = answer_file("Windows 11 Pro", "VK7JG-NPHTM-C97JM-9MPGT-3V66T", "de-DE");
+        let xml = answer_file(
+            "Windows 11 Pro",
+            "VK7JG-NPHTM-C97JM-9MPGT-3V66T",
+            "de-DE",
+            &[],
+        );
         assert_eq!(xml.matches("de-DE").count(), 9);
         assert!(!xml.contains("@@"));
         assert!(xml.contains("<Value>Windows 11 Pro</Value>"));
