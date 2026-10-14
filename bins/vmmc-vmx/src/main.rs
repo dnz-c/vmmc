@@ -14,7 +14,10 @@
 
 mod console;
 mod memdump;
+mod sandbox;
 mod screenshot;
+#[cfg(windows)]
+mod serve;
 mod vm_dir;
 #[cfg(windows)]
 mod window;
@@ -39,6 +42,9 @@ struct Cli {
 enum Command {
     /// Boot UEFI firmware or a Linux kernel, with the serial console on this terminal.
     Run(Box<RunArgs>),
+    /// Run a VM (`--vm`) with no console: vmmc's app and `vmmc-cli` control it through
+    /// its pipe, `\\.\pipe\vmmc-<uuid>`. vmmc starts its VMs this way, sandboxed.
+    Serve(Box<RunArgs>),
     /// Create an empty disk for `run --disk`: a VMDK if the name ends in `.vmdk`
     /// (it grows as the guest writes), otherwise a raw image (a sparse file on NTFS).
     CreateDisk(CreateDiskArgs),
@@ -162,8 +168,12 @@ struct RunArgs {
 }
 
 /// Where a build keeps the firmware: next to the program, or in `target\native` for
-/// `target\debug` and `target\release`.
+/// `target\debug` and `target\release`. `VMMC_FIRMWARE` names another (the tests'
+/// firmware with the UEFI shell, say).
 fn default_firmware() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("VMMC_FIRMWARE") {
+        return Some(path.into());
+    }
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
     [
@@ -223,6 +233,15 @@ impl TpmBackend for VmTpm {
     fn reset(&mut self) {
         self.0.reset();
     }
+}
+
+/// Who drives the VM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Frontend {
+    /// This terminal (and a window, with `--display window`).
+    Console,
+    /// Clients of the VM's pipe.
+    Pipe,
 }
 
 /// The resolution of a VM without a window.
@@ -489,7 +508,7 @@ fn spawn_periodic_screenshots(
 }
 
 #[cfg(windows)]
-fn run(args: RunArgs) -> Result<RunOutcome, Box<dyn Error>> {
+fn run(args: RunArgs, frontend: Frontend) -> Result<RunOutcome, Box<dyn Error>> {
     use machine::layout::MIB;
 
     let args = with_vm(args)?;
@@ -514,8 +533,18 @@ fn run(args: RunArgs) -> Result<RunOutcome, Box<dyn Error>> {
         None => None,
     };
     let targets = console::Targets::new(screenshots.clone());
-    let _raw = console::RawConsole::enable();
-    console::spawn_input(targets.clone())?;
+    let _raw = match frontend {
+        Frontend::Console => {
+            let raw = console::RawConsole::enable();
+            console::spawn_input(targets.clone())?;
+            Some(raw)
+        }
+        Frontend::Pipe => {
+            let vm = args.loaded.as_ref().ok_or("serve needs --vm")?;
+            serve::start(targets.clone(), &vm.config.name, &vm.config.uuid)?;
+            None
+        }
+    };
     if let (Some(screenshots), Some(every)) = (&screenshots, args.screenshot_every) {
         spawn_periodic_screenshots(screenshots.clone(), targets.clone(), every.max(1))?;
     }
@@ -539,7 +568,10 @@ fn run(args: RunArgs) -> Result<RunOutcome, Box<dyn Error>> {
             ),
         (Boot::Linux { .. }, None) => "vmmc".into(),
     };
-    let display = args.display;
+    let display = match frontend {
+        Frontend::Console => args.display,
+        Frontend::Pipe => DisplayMode::None,
+    };
     let resolution = match (args.resolution, display) {
         (Some(resolution), _) => resolution,
         (None, DisplayMode::Window) => window::fitting_resolution(),
@@ -650,7 +682,7 @@ fn run_machines(
 }
 
 #[cfg(not(windows))]
-fn run(args: RunArgs) -> Result<RunOutcome, Box<dyn Error>> {
+fn run(args: RunArgs, _frontend: Frontend) -> Result<RunOutcome, Box<dyn Error>> {
     // Keep the shared helpers in use on every platform.
     let args = with_vm(args)?;
     let _ = (
@@ -672,31 +704,37 @@ fn main() -> ExitCode {
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .init();
 
-    match Cli::parse().command {
-        Command::Run(args) => match run(*args) {
-            Ok(outcome) => {
-                eprintln!("\r\nvmmc-vmx: {}", describe(&outcome));
-                ExitCode::from(exit_code(&outcome))
-            }
-            Err(e) => {
-                eprintln!("vmmc-vmx: {e}");
-                ExitCode::FAILURE
-            }
-        },
-        Command::CreateDisk(args) => match create_disk(&args) {
-            Ok(()) => {
-                eprintln!(
-                    "vmmc-vmx: created {} ({} GiB)",
-                    args.path.display(),
-                    args.size as f64 / f64::from(1 << 30)
-                );
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("vmmc-vmx: {e}");
-                ExitCode::FAILURE
-            }
-        },
+    let (args, frontend) = match Cli::parse().command {
+        Command::Run(args) => (args, Frontend::Console),
+        Command::Serve(args) => (args, Frontend::Pipe),
+        Command::CreateDisk(args) => return create_disk_command(&args),
+    };
+    match run(*args, frontend) {
+        Ok(outcome) => {
+            eprintln!("\r\nvmmc-vmx: {}", describe(&outcome));
+            ExitCode::from(exit_code(&outcome))
+        }
+        Err(e) => {
+            eprintln!("vmmc-vmx: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn create_disk_command(args: &CreateDiskArgs) -> ExitCode {
+    match create_disk(args) {
+        Ok(()) => {
+            eprintln!(
+                "vmmc-vmx: created {} ({} GiB)",
+                args.path.display(),
+                args.size as f64 / f64::from(1 << 30)
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("vmmc-vmx: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -763,7 +801,7 @@ mod tests {
         let mut full = vec!["vmmc-vmx", "run"];
         full.extend_from_slice(args);
         Cli::try_parse_from(full).map(|cli| match cli.command {
-            Command::Run(args) => *args,
+            Command::Run(args) | Command::Serve(args) => *args,
             Command::CreateDisk(_) => unreachable!("parsed a run command"),
         })
     }

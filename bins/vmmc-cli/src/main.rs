@@ -4,12 +4,17 @@
 //! vmmc-cli create "Windows 11" --os windows11 --iso Win11.iso
 //! vmmc-cli import "D:\VMs\Windows 10\Windows 10.vmx"
 //! vmmc-cli list
+//! vmmc-cli start "Windows 11"
+//! vmmc-cli status "Windows 11"
+//! vmmc-cli stop "Windows 11"
 //! vmmc-cli disk create disk.vmdk --size 64G
 //! vmmc-cli disk info disk.vmdk
 //! vmmc-cli disk convert disk.raw disk.vmdk
 //! ```
 //!
-//! A VM made here runs with `vmmc-vmx run --vm FILE`.
+//! `start` runs a VM in the background, in a sandboxed worker (`vmmc-vmx serve`); the
+//! other commands talk to it. A VM is named by its `.vmmc` file or its name in the
+//! library. (`vmmc-vmx run --vm FILE` runs one on the terminal instead.)
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -49,6 +54,19 @@ enum Command {
     },
     /// List the library's VMs.
     List,
+    /// Start a VM in the background, sandboxed. Its output goes to vmmc-vmx.log in its
+    /// folder.
+    Start { vm: String },
+    /// Shut a VM down: press its power button, or with --hard, stop it at once.
+    Stop {
+        vm: String,
+        #[arg(long)]
+        hard: bool,
+    },
+    /// Reset a VM, as its reset button would.
+    Reset { vm: String },
+    /// Whether a VM runs, and how.
+    Status { vm: String },
     /// Add an existing VM (its .vmmc file) to the library.
     Add {
         file: PathBuf,
@@ -218,11 +236,14 @@ fn list() -> Result<String, String> {
             .unwrap_or_default();
         match vmconfig::Vm::load(path) {
             Ok(vm) => {
-                let started = vm
-                    .config
-                    .last_powered_on
-                    .as_deref()
-                    .map_or("never started".into(), |t| format!("last started {t}"));
+                let started = if running(&vm) {
+                    "running".into()
+                } else {
+                    vm.config
+                        .last_powered_on
+                        .as_deref()
+                        .map_or("never started".into(), |t| format!("last started {t}"))
+                };
                 lines.push(format!(
                     "{folder}{}  ({} vCPUs, {} MiB, {started})\n    {}",
                     vm.config.name,
@@ -235,6 +256,90 @@ fn list() -> Result<String, String> {
         }
     }
     Ok(lines.join("\n"))
+}
+
+#[cfg(windows)]
+fn running(vm: &vmconfig::Vm) -> bool {
+    vmmc_client::is_running(vm)
+}
+
+#[cfg(not(windows))]
+fn running(_: &vmconfig::Vm) -> bool {
+    false
+}
+
+/// A VM by its `.vmmc` file, or by its name in the library.
+fn find_vm(name: &str) -> Result<vmconfig::Vm, String> {
+    let path = Path::new(name);
+    if path.is_file() {
+        return vmconfig::Vm::load(path).map_err(|e| e.to_string());
+    }
+    let library = Library::load(&library::default_path()).map_err(|e| e.to_string())?;
+    for entry in library.entries() {
+        if let Ok(vm) = vmconfig::Vm::load(Path::new(&entry.path))
+            && vm.config.name.eq_ignore_ascii_case(name)
+        {
+            return Ok(vm);
+        }
+    }
+    Err(format!(
+        "no VM {name:?}: give its .vmmc file, or a name from `vmmc-cli list`"
+    ))
+}
+
+#[cfg(windows)]
+fn worker_command(command: Command) -> Result<(), String> {
+    use std::time::Duration;
+
+    use ipc::Request;
+
+    let connect = |vm: &vmconfig::Vm| vmmc_client::connect(vm, Duration::from_secs(2));
+    match command {
+        Command::Start { vm } => {
+            let vm = find_vm(&vm)?;
+            let connection = vmmc_client::start(&vm)?;
+            println!("{} is running (worker {})", vm.config.name, connection.pid);
+        }
+        Command::Stop { vm, hard } => {
+            let vm = find_vm(&vm)?;
+            let mut connection = connect(&vm)?;
+            if hard {
+                connection.command(&Request::Stop)?;
+                println!("{} stopped", vm.config.name);
+            } else {
+                connection.command(&Request::PowerButton)?;
+                println!("pressed {}'s power button", vm.config.name);
+            }
+        }
+        Command::Reset { vm } => {
+            let vm = find_vm(&vm)?;
+            connect(&vm)?.command(&Request::Reset)?;
+            println!("{} reset", vm.config.name);
+        }
+        Command::Status { vm } => {
+            let vm = find_vm(&vm)?;
+            match connect(&vm) {
+                Ok(mut connection) => {
+                    let status = connection.status()?;
+                    let screen = status
+                        .screen
+                        .map_or("no picture yet".into(), |(w, h)| format!("{w}x{h}"));
+                    println!(
+                        "{}: {:?}, worker {} ({}), screen {screen}",
+                        vm.config.name, status.state, connection.pid, status.sandbox
+                    );
+                }
+                Err(_) => println!("{}: not running", vm.config.name),
+            }
+        }
+        _ => unreachable!("not a worker command"),
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn worker_command(_: Command) -> Result<(), String> {
+    Err("running VMs needs Windows for now".into())
 }
 
 fn library_change(change: impl FnOnce(&mut Library) -> Result<(), String>) -> Result<(), String> {
@@ -273,6 +378,10 @@ fn run(command: Command) -> Result<(), String> {
             );
         }
         Command::List => println!("{}", list()?),
+        command @ (Command::Start { .. }
+        | Command::Stop { .. }
+        | Command::Reset { .. }
+        | Command::Status { .. }) => worker_command(command)?,
         Command::Add { file, folder } => {
             let file = std::path::absolute(&file).map_err(|e| e.to_string())?;
             vmconfig::Vm::load(&file).map_err(|e| e.to_string())?;

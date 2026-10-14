@@ -13,7 +13,9 @@ fatfs.workspace = true
 png.workspace = true
 ruzstd.workspace = true
 sha2.workspace = true
+ipc.workspace = true
 vmconfig.workspace = true
+vmmc-client.workspace = true
 
 [lints]
 workspace = true

@@ -49,6 +49,11 @@ which looks for `VEN_1234&DEV_1111`.
   built without it, and a guest kernel can write the variable store directly,
   Secure Boot's keys included. A host-side variable store would fix it (the roadmap's
   hardening item).
+- **The worker sandbox can read what the user can.** Its restricting SIDs include
+  the user, so a compromised worker could read the user's files (it can write only to
+  its VM's folder). Tighter: drop the user from the restricting SIDs and have the
+  launcher open the files a VM reads (ISOs, firmware, VMware's base disks) and pass
+  their handles. AppContainer is the other option.
 - **The TPM's state file isn't encrypted** (`tpm-state.bin` in the VM directory).
   Anyone who can read the VM's files can read its TPM secrets, such as BitLocker's.
 

@@ -13,6 +13,7 @@ mod ubuntu;
 mod vmdk_compat;
 mod vmware_import;
 mod windows;
+mod worker;
 
 use std::env;
 use std::io::{Read, Write};
@@ -47,6 +48,8 @@ tasks:
   ubuntu-desktop-test
                 download Ubuntu 26.04 Desktop, install it with autoinstall and boot it
                 (15-60 minutes)
+  worker-test   start VMs in sandboxed workers, as vmmc-cli does, and control them
+                through their pipes
   vmdk-compat-test
                 check vmmc's VMDKs against VMware's vmware-vdiskmanager, both ways
                 (needs VMware Workstation)
@@ -104,6 +107,7 @@ fn main() -> ExitCode {
         },
         Some("ubuntu-desktop-test") => ubuntu::test(),
         Some("vmdk-compat-test") => vmdk_compat::test(),
+        Some("worker-test") => worker::test(),
         Some("vmware-import-test") => vmware_import::test(),
         Some("linux-shell") => linux_shell(),
         _ => {

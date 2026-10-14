@@ -518,7 +518,16 @@ impl BlockBackend for Vmdk {
     }
 
     fn flush(&self) -> io::Result<()> {
-        for extent in &self.extents {
+        // Windows refuses to flush handles opened for reading, and they hold nothing
+        // to flush.
+        if self.read_only {
+            return Ok(());
+        }
+        for extent in self
+            .extents
+            .iter()
+            .filter(|e| e.access == Access::ReadWrite)
+        {
             match &extent.data {
                 ExtentData::Sparse(sparse) => sparse.flush()?,
                 ExtentData::Flat { file, .. } => file.sync_data()?,

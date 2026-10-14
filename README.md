@@ -32,6 +32,8 @@ Phase 3 (the desktop app and moving over from VMware) is under way:
   and VMware's own tools accept vmmc's.
 - **VMware VMs open in place** (`vmmc-cli import`), behind delta disks that keep
   VMware's files unchanged.
+- **VMs run in sandboxed workers** (`vmmc-cli start`): a background process per VM,
+  at low integrity with a restricted token, which can write only to its VM's folder.
 
 What a release still needs is listed in [docs/RELEASE-BLOCKERS.md](docs/RELEASE-BLOCKERS.md).
 
@@ -82,6 +84,7 @@ cargo xtask win-display-test                    # install Windows with the displ
 cargo xtask ubuntu-desktop-test                 # Ubuntu 26.04 Desktop autoinstall (downloads 6.5 GB)
 cargo xtask vmdk-compat-test                    # vmmc's VMDKs against VMware's vdiskmanager (needs VMware)
 cargo xtask vmware-import-test                  # open a VMware VM in place and boot it (VMMC_VMWARE_VMX)
+cargo xtask worker-test                         # VMs in sandboxed workers, controlled through their pipes
 cargo xtask linux-shell                         # test Linux with a shell on this terminal
 ```
 
@@ -100,6 +103,23 @@ cargo build --release -p vmmc-vmx -p vmmc-cli
 target\release\vmmc-cli.exe create "Ubuntu" --os ubuntu --iso C:\ISOs\ubuntu.iso
 target\release\vmmc-vmx.exe run --vm "$HOME\Documents\vmmc VMs\Ubuntu\Ubuntu.vmmc" --display window
 ```
+
+To run it in the background instead, as the app will:
+
+```powershell
+target\release\vmmc-cli.exe start "Ubuntu"     # by name in the library, or its .vmmc file
+target\release\vmmc-cli.exe status "Ubuntu"
+target\release\vmmc-cli.exe stop "Ubuntu"      # the power button; --hard pulls the plug
+```
+
+A started VM runs in its own worker process, `vmmc-vmx serve`, which keeps running
+when the command line (or the app) is gone, and is controlled through a named pipe
+(`\\.\pipe\vmmc-<uuid>`). The worker runs sandboxed: at low integrity, with a
+restricted token and in a job that can't start programs or touch the desktop. It can
+read what you can read, but write only to its VM's folder (which vmmc labels for it,
+granting you the right to label it first if the drive doesn't), so a disk the VM
+writes to must be in its folder. Its output goes to `vmmc-vmx.log` there.
+`VMMC_NO_SANDBOX=1` turns the sandbox off, for finding out whether it's in the way.
 
 `create` picks the hardware from `--os` (`windows11`, `windows10`, `ubuntu`, `linux`,
 `other`); `--cpus`, `--memory`, `--disk-size` and `--dir` change it, and the config can
@@ -245,11 +265,13 @@ status: 0 when the guest powers off (or you quit), 2 when it resets with `--no-r
 | `crates/devices` | Device models: chipset, firmware interfaces (fw_cfg, flash), PCI, NVMe, AHCI/ATAPI, e1000e, xHCI and USB HID, PS/2, TPM CRB, virtio |
 | `crates/disk` | Disk images: the block backend trait, VMDK (sparse, split, flat, stream-optimized, delta chains) and raw images |
 | `crates/vmconfig` | VM files: the `.vmmc` config, the library, OS presets, and VMware `.vmx` import |
+| `crates/ipc` | The worker's pipe protocol and its shared screen |
+| `crates/client` | Starting workers in their sandbox, and talking to them (`vmmc-client`) |
 | `crates/net` | User-mode NAT networking (smoltcp): DHCP, DNS, TCP/UDP to host sockets |
 | `crates/tpm` | The TPM 2.0 engine: Microsoft's reference implementation, linked from the CI build |
 | `crates/machine` | The x86 PC platform: memory map, ACPI, SMBIOS, firmware and Linux boot, vCPU threads |
 | `bins/vmmc-vmx` | Runs one VM, with its serial console on the terminal and optionally its screen in a Slint window |
-| `bins/vmmc-cli` | The command line: create and import VMs, the library, disks |
+| `bins/vmmc-cli` | The command line: create, import, start and stop VMs, the library, disks |
 | `guest-drivers/windows` | Windows drivers for vmmc's devices: the display (resolution changes); see its README |
 | `xtask` | Developer tasks and test guest artifacts |
 | `third_party` | Upstream crates with small Windows-build patches (see each `VMMC-PATCH.md`) |

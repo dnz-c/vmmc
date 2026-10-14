@@ -218,6 +218,10 @@ impl BlockBackend for RawFile {
     }
 
     fn flush(&self) -> io::Result<()> {
+        // Nothing to flush, and Windows refuses to flush a handle opened for reading.
+        if self.read_only {
+            return Ok(());
+        }
         self.file.sync_data()
     }
 }
@@ -304,6 +308,13 @@ mod tests {
         raw.read_at(&mut tail, (64 << 30) - 16).unwrap();
         assert_eq!(tail, [0; 16]);
         assert!(create_raw(&path, 1 << 20).is_err(), "existing image kept");
+    }
+
+    #[test]
+    fn flushing_a_read_only_image_is_a_no_op() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(4096).unwrap();
+        RawFile::open(file.path(), true).unwrap().flush().unwrap();
     }
 
     #[test]

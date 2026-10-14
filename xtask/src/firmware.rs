@@ -29,7 +29,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 /// From the shell starting Linux to Linux powering off.
 const LINUX_TIMEOUT: Duration = Duration::from_secs(90);
 /// What the test Linux must print when booted through UEFI, in order.
-const LINUX_MARKERS: [&str; 9] = [
+pub(crate) const LINUX_MARKERS: [&str; 9] = [
     "VMMC-TEST: booted",
     "VMMC-TEST: cpus=4",
     "VMMC-TEST: efi=yes",
@@ -49,7 +49,7 @@ const CD_MARKERS: [&str; 6] = [
     "VMMC-TEST: disk=ok sda",
     "VMMC-TEST: done",
 ];
-const ESP_SIZE: u64 = 64 << 20;
+pub(crate) const ESP_SIZE: u64 = 64 << 20;
 /// El Torito sizes the boot image in 512-byte sectors, 16 bits' worth: under 32 MiB.
 const CD_BOOT_IMAGE_SIZE: u64 = 24 << 20;
 const SCRATCH_SIZE: u64 = 64 << 20;
@@ -59,9 +59,9 @@ const VARIABLE_GUID: &str = "5d2f6e7a-8f1b-4c3e-9a77-766d6d637465";
 const VALUE_HEX: &str = "564D4D43";
 const VALUE_PRINTED: &str = "56 4D 4D 43";
 /// What the shell prints when it starts, once per boot.
-const SHELL_STARTED: &str = "seconds to skip startup.nsh";
+pub(crate) const SHELL_STARTED: &str = "seconds to skip startup.nsh";
 const PROMPT: &str = "Shell>";
-const SHELL_OPTION: &str = "EFI Internal Shell";
+pub(crate) const SHELL_OPTION: &str = "EFI Internal Shell";
 /// The down-arrow key, as a VT100 terminal sends it.
 const DOWN: &str = "\x1b[B";
 
@@ -162,7 +162,9 @@ fn check_screenshot(path: &Path) -> Result<(), String> {
 }
 
 /// The files that boot the test Linux from a FAT file system through the shell.
-fn linux_boot_files(extra_cmdline: &str) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+pub(crate) fn linux_boot_files(
+    extra_cmdline: &str,
+) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
     let guest = guests::prepare(&workspace())?;
     let startup = format!(
         "fs0:\\vmlinuz.efi initrd=\\initramfs.cpio console=ttyS0 panic=-1{extra_cmdline}\r\n"
@@ -298,7 +300,7 @@ fn boot_shell(vm: &mut Session, from: usize) -> Result<usize, String> {
 
 /// The strings a full-screen UEFI menu draws, in order. The session turns each cursor
 /// move into a line break, so they're the non-empty lines.
-fn screen_texts(screen: &str) -> Vec<String> {
+pub(crate) fn screen_texts(screen: &str) -> Vec<String> {
     screen
         .lines()
         .map(str::trim)
@@ -311,7 +313,7 @@ fn screen_texts(screen: &str) -> Vec<String> {
 /// line breaks and every other escape sequence is dropped. Sequences may be split
 /// across calls.
 #[derive(Default)]
-struct PlainText {
+pub(crate) struct PlainText {
     state: Escape,
 }
 
@@ -326,7 +328,7 @@ enum Escape {
 }
 
 impl PlainText {
-    fn filter(&mut self, bytes: &[u8]) -> Vec<u8> {
+    pub(crate) fn filter(&mut self, bytes: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(bytes.len());
         for &byte in bytes {
             self.state = match (self.state, byte) {

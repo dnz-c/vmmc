@@ -56,6 +56,7 @@ fn a_new_sparse_disk_reads_zeroes_and_keeps_what_is_written() {
     assert_eq!(read(&disk, GRAIN - 1000, 5000), pattern(5000, 1));
     assert_eq!(read(&disk, 100 * MIB - 512, 512), pattern(512, 2));
     assert!(disk.write_at(b"x", 0).is_err(), "read-only");
+    disk.flush().unwrap();
 }
 
 #[test]

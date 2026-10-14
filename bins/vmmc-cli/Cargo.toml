@@ -10,7 +10,9 @@ publish.workspace = true
 [dependencies]
 clap.workspace = true
 disk.workspace = true
+ipc.workspace = true
 vmconfig.workspace = true
+vmmc-client.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
