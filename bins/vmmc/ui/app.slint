@@ -7,6 +7,8 @@ export struct VmRow {
     path: string,
     name: string,
     folder: string,
+    // The folder's heading, on the first VM of each folder.
+    heading: string,
     os: string,
     running: bool,
     // One line: "4 vCPUs, 8 GiB, NVMe 64 GiB".
@@ -115,6 +117,7 @@ export component AppWindow inherits Window {
     callback pointer(length, length, length, length, bool, bool, bool, int);
     callback save-notes(string);
     callback remove-vm();
+    callback move-to-folder(string);
     callback show-folder();
     callback open-settings();
     callback new-vm();
@@ -186,7 +189,16 @@ export component AppWindow inherits Window {
                         }
                     }
                     ListView {
-                        for vm in root.vms: Rectangle {
+                        for vm in root.vms: VerticalLayout {
+                            if vm.heading != "": Text {
+                                text: vm.heading;
+                                color: #79c0ff;
+                                font-size: 11px;
+                                font-weight: 700;
+                                height: 24px;
+                                vertical-alignment: bottom;
+                            }
+                            Rectangle {
                             height: 52px;
                             background: area.has-hover ? #2f2f33 : transparent;
                             border-radius: 4px;
@@ -210,12 +222,13 @@ export component AppWindow inherits Window {
                                         overflow: elide;
                                     }
                                     Text {
-                                        text: vm.folder == "" ? vm.os : vm.folder + " · " + vm.os;
+                                        text: vm.os;
                                         color: #9a9a9a;
                                         font-size: 11px;
                                         overflow: elide;
                                     }
                                 }
+                            }
                             }
                         }
                     }
@@ -428,6 +441,24 @@ export component AppWindow inherits Window {
                                     text: "Remove from library";
                                     enabled: !root.current.running;
                                     clicked => { root.remove-vm(); }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                Text {
+                                    text: "Library folder";
+                                    color: #c8c8c8;
+                                    vertical-alignment: center;
+                                }
+                                folder := LineEdit {
+                                    width: 220px;
+                                    text: root.current.folder;
+                                    placeholder-text: "none";
+                                }
+                                Button {
+                                    text: "Move";
+                                    clicked => { root.move-to-folder(folder.text); }
                                 }
                             }
                             Text {

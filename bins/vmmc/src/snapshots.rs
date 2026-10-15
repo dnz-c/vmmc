@@ -53,6 +53,7 @@ fn vm(name: &str, running: bool) -> VmRow {
         path: format!(r"C:\VMs\{name}\{name}.vmmc").into(),
         name: name.into(),
         folder: "".into(),
+        heading: "".into(),
         os: "Windows 11".into(),
         running,
         summary: "4 vCPU, 8.0 GiB, Nvme".into(),

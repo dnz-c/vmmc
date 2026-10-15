@@ -11,6 +11,39 @@ mod dialogs;
 #[cfg(test)]
 mod snapshots;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn named(name: &str, folder: &str) -> VmRow {
+        VmRow {
+            name: name.into(),
+            folder: folder.into(),
+            ..VmRow::default()
+        }
+    }
+
+    #[test]
+    fn rows_group_into_folders_with_headings() {
+        let mut rows = vec![
+            named("zeta", ""),
+            named("b", "Work"),
+            named("alpha", ""),
+            named("a", "Work"),
+            named("t", "Test"),
+        ];
+        group_by_folder(&mut rows, &["Work".into(), "Test".into()]);
+        let order: Vec<_> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(order, ["a", "b", "t", "alpha", "zeta"]);
+        let headings: Vec<_> = rows.iter().map(|r| r.heading.as_str()).collect();
+        assert_eq!(headings, ["WORK", "", "TEST", "OTHER VMS", ""]);
+        // Without folders, no headings.
+        let mut plain = vec![named("b", ""), named("a", "")];
+        group_by_folder(&mut plain, &[]);
+        assert!(plain.iter().all(|r| r.heading.is_empty()));
+    }
+}
+
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -291,6 +324,7 @@ fn row(vm: &Vm, folder: Option<&str>, running: bool) -> VmRow {
         path: vm.path.display().to_string().into(),
         name: config.name.clone().into(),
         folder: folder.unwrap_or_default().into(),
+        heading: "".into(),
         os: if config.vmware.is_some() {
             format!("{} (from VMware)", os_label(&config.os)).into()
         } else {
@@ -345,7 +379,7 @@ fn refresh(app: &Shared) {
         state.running = running;
     }
     let entries = state.library.entries().to_vec();
-    let rows: Vec<VmRow> = state
+    let mut rows: Vec<VmRow> = state
         .vms
         .iter()
         .zip(&state.running)
@@ -355,6 +389,7 @@ fn refresh(app: &Shared) {
             Err((path, error)) => broken_row(path, error),
         })
         .collect();
+    group_by_folder(&mut rows, &state.library.data.folders);
     let tabs: Vec<TabRow> = state
         .tabs
         .iter()
@@ -397,6 +432,39 @@ fn refresh(app: &Shared) {
     }
     window.set_vms(ModelRc::new(VecModel::from(rows)));
     window.set_tabs(ModelRc::new(VecModel::from(tabs)));
+}
+
+/// Sorts the library's rows into its folders (in the library's order, then the VMs
+/// in none), by name within each, and puts each folder's heading on its first VM.
+fn group_by_folder(rows: &mut [VmRow], folders: &[String]) {
+    let rank = |folder: &str| {
+        folders
+            .iter()
+            .position(|f| f == folder)
+            .unwrap_or(if folder.is_empty() {
+                usize::MAX
+            } else {
+                folders.len()
+            })
+    };
+    rows.sort_by(|a, b| {
+        rank(&a.folder)
+            .cmp(&rank(&b.folder))
+            .then_with(|| a.folder.cmp(&b.folder))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    let any_folders = rows.iter().any(|row| !row.folder.is_empty());
+    let mut previous: Option<SharedString> = None;
+    for row in rows.iter_mut() {
+        if any_folders && previous.as_ref() != Some(&row.folder) {
+            row.heading = if row.folder.is_empty() {
+                "OTHER VMS".into()
+            } else {
+                row.folder.to_uppercase().into()
+            };
+        }
+        previous = Some(row.folder.clone());
+    }
 }
 
 fn close_console(state: &mut App, window: &AppWindow) {
@@ -727,6 +795,38 @@ fn wire(window: &AppWindow, app: &Shared) {
         reload(&app);
         refresh(&app);
     }));
+    {
+        let app = app.clone();
+        let w = weak();
+        window.on_move_to_folder(move |folder| {
+            let Some(window) = w.upgrade() else {
+                return;
+            };
+            let Some(vm) = current_vm(&app, &window) else {
+                return;
+            };
+            let folder = folder.trim();
+            let mut state = app.borrow_mut();
+            state
+                .library
+                .add(&vm.path, (!folder.is_empty()).then_some(folder));
+            // Folders nothing is in any more go.
+            let used: Vec<String> = state
+                .library
+                .entries()
+                .iter()
+                .filter_map(|entry| entry.folder.clone())
+                .collect();
+            state.library.data.folders.retain(|f| used.contains(f));
+            let saved = state.library.save();
+            drop(state);
+            if let Err(e) = saved {
+                message(&window, "Couldn't update the library", &e.to_string());
+            }
+            reload(&app);
+            refresh(&app);
+        });
+    }
     window.on_show_folder(with!(app, window, {
         if let Some(vm) = current_vm(&app, &window) {
             let _ = std::process::Command::new("explorer.exe")
