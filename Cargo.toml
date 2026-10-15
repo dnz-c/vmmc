@@ -18,6 +18,7 @@ net = { path = "crates/net" }
 hv = { path = "crates/hv" }
 hv-whp = { path = "crates/hv-whp" }
 ipc = { path = "crates/ipc" }
+keyhook = { path = "crates/keyhook" }
 machine = { path = "crates/machine" }
 media = { path = "crates/media" }
 tpm = { path = "crates/tpm" }

@@ -21,6 +21,7 @@ vmconfig.workspace = true
 [target.'cfg(windows)'.dependencies]
 hv-whp.workspace = true
 ipc.workspace = true
+keyhook.workspace = true
 slint.workspace = true
 windows = { workspace = true, features = [
     "Win32_Security",
