@@ -21,6 +21,8 @@ pub enum EasyInstall {
         language: Option<String>,
         /// Windows' name for it, like `W. Europe Standard Time`.
         time_zone: String,
+        /// Commands run at the first logon: (description, command line).
+        first_logon: Vec<(String, String)>,
     },
     Ubuntu {
         user: String,
@@ -167,7 +169,12 @@ fn answer_disc(
             password,
             language,
             time_zone,
+            first_logon,
         } => {
+            let first_logon: Vec<(&str, &str)> = first_logon
+                .iter()
+                .map(|(description, command)| (description.as_str(), command.as_str()))
+                .collect();
             let key = media::windows::generic_key(edition)
                 .ok_or_else(|| format!("no generic key for {edition}"))?;
             let language = match language {
@@ -184,7 +191,7 @@ fn answer_disc(
                 password,
                 auto_logons: 1,
                 specialize: &[],
-                first_logon: &[],
+                first_logon: &first_logon,
             });
             let xml = xml.replace('\n', "\r\n");
             let disc =
@@ -395,6 +402,7 @@ mod tests {
                 password: "pw".into(),
                 language: Some("en-US".into()),
                 time_zone: "UTC".into(),
+                first_logon: Vec::new(),
             },
         ))
         .unwrap();

@@ -96,7 +96,7 @@ fn check_iso(path: &Path) -> Result<(), String> {
 }
 
 /// The checked ISO: `VMMC_UBUNTU_ISO`, or a download kept in the test image directory.
-fn fetch_iso() -> Result<PathBuf, String> {
+pub(crate) fn fetch_iso() -> Result<PathBuf, String> {
     if let Some(path) = env::var_os(ISO_VAR) {
         let path = PathBuf::from(path);
         check_iso(&path)?;

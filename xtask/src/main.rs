@@ -2,6 +2,7 @@
 
 mod cpio;
 mod drivers;
+mod easy_install;
 mod esp;
 mod firmware;
 mod guests;
@@ -47,6 +48,9 @@ tasks:
   ubuntu-desktop-test
                 download Ubuntu 26.04 Desktop, install it with autoinstall and boot it
                 (15-60 minutes)
+  easy-install-test [windows|ubuntu]
+                install Windows ($VMMC_WIN11_ISO) and Ubuntu with Easy Install in
+                sandboxed workers, as the app does (20-60 minutes)
   worker-test   start VMs in sandboxed workers, as vmmc-cli does, and control them
                 through their pipes
   vmdk-compat-test
@@ -107,6 +111,7 @@ fn main() -> ExitCode {
         Some("ubuntu-desktop-test") => ubuntu::test(),
         Some("vmdk-compat-test") => vmdk_compat::test(),
         Some("worker-test") => worker::test(),
+        Some("easy-install-test") => easy_install::test(env::args().nth(2).as_deref()),
         Some("vmware-import-test") => vmware_import::test(),
         Some("linux-shell") => linux_shell(),
         _ => {

@@ -264,6 +264,7 @@ fn easy_install(
             password,
             language: None,
             time_zone: host::windows_time_zone().unwrap_or_else(|| "UTC".into()),
+            first_logon: Vec::new(),
         },
         "ubuntu" => EasyInstall::Ubuntu {
             real_name: user.clone(),
