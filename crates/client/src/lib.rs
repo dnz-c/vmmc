@@ -178,7 +178,7 @@ pub fn start(vm: &Vm) -> Result<Connection, String> {
 
 /// The end of a worker's log, for an error message.
 pub fn log_tail(log: &Path) -> String {
-    let text = std::fs::read_to_string(log).unwrap_or_default();
+    let text = String::from_utf8_lossy(&std::fs::read(log).unwrap_or_default()).into_owned();
     let lines: Vec<&str> = text
         .lines()
         .map(str::trim)

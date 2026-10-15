@@ -94,7 +94,8 @@ pub fn test() -> Result<(), String> {
     let started = Instant::now();
     let mut vm = Session::spawn(command)?;
     let booted = loop {
-        let text = fs::read_to_string(&log).unwrap_or_default();
+        // Lossy: the log holds whatever the firmware and the guest wrote.
+        let text = String::from_utf8_lossy(&fs::read(&log).unwrap_or_default()).into_owned();
         // A DHCP acknowledgement (reply type 5).
         if text.contains("reply=5") {
             break Ok(());

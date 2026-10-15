@@ -134,7 +134,8 @@ fn watch(run: &Run, screens: &Path) -> Result<(), String> {
     let mut shot = 0;
     let mut steps_seen = 0;
     loop {
-        let text = fs::read_to_string(&log).unwrap_or_default();
+        // Lossy: the log holds whatever the firmware and the guest wrote.
+        let text = String::from_utf8_lossy(&fs::read(&log).unwrap_or_default()).into_owned();
         let steps = text.matches("Easy Install: step").count();
         if steps != steps_seen {
             steps_seen = steps;
