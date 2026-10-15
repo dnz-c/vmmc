@@ -34,6 +34,9 @@ Phase 3 (the desktop app and moving over from VMware) is under way:
   VMware's files unchanged.
 - **VMs run in sandboxed workers** (`vmmc-cli start`): a background process per VM,
   at low integrity with a restricted token, which can write only to its VM's folder.
+- **The app** (`vmmc`): the library, a New VM wizard with **Easy Install** (Windows
+  and Ubuntu install with no questions), settings, and each running VM's screen in a
+  tab.
 
 What a release still needs is listed in [docs/RELEASE-BLOCKERS.md](docs/RELEASE-BLOCKERS.md).
 
@@ -85,6 +88,7 @@ cargo xtask ubuntu-desktop-test                 # Ubuntu 26.04 Desktop autoinsta
 cargo xtask vmdk-compat-test                    # vmmc's VMDKs against VMware's vdiskmanager (needs VMware)
 cargo xtask vmware-import-test                  # open a VMware VM in place and boot it (VMMC_VMWARE_VMX)
 cargo xtask worker-test                         # VMs in sandboxed workers, controlled through their pipes
+cargo xtask easy-install-test                   # Easy Install of Windows ($VMMC_WIN11_ISO) and Ubuntu
 cargo xtask linux-shell                         # test Linux with a shell on this terminal
 ```
 
@@ -92,6 +96,32 @@ cargo xtask linux-shell                         # test Linux with a shell on thi
 `fetch-native` and `firmware-test` download OVMF and the TPM libraries from this
 repository's releases with the GitHub CLI, so they need an account with access to it.
 Build after fetching: a `vmmc-vmx` built without the TPM libraries refuses `--tpm`.
+
+## The app
+
+```powershell
+cargo build --release -p vmmc -p vmmc-vmx -p vmmc-cli
+target\release\vmmc.exe
+```
+
+- **New VM** makes a VM from an OS preset (Windows 11, Windows 10, Ubuntu, other Linux,
+  other) with its install disc. With **Easy Install** (Windows and Ubuntu) it installs
+  with no questions: give a user name and password (and the Windows edition), and it
+  starts installing at once. vmmc makes an answer disc (Windows' `autounattend.xml`,
+  Ubuntu's autoinstall), types what the installer's first screens need (Windows' "Press
+  any key to boot from CD or DVD", Ubuntu's GRUB command line), and when Setup is done,
+  takes the install discs out (deleting the answer disc, which holds the password) and
+  starts the guest from its disk. The guest gets your time zone, and Ubuntu your
+  keyboard layout and locale.
+- **Import VMware VM** opens a `.vmx` in place (see below).
+- **A VM's tab** shows its hardware and notes and starts it; while it runs, its screen.
+  Click the screen to type in the guest: every key goes to it, the Windows key and
+  Alt+Tab included, until **Ctrl+Alt** gives the keyboard back. The pointer is a USB
+  tablet, so it moves freely in and out. With **Fit guest to window**, a Windows guest
+  with vmmc's display driver takes the window's size. **Full screen**, **Ctrl+Alt+Del**,
+  shut down (the power button), power off and reset are on the toolbar.
+- VMs keep running when the app closes; open it again to get back to them.
+- The library is `%APPDATA%\vmmc\library.toml`; `VMMC_LIBRARY` names another.
 
 ## Running a VM
 
@@ -121,6 +151,9 @@ granting you the right to label it first if the drive doesn't), so a disk the VM
 writes to must be in its folder. Its output goes to `vmmc-vmx.log` there.
 `VMMC_NO_SANDBOX=1` turns the sandbox off, for finding out whether it's in the way.
 
+`vmmc-cli create ... --easy-install --password PASSWORD` installs the OS unattended,
+as the app's Easy Install does (`--user`, `--edition` and `--keyboard` change the
+defaults).
 `create` picks the hardware from `--os` (`windows11`, `windows10`, `ubuntu`, `linux`,
 `other`); `--cpus`, `--memory`, `--disk-size` and `--dir` change it, and the config can
 be edited afterwards. `vmmc-cli list` shows the library, `vmmc-cli disk` creates,
@@ -267,10 +300,13 @@ status: 0 when the guest powers off (or you quit), 2 when it resets with `--no-r
 | `crates/vmconfig` | VM files: the `.vmmc` config, the library, OS presets, and VMware `.vmx` import |
 | `crates/ipc` | The worker's pipe protocol and its shared screen |
 | `crates/client` | Starting workers in their sandbox, and talking to them (`vmmc-client`) |
+| `crates/media` | ISO images, and Easy Install's answer files (Windows `autounattend.xml`, Ubuntu autoinstall) |
+| `crates/keyhook` | The console's keyboard on Windows: a low-level hook giving PS/2 scan codes |
 | `crates/net` | User-mode NAT networking (smoltcp): DHCP, DNS, TCP/UDP to host sockets |
 | `crates/tpm` | The TPM 2.0 engine: Microsoft's reference implementation, linked from the CI build |
 | `crates/machine` | The x86 PC platform: memory map, ACPI, SMBIOS, firmware and Linux boot, vCPU threads |
 | `bins/vmmc-vmx` | Runs one VM, with its serial console on the terminal and optionally its screen in a Slint window |
+| `bins/vmmc` | The desktop app (Slint): the library, the New VM wizard, settings, consoles |
 | `bins/vmmc-cli` | The command line: create, import, start and stop VMs, the library, disks |
 | `guest-drivers/windows` | Windows drivers for vmmc's devices: the display (resolution changes); see its README |
 | `xtask` | Developer tasks and test guest artifacts |

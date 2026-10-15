@@ -110,7 +110,9 @@ fn every_state_draws() {
     app.set_keyboard_captured(true);
     snapshot(&window, "console");
 
-    app.set_os_labels(super::strings(vmconfig::presets::PRESETS.iter().map(|p| p.label)));
+    app.set_os_labels(super::strings(
+        vmconfig::presets::PRESETS.iter().map(|p| p.label),
+    ));
     app.set_editions(super::strings(super::media_editions()));
     app.set_wizard_name("Windows 11".into());
     app.set_wizard_os(0);
