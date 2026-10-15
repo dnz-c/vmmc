@@ -196,7 +196,7 @@ impl Backlog {
 enum Host {
     Connecting,
     Connected {
-        stream: TcpStream,
+        stream: Arc<TcpStream>,
         writer: Sender<Option<Vec<u8>>>,
         backlog: Arc<Backlog>,
     },
@@ -496,14 +496,12 @@ impl Engine {
         let _ = stream.set_nodelay(true);
         let backlog = Arc::new(Backlog::default());
         let (writer, writes) = mpsc::channel::<Option<Vec<u8>>>();
-        let (Ok(mut reader), Ok(mut write_stream)) = (stream.try_clone(), stream.try_clone())
-        else {
-            connection.host = Host::Failed;
-            self.sockets
-                .get_mut::<tcp::Socket>(connection.handle)
-                .abort();
-            return;
-        };
+        // One socket, read and written from two threads: no `try_clone`, whose
+        // duplicated socket can't always be shut down on Windows (WSAENOTCONN), which
+        // left the host's side of a closed connection open.
+        let stream = Arc::new(stream);
+        let reader = stream.clone();
+        let write_stream = stream.clone();
         let events = self.events.clone();
         let reader_backlog = backlog.clone();
         let read = thread::Builder::new()
@@ -511,7 +509,7 @@ impl Engine {
             .spawn(move || {
                 let mut buffer = vec![0u8; 64 * 1024];
                 loop {
-                    match reader.read(&mut buffer) {
+                    match (&*reader).read(&mut buffer) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             if !reader_backlog.add(n)
@@ -533,11 +531,13 @@ impl Engine {
             .name("net-write".into())
             .spawn(move || {
                 while let Ok(Some(data)) = writes.recv() {
-                    if write_stream.write_all(&data).is_err() {
+                    if (&*write_stream).write_all(&data).is_err() {
                         break;
                     }
                 }
-                let _ = write_stream.shutdown(Shutdown::Write);
+                if let Err(e) = write_stream.shutdown(Shutdown::Write) {
+                    tracing::debug!(%e, "NAT: can't pass the guest's FIN on");
+                }
             });
         if read.is_err() || write.is_err() {
             connection.host = Host::Failed;

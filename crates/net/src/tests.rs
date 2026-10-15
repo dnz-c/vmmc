@@ -19,7 +19,8 @@ use smoltcp::wire::{
 
 use super::*;
 
-const TIMEOUT: Duration = Duration::from_secs(20);
+// Generous: a 1 ms sleep can last 15.6 ms on Windows, and CI runners are slow.
+const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The guest's NIC: frames it sends go to the NAT; the NAT's go into `received`.
 struct GuestNic {
@@ -276,10 +277,14 @@ fn tcp_through_the_gateway_reaches_host_loopback() {
     });
     assert_eq!(echoed, data);
 
+    // The guest's FIN reaches the host (the echo server ends), and the host's comes
+    // back.
     guest.sockets.get_mut::<tcp::Socket>(handle).close();
     guest.until("the close", |guest| {
-        !guest.sockets.get::<tcp::Socket>(handle).is_open()
-            || guest.sockets.get::<tcp::Socket>(handle).state() == tcp::State::TimeWait
+        matches!(
+            guest.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::Closed | tcp::State::TimeWait
+        )
     });
     server.join().unwrap();
 }
