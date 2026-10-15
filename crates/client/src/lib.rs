@@ -5,6 +5,7 @@
 //! output in `vmmc-vmx.log` in the VM's folder; [`connect`] finds a running one by its
 //! pipe.
 
+pub mod host;
 #[cfg(windows)]
 pub mod sandbox;
 

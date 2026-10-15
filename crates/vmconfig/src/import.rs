@@ -390,7 +390,10 @@ pub fn import(vmx_path: &Path, state_dir: Option<&Path>) -> Result<Imported, Str
                         device.path.display()
                     ));
                 }
-                config.cdroms.push(Cdrom { path });
+                config.cdroms.push(Cdrom {
+                    path,
+                    install_media: false,
+                });
                 continue;
             }
             let base = disk::vmdk::Vmdk::open(&device.path, true)

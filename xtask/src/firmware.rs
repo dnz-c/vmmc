@@ -21,7 +21,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::{build_vmmc_vmx, esp, guests, iso, native, workspace};
+use crate::{build_vmmc_vmx, esp, guests, native, workspace};
+use media::iso;
 
 /// From power-on to the shell prompt (a debug build, logging every driver).
 const BOOT_TIMEOUT: Duration = Duration::from_secs(120);

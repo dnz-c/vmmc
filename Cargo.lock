@@ -2645,6 +2645,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "media"
+version = "0.0.1"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4832,6 +4839,7 @@ name = "vmconfig"
 version = "0.0.1"
 dependencies = [
  "disk",
+ "media",
  "serde",
  "tempfile",
  "thiserror 2.0.21",
@@ -5848,6 +5856,7 @@ dependencies = [
  "disk",
  "fatfs",
  "ipc",
+ "media",
  "png",
  "ruzstd",
  "sha2",

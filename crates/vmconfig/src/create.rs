@@ -4,7 +4,36 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::presets::Preset;
-use crate::{Cdrom, Disk, NVRAM_FILE, TPM_STATE_FILE, Vm, VmConfig};
+use crate::{Cdrom, Disk, EjectOn, Install, InstallStep, NVRAM_FILE, TPM_STATE_FILE, Vm, VmConfig};
+
+/// The answer disc Easy Install makes, in the VM's folder.
+pub const ANSWER_DISC: &str = "easy-install.iso";
+
+/// Easy Install: the guest OS installs from its ISO with no questions asked.
+#[derive(Clone, Debug)]
+pub enum EasyInstall {
+    Windows {
+        /// The edition, as Setup names it: `Windows 11 Pro`.
+        edition: String,
+        user: String,
+        password: String,
+        /// Setup's language; by default the ISO's.
+        language: Option<String>,
+        /// Windows' name for it, like `W. Europe Standard Time`.
+        time_zone: String,
+    },
+    Ubuntu {
+        user: String,
+        real_name: String,
+        password: String,
+        /// An X keyboard layout, like `us`.
+        keyboard: String,
+        /// Like `en_US.UTF-8`.
+        locale: String,
+        /// Like `Europe/Berlin`.
+        time_zone: String,
+    },
+}
 
 pub struct NewVm<'a> {
     pub name: &'a str,
@@ -23,6 +52,8 @@ pub struct NewVm<'a> {
     pub adopt: Option<&'a Path>,
     /// An existing disk to use, rather than a new one (it stays where it is).
     pub existing_disk: Option<&'a Path>,
+    /// Install the guest unattended from `iso`.
+    pub easy_install: Option<EasyInstall>,
 }
 
 /// A name that works as a file name on Windows.
@@ -100,7 +131,19 @@ pub fn create_vm(new: &NewVm) -> Result<Vm, String> {
     if let Some(iso) = new.iso {
         config.cdroms.push(Cdrom {
             path: Some(absolute(iso)?.display().to_string()),
+            install_media: new.easy_install.is_some(),
         });
+    }
+    if let Some(install) = &new.easy_install {
+        let iso = new.iso.ok_or("Easy Install needs the OS's ISO")?;
+        let (disc, install) = answer_disc(new.name, iso, install)?;
+        fs::write(dir.join(ANSWER_DISC), disc)
+            .map_err(|e| format!("can't write the answer disc: {e}"))?;
+        config.cdroms.push(Cdrom {
+            path: Some(ANSWER_DISC.into()),
+            install_media: true,
+        });
+        config.install = Some(install);
     }
     config.validate()?;
     let vm = Vm {
@@ -109,6 +152,90 @@ pub fn create_vm(new: &NewVm) -> Result<Vm, String> {
     };
     vm.save().map_err(|e| e.to_string())?;
     Ok(vm)
+}
+
+/// The answer disc for `install`, and what the first boot does with it.
+fn answer_disc(
+    name: &str,
+    iso: &Path,
+    install: &EasyInstall,
+) -> Result<(Vec<u8>, Install), String> {
+    match install {
+        EasyInstall::Windows {
+            edition,
+            user,
+            password,
+            language,
+            time_zone,
+        } => {
+            let key = media::windows::generic_key(edition)
+                .ok_or_else(|| format!("no generic key for {edition}"))?;
+            let language = match language {
+                Some(language) => language.clone(),
+                None => media::windows::iso_language(iso)?,
+            };
+            let xml = media::windows::answer_file(&media::windows::Setup {
+                image: edition,
+                product_key: key,
+                language: &language,
+                computer_name: &media::windows::computer_name(name),
+                time_zone,
+                user,
+                password,
+                auto_logons: 1,
+                specialize: &[],
+                first_logon: &[],
+            });
+            let xml = xml.replace('\n', "\r\n");
+            let disc =
+                media::iso::build("VMMC_ANSWER", &[("autounattend.xml", xml.as_bytes())], None);
+            // The disc's boot loader waits a moment for a key before giving up on it.
+            let install = Install {
+                steps: vec![InstallStep {
+                    expect: media::windows::CD_PROMPT.into(),
+                    send: "\r".into(),
+                }],
+                eject_on: Some(EjectOn::Reset),
+            };
+            Ok((disc, install))
+        }
+        EasyInstall::Ubuntu {
+            user,
+            real_name,
+            password,
+            keyboard,
+            locale,
+            time_zone,
+        } => {
+            let user_data = media::ubuntu::user_data(&media::ubuntu::Setup {
+                user,
+                real_name,
+                password,
+                hostname: &media::ubuntu::hostname(name),
+                locale,
+                keyboard,
+                time_zone,
+            });
+            let meta_data =
+                media::ubuntu::meta_data(&format!("vmmc-{}", media::ubuntu::hostname(name)));
+            let disc = media::iso::build(
+                "CIDATA",
+                &[
+                    ("user-data", user_data.as_bytes()),
+                    ("meta-data", meta_data.as_bytes()),
+                ],
+                None,
+            );
+            let install = Install {
+                steps: media::ubuntu::install_steps()
+                    .into_iter()
+                    .map(|(expect, send)| InstallStep { expect, send })
+                    .collect(),
+                eject_on: Some(EjectOn::PowerOff),
+            };
+            Ok((disc, install))
+        }
+    }
 }
 
 fn absolute(path: &Path) -> Result<PathBuf, String> {
@@ -159,6 +286,7 @@ mod tests {
             iso: Some(&iso),
             adopt: None,
             existing_disk: None,
+            easy_install: None,
         })
         .unwrap();
         let dir = root.path().join("Windows 11");
@@ -184,6 +312,7 @@ mod tests {
             iso: None,
             adopt: None,
             existing_disk: None,
+            easy_install: None,
         });
         assert!(again.unwrap_err().contains("isn't empty"));
     }
@@ -208,6 +337,7 @@ mod tests {
             iso: None,
             adopt: Some(&old),
             existing_disk: Some(&disk),
+            easy_install: None,
         })
         .unwrap();
         assert_eq!(vm.config.uuid, "00112233-4455-6677-8899-aabbccddeeff");
@@ -215,6 +345,65 @@ mod tests {
         assert_eq!(fs::read(vm.nvram()).unwrap(), [7u8; 16]);
         assert!(!vm.tpm_state().exists());
         assert_eq!(vm.resolve(&vm.config.disks[0].path), disk);
+    }
+
+    #[test]
+    fn easy_install_adds_an_answer_disc_and_first_boot_steps() {
+        let root = tempfile::tempdir().unwrap();
+        let iso = root.path().join("os.iso");
+        fs::write(&iso, b"").unwrap();
+        let new = |name, os, install| NewVm {
+            name,
+            parent_dir: root.path(),
+            preset: presets::find(os).unwrap(),
+            cpus: None,
+            memory_mib: None,
+            disk_bytes: Some(1 << 20),
+            iso: Some(&iso),
+            adopt: None,
+            existing_disk: None,
+            easy_install: Some(install),
+        };
+        let ubuntu = create_vm(&new(
+            "Ubuntu",
+            "ubuntu",
+            EasyInstall::Ubuntu {
+                user: "anna".into(),
+                real_name: "Anna".into(),
+                password: "pw".into(),
+                keyboard: "us".into(),
+                locale: "en_US.UTF-8".into(),
+                time_zone: "Etc/UTC".into(),
+            },
+        ))
+        .unwrap();
+        let config = &Vm::load(&ubuntu.path).unwrap().config;
+        assert_eq!(config.cdroms.len(), 2);
+        assert!(config.cdroms.iter().all(|cd| cd.install_media));
+        assert_eq!(config.cdroms[1].path.as_deref(), Some(ANSWER_DISC));
+        assert!(ubuntu.dir().join(ANSWER_DISC).is_file());
+        let install = config.install.as_ref().unwrap();
+        assert_eq!(install.eject_on, Some(EjectOn::PowerOff));
+        assert_eq!(install.steps[0].send, "c");
+
+        let windows = create_vm(&new(
+            "Windows",
+            "windows11",
+            EasyInstall::Windows {
+                edition: "Windows 11 Pro".into(),
+                user: "anna".into(),
+                password: "pw".into(),
+                language: Some("en-US".into()),
+                time_zone: "UTC".into(),
+            },
+        ))
+        .unwrap();
+        let install = windows.config.install.as_ref().unwrap();
+        assert_eq!(install.eject_on, Some(EjectOn::Reset), "Windows restarts");
+        assert_eq!(install.steps[0].expect, media::windows::CD_PROMPT);
+        let disc = fs::read(windows.dir().join(ANSWER_DISC)).unwrap();
+        let text = String::from_utf8_lossy(&disc);
+        assert!(text.contains("<Name>anna</Name>") && text.contains("\r\n"));
     }
 
     #[test]

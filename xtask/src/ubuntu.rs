@@ -25,7 +25,8 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 
 use crate::firmware::Session;
-use crate::{build_vmmc_vmx, iso, native, workspace};
+use crate::{build_vmmc_vmx, native, workspace};
+use media::iso;
 
 const ISO_VAR: &str = "VMMC_UBUNTU_ISO";
 const ISO_FILE: &str = "ubuntu-26.04.1-desktop-amd64.iso";

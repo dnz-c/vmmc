@@ -19,6 +19,7 @@ hv = { path = "crates/hv" }
 hv-whp = { path = "crates/hv-whp" }
 ipc = { path = "crates/ipc" }
 machine = { path = "crates/machine" }
+media = { path = "crates/media" }
 tpm = { path = "crates/tpm" }
 vmconfig = { path = "crates/vmconfig" }
 vmmc-client = { path = "crates/client" }

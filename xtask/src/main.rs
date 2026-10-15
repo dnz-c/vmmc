@@ -5,7 +5,6 @@ mod drivers;
 mod esp;
 mod firmware;
 mod guests;
-mod iso;
 mod modules;
 mod native;
 mod perf;

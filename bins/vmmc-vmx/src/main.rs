@@ -13,6 +13,8 @@
 //! button, Ctrl-A r prints each vCPU's registers, and Ctrl-A m saves guest RAM.
 
 mod console;
+#[cfg(windows)]
+mod install;
 mod memdump;
 mod sandbox;
 mod screenshot;
@@ -580,9 +582,10 @@ fn run(args: RunArgs, frontend: Frontend) -> Result<RunOutcome, Box<dyn Error>> 
     let vm_targets = targets.clone();
     let vm_screenshots = screenshots.clone();
     let run_vm = move || -> Result<RunOutcome, String> {
+        let mut args = args;
         run_machines(
             &whp,
-            &args,
+            &mut args,
             &boot,
             memory,
             resolution,
@@ -617,7 +620,7 @@ fn run(args: RunArgs, frontend: Frontend) -> Result<RunOutcome, Box<dyn Error>> 
 #[allow(clippy::too_many_arguments)]
 fn run_machines(
     whp: &hv_whp::Whp,
-    args: &RunArgs,
+    args: &mut RunArgs,
     boot: &Boot,
     memory: u64,
     resolution: (u32, u32),
@@ -628,6 +631,11 @@ fn run_machines(
 ) -> Result<RunOutcome, Box<dyn Error>> {
     use machine::{Machine, MachineConfig};
 
+    // Easy Install's first boot, if the VM has one to do.
+    let installer = args
+        .loaded
+        .as_ref()
+        .and_then(|vm| install::Installer::start(vm, targets.clone()));
     loop {
         // Only one VM may have memory mapped per process, so the previous machine is
         // gone before the next one is built.
@@ -638,7 +646,10 @@ fn run_machines(
                 memory,
                 disks: disks(args),
                 nics: nics.to_vec(),
-                serial_output: Box::new(console::ConsoleOutput),
+                serial_output: match &installer {
+                    Some(installer) => installer.tap(Box::new(console::ConsoleOutput)),
+                    None => Box::new(console::ConsoleOutput),
+                },
                 firmware: boot.firmware_config()?,
                 tpm: tpm.cloned(),
                 enlightenments: !args.no_enlightenments,
@@ -664,6 +675,15 @@ fn run_machines(
         }));
         let outcome = machine.run();
         targets.set(None);
+        // The end of an install: start again from the disk, the install discs out.
+        if let (Some(installer), Ok(ended)) = (&installer, &outcome)
+            && !targets.quitting()
+            && let Some(vm) = installer.finish(ended)
+        {
+            args.loaded = Some(vm);
+            drop(machine);
+            continue;
+        }
         let restart =
             matches!(outcome, Ok(RunOutcome::Reset)) && !args.no_reboot && !targets.quitting();
         if !restart
@@ -858,6 +878,7 @@ mod tests {
         });
         config.cdroms.push(vmconfig::Cdrom {
             path: Some("install.iso".into()),
+            install_media: false,
         });
         config.firmware.secure_boot = false;
         config.display.resolution = Some("1600x900".into());

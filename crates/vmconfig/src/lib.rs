@@ -91,6 +91,9 @@ pub struct VmConfig {
     /// Where an imported VMware VM came from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vmware: Option<VmwareOrigin>,
+    /// Easy Install's steps for the first boot, until they're done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install: Option<Install>,
     #[serde(default, rename = "disk", skip_serializing_if = "Vec::is_empty")]
     pub disks: Vec<Disk>,
     #[serde(default, rename = "cdrom", skip_serializing_if = "Vec::is_empty")]
@@ -144,6 +147,35 @@ fn yes() -> bool {
     true
 }
 
+/// What Easy Install does at the first boot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Install {
+    /// Typed on the serial console, in order: wait for `expect`, then type `send`.
+    /// Gone once done.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<InstallStep>,
+    /// When to take out the install discs (and delete the answer disc, which holds
+    /// the password) once the steps are done, and start the guest again from its disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eject_on: Option<EjectOn>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EjectOn {
+    /// The installer powers off when it's done (Ubuntu's autoinstall).
+    PowerOff,
+    /// The guest restarts once the install media were read (Windows Setup, which
+    /// copies what it needs to the disk before its first restart).
+    Reset,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstallStep {
+    pub expect: String,
+    pub send: String,
+}
+
 /// A VMware VM opened in place: vmmc writes to delta disks on top of VMware's, and
 /// never to VMware's files.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,6 +212,9 @@ pub struct Cdrom {
     /// An ISO; none for an empty drive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// An install disc, which Easy Install takes out once it's done.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub install_media: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +249,7 @@ impl VmConfig {
             display: Display::default(),
             advanced: Advanced::default(),
             vmware: None,
+            install: None,
             disks: Vec::new(),
             cdroms: Vec::new(),
             nics: vec![Nic {
@@ -447,6 +483,14 @@ mod tests {
         });
         config.cdroms.push(Cdrom {
             path: Some(r"C:\ISOs\Win11.iso".into()),
+            install_media: true,
+        });
+        config.install = Some(Install {
+            steps: vec![InstallStep {
+                expect: "Press any key".into(),
+                send: "\r".into(),
+            }],
+            eject_on: Some(EjectOn::PowerOff),
         });
         config.display.resolution = Some("1920x1080".into());
         config.notes = "line one\nline two".into();

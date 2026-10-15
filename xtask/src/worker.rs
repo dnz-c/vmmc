@@ -119,6 +119,7 @@ fn new_vm(root: &Path, name: &str) -> Result<Vm, String> {
         iso: None,
         adopt: None,
         existing_disk: None,
+        easy_install: None,
     })
 }
 

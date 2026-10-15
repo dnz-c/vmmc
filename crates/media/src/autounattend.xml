@@ -1,9 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Unattended Windows 11 install for `cargo xtask win11-test`: wipes disk 0 (the NVMe
-  disk), installs the image named below with the edition's public generic key, creates a
-  local administrator, skips OOBE, and runs the first-logon script from the answer disc.
-  xtask fills in the image, key, and (while vmmc lacks a TPM) the setup check bypasses.
+  Unattended Windows install, made by vmmc's Easy Install: wipes disk 0 (the VM's
+  first disk), installs the image named below with the key below, creates a local
+  administrator, and skips the online parts of OOBE.
 -->
 <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
   <settings pass="windowsPE">
@@ -80,8 +79,8 @@
   </settings>
   <settings pass="specialize">
     <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-      <ComputerName>VMMC-TEST</ComputerName>
-      <TimeZone>UTC</TimeZone>
+      <ComputerName>@@COMPUTER@@</ComputerName>
+      <TimeZone>@@TIMEZONE@@</TimeZone>
     </component>
     <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <RunSynchronous>
@@ -111,31 +110,15 @@
       <UserAccounts>
         <LocalAccounts>
           <LocalAccount wcm:action="add">
-            <Name>vmmc</Name>
+            <Name>@@USER@@</Name>
             <Group>Administrators</Group>
             <Password>
-              <Value>vmmc</Value>
+              <Value>@@PASSWORD@@</Value>
               <PlainText>true</PlainText>
             </Password>
           </LocalAccount>
         </LocalAccounts>
       </UserAccounts>
-      <AutoLogon>
-        <Enabled>true</Enabled>
-        <LogonCount>1</LogonCount>
-        <Username>vmmc</Username>
-        <Password>
-          <Value>vmmc</Value>
-          <PlainText>true</PlainText>
-        </Password>
-      </AutoLogon>
-      <FirstLogonCommands>
-        <SynchronousCommand wcm:action="add">
-          <Order>1</Order>
-          <Description>Report to the host and shut down</Description>
-          <CommandLine>cmd /c for %d in (D E F G H I J) do @if exist %d:\vmmc-firstlogon.ps1 powershell -NoProfile -ExecutionPolicy Bypass -File %d:\vmmc-firstlogon.ps1</CommandLine>
-        </SynchronousCommand>
-      </FirstLogonCommands>
-    </component>
+@@AUTOLOGON@@@@FIRSTLOGON@@    </component>
   </settings>
 </unattend>

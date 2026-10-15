@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
-use vmconfig::create::{NewVm, create_vm};
+use vmconfig::create::{EasyInstall, NewVm, create_vm};
 use vmconfig::library::{self, Library};
 use vmconfig::presets::{self, PRESETS};
 
@@ -39,7 +39,7 @@ struct Cli {
 enum Command {
     /// Make a new VM: a folder with its config (.vmmc) and an empty disk, added to the
     /// library.
-    Create(CreateArgs),
+    Create(Box<CreateArgs>),
     /// Open a VMware VM in place. vmmc's files go in a `vmmc` folder beside the .vmx,
     /// and its writes go to delta disks there: VMware's files are never changed, and
     /// deleting that folder leaves the VMware VM as it was.
@@ -104,6 +104,23 @@ struct CreateArgs {
     /// An installation disc for the DVD drive.
     #[arg(long)]
     iso: Option<PathBuf>,
+    /// Install the OS from --iso unattended (Windows and Ubuntu): vmmc makes an answer
+    /// disc, and types what the installer's first screens need.
+    #[arg(long, requires = "iso", requires = "password")]
+    easy_install: bool,
+    /// Easy Install's user [default: yours].
+    #[arg(long)]
+    user: Option<String>,
+    /// Easy Install's password for that user.
+    #[arg(long)]
+    password: Option<String>,
+    /// Easy Install's Windows edition, as Setup names it [default: Windows 11 Pro or
+    /// Windows 10 Pro].
+    #[arg(long)]
+    edition: Option<String>,
+    /// Easy Install's keyboard layout for Linux, like `us` or `de` [default: yours].
+    #[arg(long)]
+    keyboard: Option<String>,
     /// Take over a state directory of `vmmc-vmx run --vm-dir`: its UUID, MAC, UEFI
     /// variables and TPM.
     #[arg(long)]
@@ -214,11 +231,57 @@ fn create(args: &CreateArgs) -> Result<PathBuf, String> {
         iso: args.iso.as_deref(),
         adopt: args.from_vm_dir.as_deref(),
         existing_disk: args.disk.as_deref(),
+        easy_install: easy_install(args, preset)?,
     })?;
     let mut library = Library::load(&library::default_path()).map_err(|e| e.to_string())?;
     library.add(&vm.path, args.folder.as_deref());
     library.save().map_err(|e| e.to_string())?;
     Ok(vm.path)
+}
+
+/// Easy Install's settings from the arguments, with the host's as defaults.
+fn easy_install(
+    args: &CreateArgs,
+    preset: &vmconfig::presets::Preset,
+) -> Result<Option<EasyInstall>, String> {
+    use vmmc_client::host;
+
+    if !args.easy_install {
+        return Ok(None);
+    }
+    let user = args.user.clone().unwrap_or_else(host::user_name);
+    let password = args.password.clone().unwrap_or_default();
+    Ok(Some(match preset.id {
+        "windows11" | "windows10" => EasyInstall::Windows {
+            edition: args.edition.clone().unwrap_or_else(|| {
+                if preset.id == "windows11" {
+                    "Windows 11 Pro".into()
+                } else {
+                    "Windows 10 Pro".into()
+                }
+            }),
+            user,
+            password,
+            language: None,
+            time_zone: host::windows_time_zone().unwrap_or_else(|| "UTC".into()),
+        },
+        "ubuntu" => EasyInstall::Ubuntu {
+            real_name: user.clone(),
+            user,
+            password,
+            keyboard: args
+                .keyboard
+                .clone()
+                .unwrap_or_else(|| host::keyboard_layout().into()),
+            locale: host::linux_locale(),
+            time_zone: host::linux_time_zone(),
+        },
+        other => {
+            return Err(format!(
+                "Easy Install knows Windows and Ubuntu, not {other}"
+            ));
+        }
+    }))
 }
 
 fn list() -> Result<String, String> {
