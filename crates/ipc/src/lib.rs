@@ -55,7 +55,10 @@ pub enum Request {
     /// Puts a disc (an ISO the worker can read) into DVD drive `drive` (0 for the
     /// first), or takes it out (`None`), while the guest runs. Lasts until the VM
     /// stops; the VM's file isn't changed.
-    InsertDisc { drive: u32, path: Option<String> },
+    InsertDisc {
+        drive: u32,
+        path: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

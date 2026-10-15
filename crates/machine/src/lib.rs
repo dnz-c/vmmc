@@ -46,10 +46,10 @@ use devices::nic::e1000e::{
 };
 use devices::pci::root::{CONFIG_IO_BASE, CONFIG_IO_PORTS, PciConfigIo, PciEcam, PciRoot};
 use devices::pci::{PciDevice, SharedPciDevice};
+pub use devices::storage::ahci::DiscDrive;
 use devices::storage::ahci::{
     ABAR, ABAR_SIZE, AHCI_FUNCTION, AHCI_SLOT, Ahci, Drive, PORTS as AHCI_PORTS,
 };
-pub use devices::storage::ahci::DiscDrive;
 use devices::storage::ata::AtaDisk;
 use devices::storage::atapi::Cdrom;
 use devices::storage::nvme::{NVME_BAR, NVME_BAR_SIZE, Namespace, Nvme};
