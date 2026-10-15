@@ -672,6 +672,7 @@ fn run_machines(
             memory: machine.memory().clone(),
             ps2: machine.ps2_input(),
             usb: machine.usb_input(),
+            discs: machine.disc_drives(),
         }));
         let outcome = machine.run();
         targets.set(None);

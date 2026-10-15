@@ -191,6 +191,20 @@ fn handle(shared: &Shared, request: Request) -> Response {
                     let (width, height) = target.display.request_size(width, height);
                     tracing::debug!(width, height, "a client asked the guest for a size");
                 }
+                Request::InsertDisc { drive, path } => {
+                    let Some(slot) = target.discs.get(drive as usize) else {
+                        return Response::Error(format!("the VM has no DVD drive {drive}"));
+                    };
+                    let medium = match path {
+                        Some(path) => match disk::open(std::path::Path::new(&path), true) {
+                            Ok(medium) => Some(medium),
+                            Err(e) => return Response::Error(format!("{path}: {e}")),
+                        },
+                        None => None,
+                    };
+                    slot.change(medium);
+                    eprintln!("vmmc-vmx: a client changed the disc in DVD drive {drive}");
+                }
                 Request::Hello { .. } | Request::Status | Request::Stop | Request::Screen => {
                     unreachable!("handled above")
                 }

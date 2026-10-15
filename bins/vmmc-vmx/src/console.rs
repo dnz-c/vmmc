@@ -137,6 +137,7 @@ pub struct Target {
     pub memory: GuestMemoryMmap,
     pub ps2: Ps2Input,
     pub usb: UsbInput,
+    pub discs: Vec<machine::DiscDrive>,
 }
 
 /// Where console input goes. A guest reset rebuilds the machine, so the target changes

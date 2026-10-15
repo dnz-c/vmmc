@@ -49,6 +49,7 @@ use devices::pci::{PciDevice, SharedPciDevice};
 use devices::storage::ahci::{
     ABAR, ABAR_SIZE, AHCI_FUNCTION, AHCI_SLOT, Ahci, Drive, PORTS as AHCI_PORTS,
 };
+pub use devices::storage::ahci::DiscDrive;
 use devices::storage::ata::AtaDisk;
 use devices::storage::atapi::Cdrom;
 use devices::storage::nvme::{NVME_BAR, NVME_BAR_SIZE, Namespace, Nvme};
@@ -284,6 +285,7 @@ pub struct Machine<P: Partition> {
     display: Display,
     ps2: Ps2Input,
     usb: UsbInput,
+    disc_drives: Vec<DiscDrive>,
     boot: Option<BootEntry>,
     /// What went wrong, if a vCPU stopped the machine with an error.
     error: Arc<Mutex<Option<String>>>,
@@ -395,6 +397,7 @@ impl<P: Partition + 'static> Machine<P> {
         let root = Arc::new(Mutex::new(PciRoot::new(vm.mmio().clone())));
         let display;
         let usb;
+        let disc_drives;
         pio.insert(
             CONFIG_IO_BASE.into(),
             CONFIG_IO_PORTS.into(),
@@ -465,6 +468,7 @@ impl<P: Partition + 'static> Machine<P> {
             let intx = irq(acpi::intx_gsi(AHCI_SLOT, 0) as u8);
             let mut ahci = Ahci::new(sata_drives, vm.memory().clone(), sink.clone(), Some(intx))
                 .map_err(Error::Thread)?;
+            disc_drives = ahci.disc_drives();
             if direct_boot {
                 ahci.config_mut()
                     .set_bar_address(ABAR.into(), allocate(ABAR_SIZE)?);
@@ -608,6 +612,7 @@ impl<P: Partition + 'static> Machine<P> {
             display,
             ps2,
             usb,
+            disc_drives,
             boot: None,
             error: Arc::default(),
         })
@@ -659,6 +664,12 @@ impl<P: Partition + 'static> Machine<P> {
     /// A handle that moves the guest's USB tablet and types on its USB keyboard.
     pub fn usb_input(&self) -> UsbInput {
         self.usb.clone()
+    }
+
+    /// The DVD drives (on the AHCI controller, CD-ROMs first), whose discs can change
+    /// while the guest runs.
+    pub fn disc_drives(&self) -> Vec<DiscDrive> {
+        self.disc_drives.clone()
     }
 
     /// A handle that types on the guest's PS/2 keyboard and moves its PS/2 mouse.

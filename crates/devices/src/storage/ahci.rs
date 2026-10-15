@@ -498,6 +498,21 @@ fn run_port(
 struct Port {
     messages: Sender<Message>,
     thread: Option<JoinHandle<()>>,
+    drive: Arc<Mutex<Drive>>,
+}
+
+/// A DVD drive of the controller, whose disc the host can change while the guest
+/// runs (the guest sees the drive's unit attention and media event).
+#[derive(Clone)]
+pub struct DiscDrive(Arc<Mutex<Drive>>);
+
+impl DiscDrive {
+    /// Takes the disc out (`None`) or puts one in.
+    pub fn change(&self, medium: Option<Arc<dyn disk::BlockBackend>>) {
+        if let Drive::Cdrom(cdrom) = &mut *lock(&self.0) {
+            cdrom.change_medium(medium);
+        }
+    }
 }
 
 impl Drop for Port {
@@ -561,12 +576,14 @@ impl Ahci {
             let (messages, receiver) = mpsc::channel();
             let shared = shared.clone();
             let drive = Arc::new(Mutex::new(drive));
+            let port_drive = drive.clone();
             let thread = thread::Builder::new()
                 .name(format!("ahci-port{index}"))
-                .spawn(move || run_port(shared, index, drive, receiver))?;
+                .spawn(move || run_port(shared, index, port_drive, receiver))?;
             ports[index] = Some(Port {
                 messages,
                 thread: Some(thread),
+                drive,
             });
         }
         Ok(Self {
@@ -576,6 +593,16 @@ impl Ahci {
             ports,
             sent_signature: Default::default(),
         })
+    }
+
+    /// The DVD drives, in port order.
+    pub fn disc_drives(&self) -> Vec<DiscDrive> {
+        self.ports
+            .iter()
+            .flatten()
+            .filter(|port| matches!(*lock(&port.drive), Drive::Cdrom(_)))
+            .map(|port| DiscDrive(port.drive.clone()))
+            .collect()
     }
 
     fn read_register(&self, offset: u64) -> u32 {
