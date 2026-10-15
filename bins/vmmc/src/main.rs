@@ -8,6 +8,8 @@
 
 mod console;
 mod dialogs;
+#[cfg(test)]
+mod snapshots;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};

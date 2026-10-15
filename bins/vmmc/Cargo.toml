@@ -23,6 +23,9 @@ windows = { workspace = true, features = [
     "Win32_UI_Shell_Common",
 ] }
 
+[dev-dependencies]
+png.workspace = true
+
 [build-dependencies]
 slint-build.workspace = true
 

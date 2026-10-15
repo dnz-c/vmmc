@@ -4959,6 +4959,7 @@ version = "0.0.1"
 dependencies = [
  "ipc",
  "keyhook",
+ "png",
  "slint",
  "slint-build",
  "tracing",
