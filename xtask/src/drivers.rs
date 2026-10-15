@@ -8,7 +8,8 @@
 //!   Windows loads test-signed drivers only with test signing on, which Secure Boot
 //!   rules out: until Microsoft signs them, they're for VMs with Secure Boot off.
 //! - `cargo xtask win-display-test` installs Windows as `win11-test` does, but with
-//!   Secure Boot off and test signing on, installs the display driver at first logon,
+//!   Secure Boot off and test signing on, installs the display driver at first logon
+//!   with the vmmc Tools disc's setup,
 //!   switches to 1600x900 and checks that the screen followed, then asks for 1500x844
 //!   as resizing the window does and checks the desktop follows. A second boot checks
 //!   that Windows hands the driver its pointer and that the helper starts at logon.
@@ -27,9 +28,10 @@ const CERTIFICATE_SUBJECT: &str = "CN=vmmc test driver signing";
 const KITS: &str = r"C:\Program Files (x86)\Windows Kits\10";
 const DISPLAY_TEST: &str = include_str!("../guest/display-test.ps1");
 /// What the display test's first logon reports, in order.
-const DISPLAY_MARKERS: [&str; 10] = [
+const DISPLAY_MARKERS: [&str; 11] = [
     "VMMC-DISP: booted",
     "VMMC-DISP: testsigning=True",
+    "VMMC-DISP: setup=ok",
     "VMMC-DISP: driver=vmmcdisp status=OK",
     "VMMC-DISP: set=0 now=1600x900",
     "VMMC-DISP: mode-set",
@@ -351,6 +353,7 @@ pub fn display_test() -> Result<(), String> {
     for file in PACKAGE {
         files.push((file.to_owned(), read(&drivers.display.join(file))?));
     }
+    files.push(("setup.ps1".to_owned(), tools_file("setup.ps1")?));
     let mut modes = String::new();
     windows::install(
         &Install {
@@ -358,19 +361,13 @@ pub fn display_test() -> Result<(), String> {
             vars: "OVMF_VARS.fd",
             first_logon: windows::crlf(DISPLAY_TEST),
             files,
-            // As SYSTEM, before the first logon, which installs the driver. (Setup's
-            // pnputil ran without effect; the first logon's works. Importing the
-            // certificate there was denied.)
-            specialize: &[
-                (
-                    "Load test-signed drivers",
-                    "bcdedit /set {current} testsigning on",
-                ),
-                (
-                    "Trust the test driver certificate",
-                    r"cmd /c for %d in (D E F G H I J) do @if exist %d:\vmmc-test-signing.cer (certutil -addstore -f Root %d:\vmmc-test-signing.cer & certutil -addstore -f TrustedPublisher %d:\vmmc-test-signing.cer)",
-                ),
-            ],
+            // Before the first logon, so the driver loads without the restart setup
+            // asks for when it turns test signing on. (Setup's pnputil ran without
+            // effect; the first logon's works.)
+            specialize: &[(
+                "Load test-signed drivers",
+                "bcdedit /set {current} testsigning on",
+            )],
             markers: &DISPLAY_MARKERS,
         },
         |marker, vm, dir| {
@@ -446,15 +443,9 @@ pub fn display_test() -> Result<(), String> {
 /// The vmmc Tools disc: setup (with Windows line ends), the driver package and the
 /// certificate it's signed with, all in the root.
 fn write_tools_iso(package: &Path, certificate: &Path, iso: &Path) -> Result<(), String> {
-    let source = workspace()
-        .join("guest-drivers")
-        .join("windows")
-        .join("tools");
     let mut files = Vec::new();
     for name in ["setup.cmd", "setup.ps1", "autorun.inf"] {
-        let text = String::from_utf8(read(&source.join(name))?)
-            .map_err(|_| format!("{name} isn't UTF-8"))?;
-        files.push((name.to_owned(), windows::crlf(&text).into_bytes()));
+        files.push((name.to_owned(), tools_file(name)?));
     }
     for name in PACKAGE {
         files.push((name.to_owned(), read(&package.join(name))?));
@@ -466,6 +457,18 @@ fn write_tools_iso(package: &Path, certificate: &Path, iso: &Path) -> Result<(),
         .collect();
     fs::write(iso, media::iso::build("VMMC_TOOLS", &files, None))
         .map_err(|e| format!("can't write {}: {e}", iso.display()))
+}
+
+/// A file of the Tools disc's setup (`guest-drivers/windows/tools`), with Windows line
+/// ends.
+fn tools_file(name: &str) -> Result<Vec<u8>, String> {
+    let path = workspace()
+        .join("guest-drivers")
+        .join("windows")
+        .join("tools")
+        .join(name);
+    let text = String::from_utf8(read(&path)?).map_err(|_| format!("{name} isn't UTF-8"))?;
+    Ok(windows::crlf(&text).into_bytes())
 }
 
 fn read(path: &Path) -> Result<Vec<u8>, String> {

@@ -1,6 +1,7 @@
-# First logon of `cargo xtask win-display-test`: installs the vmmc display driver
-# (Setup's specialize pass trusted its test certificate), reports to COM1 what Windows
-# makes of it, switches the resolution (the host checks the screen), then shuts down.
+# First logon of `cargo xtask win-display-test`: installs the vmmc display driver with
+# the vmmc Tools setup (Setup's specialize pass turned test signing on), reports to COM1
+# what Windows makes of it, switches the resolution (the host checks the screen), then
+# shuts down.
 
 $port = New-Object System.IO.Ports.SerialPort 'COM1', 115200, 'None', 8, 'One'
 $port.Open()
@@ -12,8 +13,10 @@ try {
     Mark 'booted'
     $options = (Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control).SystemStartOptions
     Mark "testsigning=$($options -match 'TESTSIGNING')"
-    $output = pnputil /add-driver (Join-Path $PSScriptRoot 'vmmcdisp.inf') /install 2>&1 | Out-String
-    Mark "pnputil=$LASTEXITCODE $($output -replace '\s+', ' ')"
+    # As the Tools disc's setup does it (with test signing on already, no restart).
+    $output = & (Join-Path $PSScriptRoot 'setup.ps1') -Quiet 2>&1 | Out-String
+    Mark "setup: $LASTEXITCODE $($output -replace '\s+', ' ')"
+    Mark "setup=$(if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq 3010) { 'ok' } else { 'failed' })"
 
     # The adapter restarts with the driver.
     $deadline = (Get-Date).AddSeconds(60)
