@@ -110,6 +110,55 @@ pub fn worker_exe() -> Result<PathBuf, String> {
     }
 }
 
+/// The vmmc Tools disc: `VMMC_TOOLS_ISO`, or `vmmc-tools.iso` next to this program,
+/// or (in a build) in `target\guest-drivers`, where `cargo xtask guest-drivers` puts
+/// it.
+pub fn tools_iso() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("VMMC_TOOLS_ISO") {
+        return Some(path.into());
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    [
+        dir.join(TOOLS_ISO),
+        dir.parent()?.join("guest-drivers").join(TOOLS_ISO),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+}
+
+/// The vmmc Tools disc's file name.
+pub const TOOLS_ISO: &str = "vmmc-tools.iso";
+
+/// Puts the vmmc Tools disc into the running VM's first DVD drive. Returns what the
+/// user should know next.
+#[cfg(windows)]
+pub fn insert_tools(vm: &Vm) -> Result<String, String> {
+    let iso = tools_iso().ok_or(
+        "the vmmc Tools disc (vmmc-tools.iso) isn't there: build it with `cargo xtask guest-drivers`",
+    )?;
+    let mut connection = connect(vm, Duration::from_secs(2))?;
+    connection
+        .command(&Request::InsertDisc {
+            drive: 0,
+            path: Some(iso.display().to_string()),
+        })
+        .map_err(|e| {
+            if e.contains("no DVD drive") {
+                "this VM has no DVD drive: shut it down, put the vmmc Tools disc (vmmc-tools.iso) in its DVD drive in its settings, and start it again".to_owned()
+            } else {
+                e
+            }
+        })?;
+    let mut text = "The vmmc Tools disc is in the VM's DVD drive. In Windows, open it (AutoPlay offers it, or open the drive in Explorer) and run setup; it asks for administrator rights.".to_owned();
+    if vm.config.firmware.secure_boot {
+        text += "\n\nSecure Boot is on in this VM, and vmmc's display driver isn't signed by Microsoft yet, so Windows won't load it: setup will say so. To use it now, shut the VM down, turn Secure Boot off in its settings, start it, and run setup again.";
+    } else {
+        text += " Windows restarts once afterwards, the first time.";
+    }
+    Ok(text)
+}
+
 /// Whether the sandbox is off (`VMMC_NO_SANDBOX=1`), for finding out if it's in the
 /// way.
 pub fn sandbox_disabled() -> bool {

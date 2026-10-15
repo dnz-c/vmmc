@@ -324,6 +324,7 @@ fn row(vm: &Vm, folder: Option<&str>, running: bool) -> VmRow {
         path: vm.path.display().to_string().into(),
         name: config.name.clone().into(),
         folder: folder.unwrap_or_default().into(),
+        windows: config.os.starts_with("windows"),
         heading: "".into(),
         os: if config.vmware.is_some() {
             format!("{} (from VMware)", os_label(&config.os)).into()
@@ -726,6 +727,16 @@ fn wire(window: &AppWindow, app: &Shared) {
             );
         }
     }));
+    window.on_install_tools(with!(app, window, {
+        let Some(vm) = current_vm(&app, &window) else {
+            return;
+        };
+        #[cfg(windows)]
+        match vmmc_client::insert_tools(&vm) {
+            Ok(text) => message(&window, "vmmc Tools", &text),
+            Err(e) => message(&window, "Couldn't insert vmmc Tools", &e),
+        }
+    }));
     {
         let w = weak();
         window.on_toggle_fullscreen(move || {
@@ -994,6 +1005,7 @@ fn wire(window: &AppWindow, app: &Shared) {
         }
         let resolution = window.get_settings_resolution().trim().to_owned();
         config.display.resolution = (!resolution.is_empty()).then_some(resolution);
+        let secure_boot_changed = config.firmware.secure_boot != window.get_settings_secure_boot();
         config.firmware.secure_boot = window.get_settings_secure_boot();
         config.firmware.tpm = window.get_settings_tpm();
         config.advanced.enlightenments = window.get_settings_enlightenments();
@@ -1004,6 +1016,17 @@ fn wire(window: &AppWindow, app: &Shared) {
         if let Err(e) = vm.save() {
             window.set_settings_error(e.to_string().into());
             return;
+        }
+        // Secure Boot lives in the UEFI variables: the VM gets a fresh store, from the
+        // template with Secure Boot on or off (the old one stays as nvram.fd.old). Boot
+        // entries go with it; Windows and Linux boot again from their fallback loader.
+        if secure_boot_changed && vm.nvram().is_file() {
+            let old = vm.nvram().with_extension("fd.old");
+            let _ = std::fs::remove_file(&old);
+            if let Err(e) = std::fs::rename(vm.nvram(), &old) {
+                window.set_settings_error(format!("can't reset the UEFI variables: {e}").into());
+                return;
+            }
         }
         window.set_settings_open(false);
         reload(&app);

@@ -67,6 +67,9 @@ enum Command {
     Reset { vm: String },
     /// Whether a VM runs, and how.
     Status { vm: String },
+    /// Put the vmmc Tools disc (the display driver, for Windows guests) into a running
+    /// VM's DVD drive.
+    Tools { vm: String },
     /// Add an existing VM (its .vmmc file) to the library.
     Add {
         file: PathBuf,
@@ -380,6 +383,10 @@ fn worker_command(command: Command) -> Result<(), String> {
             connect(&vm)?.command(&Request::Reset)?;
             println!("{} reset", vm.config.name);
         }
+        Command::Tools { vm } => {
+            let vm = find_vm(&vm)?;
+            println!("{}", vmmc_client::insert_tools(&vm)?);
+        }
         Command::Status { vm } => {
             let vm = find_vm(&vm)?;
             match connect(&vm) {
@@ -445,7 +452,8 @@ fn run(command: Command) -> Result<(), String> {
         command @ (Command::Start { .. }
         | Command::Stop { .. }
         | Command::Reset { .. }
-        | Command::Status { .. }) => worker_command(command)?,
+        | Command::Status { .. }
+        | Command::Tools { .. }) => worker_command(command)?,
         Command::Add { file, folder } => {
             let file = std::path::absolute(&file).map_err(|e| e.to_string())?;
             vmconfig::Vm::load(&file).map_err(|e| e.to_string())?;

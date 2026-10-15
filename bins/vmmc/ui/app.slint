@@ -7,6 +7,8 @@ export struct VmRow {
     path: string,
     name: string,
     folder: string,
+    // A Windows guest (vmmc Tools are for Windows so far).
+    windows: bool,
     // The folder's heading, on the first VM of each folder.
     heading: string,
     os: string,
@@ -114,6 +116,7 @@ export component AppWindow inherits Window {
     callback stop-vm();
     callback reset-vm();
     callback ctrl-alt-del();
+    callback install-tools();
     callback toggle-fullscreen();
     callback pointer(length, length, length, length, bool, bool, bool, int);
     callback save-notes(string);
@@ -345,6 +348,10 @@ export component AppWindow inherits Window {
                                 if root.current.running: ToolButton {
                                     text: "Ctrl+Alt+Del";
                                     clicked => { root.ctrl-alt-del(); }
+                                }
+                                if root.current.running && root.current.windows: ToolButton {
+                                    text: "Install vmmc Tools";
+                                    clicked => { root.install-tools(); }
                                 }
                                 if root.current.running: ToolButton {
                                     text: root.show-console ? "Summary" : "Console";
@@ -722,7 +729,7 @@ export component AppWindow inherits Window {
                 }
             }
             Text {
-                text: "Secure Boot applies to a new variable store: it changes for this VM when its nvram.fd is deleted.";
+                text: "Changing Secure Boot gives the VM a fresh UEFI variable store (the old one is kept as nvram.fd.old).";
                 color: #8a8a8a;
                 font-size: 11px;
                 wrap: word-wrap;

@@ -201,6 +201,33 @@ pub fn test() -> Result<(), String> {
     if connection.status()?.state != ipc::State::Running {
         return Err("the idle VM isn't running".into());
     }
+    // A disc goes into its (empty) DVD drive while it runs; a drive it hasn't is refused.
+    let disc = root.join("disc.iso");
+    fs::write(
+        &disc,
+        media::iso::build("VMMC_TEST", &[("hello.txt", b"vmmc")], None),
+    )
+    .map_err(|e| e.to_string())?;
+    connection.command(&Request::InsertDisc {
+        drive: 0,
+        path: Some(disc.display().to_string()),
+    })?;
+    let refused = connection
+        .command(&Request::InsertDisc {
+            drive: 5,
+            path: None,
+        })
+        .err()
+        .unwrap_or_default();
+    if !refused.contains("no DVD drive") {
+        return Err(format!("a missing drive wasn't refused: {refused:?}"));
+    }
+    expect_in_log(
+        &idle.dir().join(vmmc_client::LOG_FILE),
+        &["changed the disc in DVD drive 0"],
+        Duration::from_secs(5),
+        0,
+    )?;
     connection.command(&Request::Stop)?;
     wait_until_stopped(&idle)?;
     eprintln!("xtask: a hard stop ended the idle VM");
