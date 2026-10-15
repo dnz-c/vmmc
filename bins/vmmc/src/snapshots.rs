@@ -110,6 +110,11 @@ fn every_state_draws() {
     app.set_screen(Image::from_rgb8(picture));
     app.set_keyboard_captured(true);
     snapshot(&window, "console");
+    app.set_fullscreen(true);
+    app.set_fullscreen_bar(true);
+    snapshot(&window, "fullscreen");
+    app.set_fullscreen(false);
+    app.set_fullscreen_bar(false);
 
     app.set_os_labels(super::strings(
         vmconfig::presets::PRESETS.iter().map(|p| p.label),

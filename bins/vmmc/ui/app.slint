@@ -98,6 +98,7 @@ export component AppWindow inherits Window {
     in property <int> cursor-hot-y;
     in-out property <bool> keyboard-captured;
     in-out property <bool> fullscreen;
+    in-out property <bool> fullscreen-bar;
     in-out property <bool> fit-guest: true;
     in-out property <bool> left;
     in-out property <bool> right;
@@ -162,339 +163,388 @@ export component AppWindow inherits Window {
     in property <string> message-title;
     in property <string> message-text;
 
-    VerticalLayout {
-        HorizontalLayout {
-            // The library.
-            if !root.fullscreen: Rectangle {
-                width: 270px;
-                background: #252526;
-                VerticalLayout {
-                    padding: 10px;
-                    spacing: 8px;
-                    Text {
-                        text: "vmmc";
-                        font-size: 20px;
-                        font-weight: 700;
-                        color: white;
-                    }
-                    HorizontalLayout {
-                        spacing: 6px;
-                        Button {
-                            text: "New VM";
-                            clicked => { root.new-vm(); }
+    // The window's shortcuts: Ctrl+Alt+Enter toggles full screen (as in VMware), Esc
+    // leaves it. They reach the window once Ctrl+Alt has released the keyboard.
+    shortcuts := FocusScope {
+        width: root.width;
+        height: root.height;
+        init => { self.focus(); }
+        key-pressed(event) => {
+            if (event.modifiers.control && event.modifiers.alt && event.text == Key.Return && root.current.running) {
+                root.toggle-fullscreen();
+                return accept;
+            }
+            if (root.fullscreen && event.text == Key.Escape) {
+                root.toggle-fullscreen();
+                return accept;
+            }
+            return reject;
+        }
+        VerticalLayout {
+            HorizontalLayout {
+                // The library.
+                if !root.fullscreen: Rectangle {
+                    width: 270px;
+                    background: #252526;
+                    VerticalLayout {
+                        padding: 10px;
+                        spacing: 8px;
+                        Text {
+                            text: "vmmc";
+                            font-size: 20px;
+                            font-weight: 700;
+                            color: white;
                         }
-                        Button {
-                            text: "Import VMware VM";
-                            clicked => { root.import-vm(); }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Button {
+                                text: "New VM";
+                                clicked => { root.new-vm(); }
+                            }
+                            Button {
+                                text: "Import VMware VM";
+                                clicked => { root.import-vm(); }
+                            }
                         }
-                    }
-                    ListView {
-                        for vm in root.vms: VerticalLayout {
-                            if vm.heading != "": Text {
-                                text: vm.heading;
-                                color: #79c0ff;
-                                font-size: 11px;
-                                font-weight: 700;
-                                height: 24px;
-                                vertical-alignment: bottom;
-                            }
-                            Rectangle {
-                            height: 52px;
-                            background: area.has-hover ? #2f2f33 : transparent;
-                            border-radius: 4px;
-                            area := TouchArea {
-                                clicked => { root.open-vm(vm.path); }
-                            }
-                            HorizontalLayout {
-                                padding: 6px;
-                                spacing: 8px;
+                        ListView {
+                            for vm in root.vms: VerticalLayout {
+                                if vm.heading != "": Text {
+                                    text: vm.heading;
+                                    color: #79c0ff;
+                                    font-size: 11px;
+                                    font-weight: 700;
+                                    height: 24px;
+                                    vertical-alignment: bottom;
+                                }
                                 Rectangle {
-                                    width: 10px;
-                                    height: 10px;
-                                    y: (parent.height - self.height) / 2;
-                                    border-radius: 5px;
-                                    background: vm.running ? #3fb950 : #5a5a5a;
+                                height: 52px;
+                                background: area.has-hover ? #2f2f33 : transparent;
+                                border-radius: 4px;
+                                area := TouchArea {
+                                    clicked => { root.open-vm(vm.path); }
                                 }
-                                VerticalLayout {
-                                    Text {
-                                        text: vm.name;
-                                        color: white;
-                                        overflow: elide;
+                                HorizontalLayout {
+                                    padding: 6px;
+                                    spacing: 8px;
+                                    Rectangle {
+                                        width: 10px;
+                                        height: 10px;
+                                        y: (parent.height - self.height) / 2;
+                                        border-radius: 5px;
+                                        background: vm.running ? #3fb950 : #5a5a5a;
                                     }
-                                    Text {
-                                        text: vm.os;
-                                        color: #9a9a9a;
-                                        font-size: 11px;
-                                        overflow: elide;
+                                    VerticalLayout {
+                                        Text {
+                                            text: vm.name;
+                                            color: white;
+                                            overflow: elide;
+                                        }
+                                        Text {
+                                            text: vm.os;
+                                            color: #9a9a9a;
+                                            font-size: 11px;
+                                            overflow: elide;
+                                        }
                                     }
+                                }
                                 }
                             }
+                        }
+                        Text {
+                            text: root.status-text;
+                            color: #8a8a8a;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        Button {
+                            text: "About vmmc";
+                            clicked => { about.show(); }
+                        }
+                    }
+                }
+
+                VerticalLayout {
+                    // The tabs.
+                    if !root.fullscreen && root.tabs.length > 0: Rectangle {
+                        height: 36px;
+                        background: #252526;
+                        HorizontalLayout {
+                            alignment: start;
+                            for tab[index] in root.tabs: Rectangle {
+                                width: 190px;
+                                background: index == root.current-tab ? #1e1e1e : (tab-area.has-hover ? #2d2d30 : transparent);
+                                tab-area := TouchArea {
+                                    clicked => { root.select-tab(index); }
+                                }
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 4px;
+                                    spacing: 6px;
+                                    Rectangle {
+                                        width: 8px;
+                                        height: 8px;
+                                        y: (parent.height - self.height) / 2;
+                                        border-radius: 4px;
+                                        background: tab.running ? #3fb950 : #5a5a5a;
+                                    }
+                                    Text {
+                                        text: tab.name;
+                                        color: index == root.current-tab ? white : #b0b0b0;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                    Rectangle {
+                                        width: 22px;
+                                        Text {
+                                            text: "×";
+                                            color: close-area.has-hover ? white : #808080;
+                                            font-size: 16px;
+                                        }
+                                        close-area := TouchArea {
+                                            clicked => { root.close-tab(index); }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
-                    Text {
-                        text: root.status-text;
-                        color: #8a8a8a;
-                        font-size: 11px;
-                        wrap: word-wrap;
+
+                    // The current tab.
+                    if root.current-tab < 0: Rectangle {
+                        Text {
+                            text: "Open a VM from the library, or make a new one.";
+                            color: #808080;
+                            font-size: 15px;
+                        }
                     }
-                    Button {
-                        text: "About vmmc";
-                        clicked => { about.show(); }
+                    if root.current-tab >= 0: VerticalLayout {
+                        // The VM's toolbar.
+                        if !root.fullscreen: Rectangle {
+                            height: 44px;
+                            background: #2a2a2a;
+                            HorizontalLayout {
+                                padding: 7px;
+                                spacing: 6px;
+                                if !root.current.running: ToolButton {
+                                    text: "▶ Start";
+                                    primary: true;
+                                    clicked => { root.start-vm(); }
+                                }
+                                if root.current.running: ToolButton {
+                                    text: "Shut down";
+                                    clicked => { root.power-button(); }
+                                }
+                                if root.current.running: ToolButton {
+                                    text: "Power off";
+                                    clicked => { root.stop-vm(); }
+                                }
+                                if root.current.running: ToolButton {
+                                    text: "Reset";
+                                    clicked => { root.reset-vm(); }
+                                }
+                                if root.current.running: ToolButton {
+                                    text: "Ctrl+Alt+Del";
+                                    clicked => { root.ctrl-alt-del(); }
+                                }
+                                if root.current.running: ToolButton {
+                                    text: root.show-console ? "Summary" : "Console";
+                                    clicked => { root.show-console = !root.show-console; }
+                                }
+                                if root.current.running && root.show-console: ToolButton {
+                                    text: "Full screen";
+                                    clicked => { root.toggle-fullscreen(); }
+                                }
+                                if root.current.running && root.show-console: CheckBox {
+                                    text: "Fit guest to window";
+                                    checked <=> root.fit-guest;
+                                }
+                                Rectangle { }
+                                if root.current.running && root.show-console: Text {
+                                    text: root.keyboard-captured ? "Keyboard: guest (Ctrl+Alt releases it)" : "Click the screen to type in the guest";
+                                    color: root.keyboard-captured ? #e3b341 : #8a8a8a;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        // The console.
+                        if root.current.running && root.show-console: console-area := Rectangle {
+                            background: black;
+                            // Screen pixels per guest pixel, as the picture is scaled to fit.
+                            property <float> scale: min(self.width / (root.frame-width * 1phx), self.height / (root.frame-height * 1phx));
+                            init => { root.console-resized(self.width, self.height); }
+                            changed width => { root.console-resized(self.width, self.height); }
+                            changed height => { root.console-resized(self.width, self.height); }
+                            if !root.console-live: Text {
+                                text: "Connecting…";
+                                color: #808080;
+                            }
+                            Image {
+                                source: root.screen;
+                                width: parent.width;
+                                height: parent.height;
+                                image-fit: contain;
+                            }
+                            touch := TouchArea {
+                                mouse-cursor: root.cursor-hardware ? MouseCursor.none : MouseCursor.default;
+                                moved => {
+                                    root.pointer(self.mouse-x, self.mouse-y, console-area.width, console-area.height, root.left, root.right, root.middle, 0);
+                                }
+                                pointer-event(event) => {
+                                    if (event.kind == PointerEventKind.down) {
+                                        root.keyboard-captured = true;
+                                        shortcuts.focus();
+                                    }
+                                    if (event.kind == PointerEventKind.down || event.kind == PointerEventKind.up) {
+                                        if (event.button == PointerEventButton.left) {
+                                            root.left = event.kind == PointerEventKind.down;
+                                        }
+                                        if (event.button == PointerEventButton.right) {
+                                            root.right = event.kind == PointerEventKind.down;
+                                        }
+                                        if (event.button == PointerEventButton.middle) {
+                                            root.middle = event.kind == PointerEventKind.down;
+                                        }
+                                    }
+                                    root.pointer(self.mouse-x, self.mouse-y, console-area.width, console-area.height, root.left, root.right, root.middle, 0);
+                                }
+                                scroll-event(event) => {
+                                    root.pointer(self.mouse-x, self.mouse-y, console-area.width, console-area.height, root.left, root.right, root.middle, event.delta-y > 0 ? 1 : -1);
+                                    accept
+                                }
+                            }
+                            Image {
+                                source: root.cursor-image;
+                                x: touch.mouse-x - root.cursor-hot-x * console-area.scale * 1phx;
+                                y: touch.mouse-y - root.cursor-hot-y * console-area.scale * 1phx;
+                                width: root.cursor-image.width * console-area.scale * 1phx;
+                                height: root.cursor-image.height * console-area.scale * 1phx;
+                                visible: root.cursor-hardware && root.cursor-shown && touch.has-hover;
+                            }
+                        }
+
+                        // The summary.
+                        if !root.current.running || !root.show-console: ScrollView {
+                            VerticalLayout {
+                                padding: 24px;
+                                spacing: 14px;
+                                alignment: start;
+                                Text {
+                                    text: root.current.name;
+                                    font-size: 24px;
+                                    font-weight: 700;
+                                    color: white;
+                                }
+                                Text {
+                                    text: root.current.os + (root.current.running ? " · running" : " · powered off");
+                                    color: root.current.running ? #3fb950 : #9a9a9a;
+                                }
+                                if root.current.origin != "": Text {
+                                    text: root.current.origin;
+                                    color: #79c0ff;
+                                    wrap: word-wrap;
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: start;
+                                    Button {
+                                        text: "Settings";
+                                        enabled: !root.current.running;
+                                        clicked => { root.open-settings(); }
+                                    }
+                                    Button {
+                                        text: "Show files";
+                                        clicked => { root.show-folder(); }
+                                    }
+                                    Button {
+                                        text: "Remove from library";
+                                        enabled: !root.current.running;
+                                        clicked => { root.remove-vm(); }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: start;
+                                    Text {
+                                        text: "Library folder";
+                                        color: #c8c8c8;
+                                        vertical-alignment: center;
+                                    }
+                                    folder := LineEdit {
+                                        width: 220px;
+                                        text: root.current.folder;
+                                        placeholder-text: "none";
+                                    }
+                                    Button {
+                                        text: "Move";
+                                        clicked => { root.move-to-folder(folder.text); }
+                                    }
+                                }
+                                Text {
+                                    text: "Hardware";
+                                    font-weight: 700;
+                                    color: white;
+                                }
+                                Text {
+                                    text: root.current.details;
+                                    color: #d0d0d0;
+                                    wrap: word-wrap;
+                                }
+                                Text {
+                                    text: "Created " + root.current.created + (root.current.started == "" ? "; never started" : "; last started " + root.current.started);
+                                    color: #8a8a8a;
+                                }
+                                Text {
+                                    text: "Notes";
+                                    font-weight: 700;
+                                    color: white;
+                                }
+                                notes := TextEdit {
+                                    height: 140px;
+                                    text: root.current.notes;
+                                    wrap: word-wrap;
+                                }
+                                HorizontalLayout {
+                                    alignment: start;
+                                    Button {
+                                        text: "Save notes";
+                                        clicked => { root.save-notes(notes.text); }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
+        }
+    }
 
-            VerticalLayout {
-                // The tabs.
-                if !root.fullscreen && root.tabs.length > 0: Rectangle {
-                    height: 36px;
-                    background: #252526;
-                    HorizontalLayout {
-                        alignment: start;
-                        for tab[index] in root.tabs: Rectangle {
-                            width: 190px;
-                            background: index == root.current-tab ? #1e1e1e : (tab-area.has-hover ? #2d2d30 : transparent);
-                            tab-area := TouchArea {
-                                clicked => { root.select-tab(index); }
-                            }
-                            HorizontalLayout {
-                                padding-left: 10px;
-                                padding-right: 4px;
-                                spacing: 6px;
-                                Rectangle {
-                                    width: 8px;
-                                    height: 8px;
-                                    y: (parent.height - self.height) / 2;
-                                    border-radius: 4px;
-                                    background: tab.running ? #3fb950 : #5a5a5a;
-                                }
-                                Text {
-                                    text: tab.name;
-                                    color: index == root.current-tab ? white : #b0b0b0;
-                                    vertical-alignment: center;
-                                    overflow: elide;
-                                }
-                                Rectangle {
-                                    width: 22px;
-                                    Text {
-                                        text: "×";
-                                        color: close-area.has-hover ? white : #808080;
-                                        font-size: 16px;
-                                    }
-                                    close-area := TouchArea {
-                                        clicked => { root.close-tab(index); }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // The current tab.
-                if root.current-tab < 0: Rectangle {
-                    Text {
-                        text: "Open a VM from the library, or make a new one.";
-                        color: #808080;
-                        font-size: 15px;
-                    }
-                }
-                if root.current-tab >= 0: VerticalLayout {
-                    // The VM's toolbar.
-                    if !root.fullscreen: Rectangle {
-                        height: 44px;
-                        background: #2a2a2a;
-                        HorizontalLayout {
-                            padding: 7px;
-                            spacing: 6px;
-                            if !root.current.running: ToolButton {
-                                text: "▶ Start";
-                                primary: true;
-                                clicked => { root.start-vm(); }
-                            }
-                            if root.current.running: ToolButton {
-                                text: "Shut down";
-                                clicked => { root.power-button(); }
-                            }
-                            if root.current.running: ToolButton {
-                                text: "Power off";
-                                clicked => { root.stop-vm(); }
-                            }
-                            if root.current.running: ToolButton {
-                                text: "Reset";
-                                clicked => { root.reset-vm(); }
-                            }
-                            if root.current.running: ToolButton {
-                                text: "Ctrl+Alt+Del";
-                                clicked => { root.ctrl-alt-del(); }
-                            }
-                            if root.current.running: ToolButton {
-                                text: root.show-console ? "Summary" : "Console";
-                                clicked => { root.show-console = !root.show-console; }
-                            }
-                            if root.current.running && root.show-console: ToolButton {
-                                text: "Full screen";
-                                clicked => { root.toggle-fullscreen(); }
-                            }
-                            if root.current.running && root.show-console: CheckBox {
-                                text: "Fit guest to window";
-                                checked <=> root.fit-guest;
-                            }
-                            Rectangle { }
-                            if root.current.running && root.show-console: Text {
-                                text: root.keyboard-captured ? "Keyboard: guest (Ctrl+Alt releases it)" : "Click the screen to type in the guest";
-                                color: root.keyboard-captured ? #e3b341 : #8a8a8a;
-                                vertical-alignment: center;
-                            }
-                        }
-                    }
-
-                    // The console.
-                    if root.current.running && root.show-console: console-area := Rectangle {
-                        background: black;
-                        // Screen pixels per guest pixel, as the picture is scaled to fit.
-                        property <float> scale: min(self.width / (root.frame-width * 1phx), self.height / (root.frame-height * 1phx));
-                        init => { root.console-resized(self.width, self.height); }
-                        changed width => { root.console-resized(self.width, self.height); }
-                        changed height => { root.console-resized(self.width, self.height); }
-                        if !root.console-live: Text {
-                            text: "Connecting…";
-                            color: #808080;
-                        }
-                        Image {
-                            source: root.screen;
-                            width: parent.width;
-                            height: parent.height;
-                            image-fit: contain;
-                        }
-                        touch := TouchArea {
-                            mouse-cursor: root.cursor-hardware ? MouseCursor.none : MouseCursor.default;
-                            moved => {
-                                root.pointer(self.mouse-x, self.mouse-y, console-area.width, console-area.height, root.left, root.right, root.middle, 0);
-                            }
-                            pointer-event(event) => {
-                                if (event.kind == PointerEventKind.down) {
-                                    root.keyboard-captured = true;
-                                }
-                                if (event.kind == PointerEventKind.down || event.kind == PointerEventKind.up) {
-                                    if (event.button == PointerEventButton.left) {
-                                        root.left = event.kind == PointerEventKind.down;
-                                    }
-                                    if (event.button == PointerEventButton.right) {
-                                        root.right = event.kind == PointerEventKind.down;
-                                    }
-                                    if (event.button == PointerEventButton.middle) {
-                                        root.middle = event.kind == PointerEventKind.down;
-                                    }
-                                }
-                                root.pointer(self.mouse-x, self.mouse-y, console-area.width, console-area.height, root.left, root.right, root.middle, 0);
-                            }
-                            scroll-event(event) => {
-                                root.pointer(self.mouse-x, self.mouse-y, console-area.width, console-area.height, root.left, root.right, root.middle, event.delta-y > 0 ? 1 : -1);
-                                accept
-                            }
-                        }
-                        Image {
-                            source: root.cursor-image;
-                            x: touch.mouse-x - root.cursor-hot-x * console-area.scale * 1phx;
-                            y: touch.mouse-y - root.cursor-hot-y * console-area.scale * 1phx;
-                            width: root.cursor-image.width * console-area.scale * 1phx;
-                            height: root.cursor-image.height * console-area.scale * 1phx;
-                            visible: root.cursor-hardware && root.cursor-shown && touch.has-hover;
-                        }
-                    }
-
-                    // The summary.
-                    if !root.current.running || !root.show-console: ScrollView {
-                        VerticalLayout {
-                            padding: 24px;
-                            spacing: 14px;
-                            alignment: start;
-                            Text {
-                                text: root.current.name;
-                                font-size: 24px;
-                                font-weight: 700;
-                                color: white;
-                            }
-                            Text {
-                                text: root.current.os + (root.current.running ? " · running" : " · powered off");
-                                color: root.current.running ? #3fb950 : #9a9a9a;
-                            }
-                            if root.current.origin != "": Text {
-                                text: root.current.origin;
-                                color: #79c0ff;
-                                wrap: word-wrap;
-                            }
-                            HorizontalLayout {
-                                spacing: 8px;
-                                alignment: start;
-                                Button {
-                                    text: "Settings";
-                                    enabled: !root.current.running;
-                                    clicked => { root.open-settings(); }
-                                }
-                                Button {
-                                    text: "Show files";
-                                    clicked => { root.show-folder(); }
-                                }
-                                Button {
-                                    text: "Remove from library";
-                                    enabled: !root.current.running;
-                                    clicked => { root.remove-vm(); }
-                                }
-                            }
-                            HorizontalLayout {
-                                spacing: 8px;
-                                alignment: start;
-                                Text {
-                                    text: "Library folder";
-                                    color: #c8c8c8;
-                                    vertical-alignment: center;
-                                }
-                                folder := LineEdit {
-                                    width: 220px;
-                                    text: root.current.folder;
-                                    placeholder-text: "none";
-                                }
-                                Button {
-                                    text: "Move";
-                                    clicked => { root.move-to-folder(folder.text); }
-                                }
-                            }
-                            Text {
-                                text: "Hardware";
-                                font-weight: 700;
-                                color: white;
-                            }
-                            Text {
-                                text: root.current.details;
-                                color: #d0d0d0;
-                                wrap: word-wrap;
-                            }
-                            Text {
-                                text: "Created " + root.current.created + (root.current.started == "" ? "; never started" : "; last started " + root.current.started);
-                                color: #8a8a8a;
-                            }
-                            Text {
-                                text: "Notes";
-                                font-weight: 700;
-                                color: white;
-                            }
-                            notes := TextEdit {
-                                height: 140px;
-                                text: root.current.notes;
-                                wrap: word-wrap;
-                            }
-                            HorizontalLayout {
-                                alignment: start;
-                                Button {
-                                    text: "Save notes";
-                                    clicked => { root.save-notes(notes.text); }
-                                }
-                            }
-                        }
-                    }
-                }
+    // In full screen, a bar at the top: it shows on entering, and when the pointer
+    // touches the top edge.
+    if root.fullscreen && root.fullscreen-bar: Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: 46px;
+        background: #202020e8;
+        TouchArea { }
+        HorizontalLayout {
+            padding: 8px;
+            spacing: 8px;
+            alignment: center;
+            Button {
+                text: "Exit full screen";
+                primary: true;
+                clicked => { root.toggle-fullscreen(); }
+            }
+            Button {
+                text: "Ctrl+Alt+Del";
+                clicked => { root.ctrl-alt-del(); }
+            }
+            Text {
+                text: "Ctrl+Alt releases the keyboard; then Ctrl+Alt+Enter or Esc leaves full screen.";
+                color: #c8c8c8;
+                vertical-alignment: center;
             }
         }
     }

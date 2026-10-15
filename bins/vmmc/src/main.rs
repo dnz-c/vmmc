@@ -732,13 +732,26 @@ fn wire(window: &AppWindow, app: &Shared) {
             if let Some(window) = w.upgrade() {
                 let full = !window.get_fullscreen();
                 window.set_fullscreen(full);
+                // The bar shows at first, so the way out is plain to see.
+                window.set_fullscreen_bar(full);
                 window.window().set_fullscreen(full);
             }
         });
     }
     {
         let app = app.clone();
+        let w = weak();
         window.on_pointer(move |x, y, width, height, left, right, middle, wheel| {
+            // In full screen, the top edge brings the bar, and leaving it hides it.
+            if let Some(window) = w.upgrade()
+                && window.get_fullscreen()
+            {
+                if y < 3.0 {
+                    window.set_fullscreen_bar(true);
+                } else if y > 60.0 {
+                    window.set_fullscreen_bar(false);
+                }
+            }
             let state = app.borrow();
             let Some(console) = state.console.as_ref() else {
                 return;
