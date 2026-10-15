@@ -1,0 +1,30 @@
+[package]
+name = "vmmc"
+description = "vmmc's desktop app: the VM library, Easy Install, and each VM's console"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ipc.workspace = true
+slint.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+vmconfig.workspace = true
+vmmc-client.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+keyhook.workspace = true
+windows = { workspace = true, features = [
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+] }
+
+[build-dependencies]
+slint-build.workspace = true
+
+[lints]
+workspace = true
