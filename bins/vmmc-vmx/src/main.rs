@@ -444,13 +444,16 @@ fn disks(args: &RunArgs) -> Vec<DiskConfig> {
     let mut cdroms = Vec::new();
     let mut disks = Vec::new();
     if let Some(vm) = &args.loaded {
-        cdroms.extend(
-            vm.config
-                .cdroms
-                .iter()
-                .filter_map(|drive| drive.path.as_deref())
-                .map(|path| cdrom(vm.resolve(path))),
-        );
+        // An empty drive has no path (and keeps its place for a disc later).
+        cdroms.extend(vm.config.cdroms.iter().map(|drive| {
+            cdrom(
+                drive
+                    .path
+                    .as_deref()
+                    .map(|path| vm.resolve(path))
+                    .unwrap_or_default(),
+            )
+        }));
         disks.extend(vm.config.disks.iter().map(|disk| DiskConfig {
             path: vm.resolve(&disk.path),
             read_only: disk.read_only,

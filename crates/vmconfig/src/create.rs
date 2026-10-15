@@ -130,12 +130,16 @@ pub fn create_vm(new: &NewVm) -> Result<Vm, String> {
         bus: preset.bus,
         read_only: false,
     });
-    if let Some(iso) = new.iso {
-        config.cdroms.push(Cdrom {
-            path: Some(absolute(iso)?.display().to_string()),
-            install_media: new.easy_install.is_some(),
-        });
-    }
+    // A DVD drive, as on a PC: empty without an ISO, there for a disc later (vmmc
+    // Tools, say).
+    config.cdroms.push(Cdrom {
+        path: new
+            .iso
+            .map(absolute)
+            .transpose()?
+            .map(|path| path.display().to_string()),
+        install_media: new.iso.is_some() && new.easy_install.is_some(),
+    });
     if let Some(install) = &new.easy_install {
         let iso = new.iso.ok_or("Easy Install needs the OS's ISO")?;
         let (disc, install) = answer_disc(new.name, iso, install)?;

@@ -50,6 +50,9 @@ const CURSOR_TIMEOUT: Duration = Duration::from_secs(240);
 const LOGON_HELPER: &str = "VMMC-DISP: logon helper=";
 /// The version stamped into the INF.
 const DRIVER_VERSION: &str = "0.2.0.0";
+/// The vmmc Tools disc `guest-drivers` makes, beside the package: the driver package,
+/// the test certificate, and setup (`guest-drivers/windows/tools`).
+pub const TOOLS_ISO: &str = "vmmc-tools.iso";
 /// The display driver's package.
 const PACKAGE: [&str; 4] = [
     "vmmcdisp.inf",
@@ -294,6 +297,9 @@ pub fn build(trace: bool) -> Result<Drivers, String> {
         display.display(),
         certificate.display()
     );
+    let tools = out.join(TOOLS_ISO);
+    write_tools_iso(&display, &certificate, &tools)?;
+    eprintln!("xtask: vmmc Tools disc in {}", tools.display());
     Ok(Drivers {
         display,
         certificate,
@@ -435,6 +441,31 @@ pub fn display_test() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The vmmc Tools disc: setup (with Windows line ends), the driver package and the
+/// certificate it's signed with, all in the root.
+fn write_tools_iso(package: &Path, certificate: &Path, iso: &Path) -> Result<(), String> {
+    let source = workspace()
+        .join("guest-drivers")
+        .join("windows")
+        .join("tools");
+    let mut files = Vec::new();
+    for name in ["setup.cmd", "setup.ps1", "autorun.inf"] {
+        let text = String::from_utf8(read(&source.join(name))?)
+            .map_err(|_| format!("{name} isn't UTF-8"))?;
+        files.push((name.to_owned(), windows::crlf(&text).into_bytes()));
+    }
+    for name in PACKAGE {
+        files.push((name.to_owned(), read(&package.join(name))?));
+    }
+    files.push(("vmmc-test-signing.cer".to_owned(), read(certificate)?));
+    let files: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(name, data)| (name.as_str(), data.as_slice()))
+        .collect();
+    fs::write(iso, media::iso::build("VMMC_TOOLS", &files, None))
+        .map_err(|e| format!("can't write {}: {e}", iso.display()))
 }
 
 fn read(path: &Path) -> Result<Vec<u8>, String> {

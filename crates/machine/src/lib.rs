@@ -440,12 +440,25 @@ impl<P: Partition + 'static> Machine<P> {
             let mut sata_drives = Vec::new();
             for disk in &config.disks {
                 let read_only = disk.read_only || disk.interface == DiskInterface::Cdrom;
-                let backend = disk::open(&disk.path, read_only).map_err(|source| Error::Disk {
-                    path: disk.path.clone(),
-                    source,
-                })?;
+                // An empty DVD drive has no path.
+                let empty =
+                    disk.interface == DiskInterface::Cdrom && disk.path.as_os_str().is_empty();
+                let backend = if empty {
+                    None
+                } else {
+                    Some(
+                        disk::open(&disk.path, read_only).map_err(|source| Error::Disk {
+                            path: disk.path.clone(),
+                            source,
+                        })?,
+                    )
+                };
                 let id = disk_id(&disk.path);
                 let serial: String = id[..6].iter().map(|b| format!("{b:02X}")).collect();
+                let Some(backend) = backend else {
+                    sata_drives.push(Drive::Cdrom(Cdrom::new(None, &format!("VMMC{serial}"))));
+                    continue;
+                };
                 match disk.interface {
                     DiskInterface::Nvme => namespaces.push(Namespace { backend, nguid: id }),
                     DiskInterface::Virtio => virtio_disks.push(backend),
