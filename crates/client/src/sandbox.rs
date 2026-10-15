@@ -75,6 +75,11 @@ pub fn interactive() -> bool {
     named.is_ok() && String::from_utf16_lossy(&name[..len]).eq_ignore_ascii_case("WinSta0")
 }
 
+/// How a sandboxed process ends when its desktop doesn't let it in: Windows can't
+/// start its DLLs (user32's needs the window station and desktop). Seen on GitHub's
+/// hosted runners, whose desktop doesn't admit a restricted, low-integrity token.
+pub const DLL_INIT_FAILED: u32 = 0xc000_0142;
+
 /// Token group flags (in SystemServices, which this crate doesn't otherwise need).
 const SE_GROUP_INTEGRITY: u32 = 0x20;
 const SE_GROUP_LOGON_ID: u32 = 0xc000_0000;
@@ -577,6 +582,10 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while process.exit_code().is_none() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if process.exit_code() == Some(DLL_INIT_FAILED) {
+            eprintln!("skipped: this desktop doesn't admit sandboxed processes (a CI runner?)");
+            return;
         }
         let output = format!(
             "exit {:?}: {}",
