@@ -138,6 +138,12 @@ pub fn start(vm: &Vm) -> Result<Connection, String> {
         return Err(format!("{} is running already", vm.config.name));
     }
     let sandboxed = !sandbox_disabled();
+    if sandboxed && !sandbox::interactive() {
+        return Err(
+            "a sandboxed VM can only start from the desktop, not from a service or SSH session (or set VMMC_NO_SANDBOX=1)"
+                .into(),
+        );
+    }
     if sandboxed && let Some(outside) = disks_outside(vm).first() {
         return Err(format!(
             "{} is outside the VM's folder, where the sandboxed VM can't write: move it into {} (or run with VMMC_NO_SANDBOX=1)",

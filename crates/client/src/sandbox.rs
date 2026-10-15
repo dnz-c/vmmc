@@ -49,6 +49,32 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 
+/// Whether this process runs on the interactive window station (`WinSta0`), the
+/// desktop's. Only there can a sandboxed process start: elsewhere (a service, an SSH
+/// session, a CI runner) its restricted token gets no access to the window station,
+/// and Windows fails its DLLs' start-up (STATUS_DLL_INIT_FAILED).
+pub fn interactive() -> bool {
+    use windows::Win32::System::StationsAndDesktops::{
+        GetProcessWindowStation, GetUserObjectInformationW, UOI_NAME,
+    };
+    let mut name = [0u16; 64];
+    // SAFETY: plain calls; the station handle isn't ours to close, and the buffer's
+    // size in bytes is passed.
+    let named = unsafe {
+        GetProcessWindowStation().and_then(|station| {
+            GetUserObjectInformationW(
+                HANDLE(station.0),
+                UOI_NAME,
+                Some(name.as_mut_ptr().cast()),
+                std::mem::size_of_val(&name) as u32,
+                None,
+            )
+        })
+    };
+    let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    named.is_ok() && String::from_utf16_lossy(&name[..len]).eq_ignore_ascii_case("WinSta0")
+}
+
 /// Token group flags (in SystemServices, which this crate doesn't otherwise need).
 const SE_GROUP_INTEGRITY: u32 = 0x20;
 const SE_GROUP_LOGON_ID: u32 = 0xc000_0000;
@@ -528,6 +554,10 @@ mod tests {
 
     #[test]
     fn a_sandboxed_process_runs_at_low_integrity_and_can_write_only_where_allowed() {
+        if !interactive() {
+            eprintln!("skipped: not on the interactive desktop (a CI runner?)");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let allowed = dir.path().join("vm");
         std::fs::create_dir(&allowed).unwrap();
