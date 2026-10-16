@@ -1734,6 +1734,7 @@ checksum = "48ce8546b993eaf241d69ded33b1be6d205dd9857ec879d9d18bd05d3676e144"
 name = "hv"
 version = "0.0.1"
 dependencies = [
+ "serde",
  "thiserror 2.0.21",
 ]
 
@@ -1743,6 +1744,7 @@ version = "0.0.1"
 dependencies = [
  "hv",
  "iced-x86",
+ "tracing",
  "vm-core",
  "windows",
 ]

@@ -14,7 +14,8 @@ use windows::Win32::System::Hypervisor::{
     WHV_CAPABILITY_CODE, WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_STATUS, WHV_INTERRUPT_CONTROL,
     WHV_MAP_GPA_RANGE_FLAGS, WHV_MEMORY_ACCESS_CONTEXT, WHV_PARTITION_HANDLE,
     WHV_PARTITION_PROPERTY_CODE, WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_TRANSLATE_GVA_FLAGS,
-    WHV_TRANSLATE_GVA_RESULT, WHV_VP_EXIT_CONTEXT, WHV_X64_IO_PORT_ACCESS_CONTEXT,
+    WHV_TRANSLATE_GVA_RESULT, WHV_VIRTUAL_PROCESSOR_STATE_TYPE, WHV_VP_EXIT_CONTEXT,
+    WHV_X64_IO_PORT_ACCESS_CONTEXT,
 };
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
@@ -73,6 +74,15 @@ whp_api! {
             buffer: *const c_void,
             buffer_size: u32,
         );
+        WHvGetPartitionProperty(
+            partition: WHV_PARTITION_HANDLE,
+            code: WHV_PARTITION_PROPERTY_CODE,
+            buffer: *mut c_void,
+            buffer_size: u32,
+            written_size: *mut u32,
+        );
+        WHvSuspendPartitionTime(partition: WHV_PARTITION_HANDLE);
+        WHvResumePartitionTime(partition: WHV_PARTITION_HANDLE);
         WHvMapGpaRange(
             partition: WHV_PARTITION_HANDLE,
             source: *const c_void,
@@ -110,6 +120,21 @@ whp_api! {
             names: *const WHV_REGISTER_NAME,
             count: u32,
             values: *const WHV_REGISTER_VALUE,
+        );
+        WHvGetVirtualProcessorState(
+            partition: WHV_PARTITION_HANDLE,
+            index: u32,
+            kind: WHV_VIRTUAL_PROCESSOR_STATE_TYPE,
+            buffer: *mut c_void,
+            buffer_size: u32,
+            written_size: *mut u32,
+        );
+        WHvSetVirtualProcessorState(
+            partition: WHV_PARTITION_HANDLE,
+            index: u32,
+            kind: WHV_VIRTUAL_PROCESSOR_STATE_TYPE,
+            buffer: *const c_void,
+            buffer_size: u32,
         );
         WHvRequestInterrupt(
             partition: WHV_PARTITION_HANDLE,

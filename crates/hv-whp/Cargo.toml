@@ -11,6 +11,7 @@ publish.workspace = true
 hv.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+tracing.workspace = true
 windows.workspace = true
 
 [dev-dependencies]

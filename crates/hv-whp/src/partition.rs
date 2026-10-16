@@ -8,7 +8,7 @@ use windows::Win32::System::Hypervisor::{
     WHvCapabilityCodeSyntheticProcessorFeaturesBanks, WHvMapGpaRangeFlagExecute,
     WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite, WHvPartitionPropertyCodeCpuidExitList,
     WHvPartitionPropertyCodeExtendedVmExits, WHvPartitionPropertyCodeLocalApicEmulationMode,
-    WHvPartitionPropertyCodeProcessorCount,
+    WHvPartitionPropertyCodeProcessorCount, WHvPartitionPropertyCodeReferenceTime,
     WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks, WHvX64LocalApicEmulationModeX2Apic,
     WHvX64LocalApicEmulationModeXApic,
 };
@@ -74,6 +74,11 @@ pub(crate) struct PartitionInner {
     pub handle: WHV_PARTITION_HANDLE,
     /// How many vCPUs the partition has.
     pub vcpus: u32,
+    /// Whether the guest has the Hyper-V enlightenments, whose state a vCPU's includes.
+    pub enlightenments: bool,
+    /// The registers this host's vCPUs have, of those a saved state is made of: found
+    /// out at the first save.
+    pub saved_registers: std::sync::OnceLock<crate::state::Registers>,
 }
 
 impl PartitionInner {
@@ -159,6 +164,8 @@ impl WhpPartition {
             api,
             handle,
             vcpus: config.vcpu_count,
+            enlightenments: config.enlightenments,
+            saved_registers: std::sync::OnceLock::new(),
         });
 
         inner.set_property(WHvPartitionPropertyCodeProcessorCount, &config.vcpu_count)?;
@@ -253,5 +260,40 @@ impl hv::Partition for WhpPartition {
 
     fn interrupts(&self) -> WhpInterrupts {
         WhpInterrupts::new(Arc::downgrade(&self.inner))
+    }
+
+    fn suspend_time(&self) -> hv::Result<()> {
+        // SAFETY: plain call on a valid partition handle.
+        check("WHvSuspendPartitionTime", unsafe {
+            (self.inner.api.WHvSuspendPartitionTime)(self.inner.handle)
+        })
+    }
+
+    fn resume_time(&self) -> hv::Result<()> {
+        // SAFETY: plain call on a valid partition handle.
+        check("WHvResumePartitionTime", unsafe {
+            (self.inner.api.WHvResumePartitionTime)(self.inner.handle)
+        })
+    }
+
+    fn save_state(&self) -> hv::Result<hv::PartitionState> {
+        let mut reference_time = 0u64;
+        let mut written = 0u32;
+        // SAFETY: `reference_time` is a writable u64, the property's type.
+        check("WHvGetPartitionProperty", unsafe {
+            (self.inner.api.WHvGetPartitionProperty)(
+                self.inner.handle,
+                WHvPartitionPropertyCodeReferenceTime,
+                (&raw mut reference_time).cast::<c_void>(),
+                size_of::<u64>() as u32,
+                &mut written,
+            )
+        })?;
+        Ok(hv::PartitionState { reference_time })
+    }
+
+    fn restore_state(&self, state: &hv::PartitionState) -> hv::Result<()> {
+        self.inner
+            .set_property(WHvPartitionPropertyCodeReferenceTime, &state.reference_time)
     }
 }

@@ -11,6 +11,7 @@ mod emulator;
 mod interrupts;
 mod partition;
 mod regs;
+mod state;
 mod vcpu;
 
 use std::ffi::c_void;

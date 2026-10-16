@@ -5,11 +5,13 @@
 //! crate, so backend-specific types never leak into the rest of the engine.
 
 mod regs;
+mod state;
 
 use std::fmt;
 use std::ops::BitOr;
 
 pub use regs::{DescriptorTable, Segment, SpecialRegisters, StandardRegisters};
+pub use state::{PartitionState, VcpuState};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -26,6 +28,12 @@ pub enum Error {
     },
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    /// This backend can't do it.
+    #[error("this hypervisor can't {0}")]
+    Unsupported(&'static str),
+    /// Saved state this backend can't restore, and why.
+    #[error("can't restore the saved state: {0}")]
+    BadState(String),
 }
 
 /// Where the guest's local APIC lives.
@@ -196,6 +204,28 @@ pub trait Partition: Send + Sync {
 
     /// Returns a handle that injects interrupts from any thread.
     fn interrupts(&self) -> Self::Interrupts;
+
+    /// Stops the guest's clocks: its reference time, TSCs and timers stand still until
+    /// [`Partition::resume_time`]. Snapshots are taken, and restored, with time
+    /// suspended, so the guest sees no time pass in between.
+    fn suspend_time(&self) -> Result<()> {
+        Err(Error::Unsupported("suspend guest time"))
+    }
+
+    fn resume_time(&self) -> Result<()> {
+        Err(Error::Unsupported("suspend guest time"))
+    }
+
+    /// The partition's own state, with time suspended.
+    fn save_state(&self) -> Result<PartitionState> {
+        Err(Error::Unsupported("save VM state"))
+    }
+
+    /// Puts back what [`Partition::save_state`] saved, with time suspended and before
+    /// any vCPU runs.
+    fn restore_state(&self, _state: &PartitionState) -> Result<()> {
+        Err(Error::Unsupported("restore VM state"))
+    }
 }
 
 /// A virtual processor. Runs on whichever thread calls [`Vcpu::run`].
@@ -218,6 +248,18 @@ pub trait Vcpu: Send {
 
     /// Returns a handle that can interrupt [`Vcpu::run`] from another thread.
     fn kicker(&self) -> Self::Kicker;
+
+    /// The vCPU's whole state, while it isn't running and the partition's time is
+    /// suspended.
+    fn save_state(&self) -> Result<VcpuState> {
+        Err(Error::Unsupported("save vCPU state"))
+    }
+
+    /// Puts back what [`Vcpu::save_state`] saved, while the partition's time is
+    /// suspended. The vCPU then runs on from where it was.
+    fn restore_state(&mut self, _state: &VcpuState) -> Result<()> {
+        Err(Error::Unsupported("restore vCPU state"))
+    }
 
     /// The local APIC's registers as its 4 KiB xAPIC register page, for debugging.
     /// `None` when the backend can't read them.

@@ -3,8 +3,8 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
 use hv::{
-    CpuIo, Hypervisor, MemoryAccess, Partition, PartitionConfig, SpecialRegisters,
-    StandardRegisters, Vcpu, VcpuExit, VcpuKicker,
+    CpuIo, Hypervisor, MemoryAccess, Partition, PartitionConfig, PartitionState, SpecialRegisters,
+    StandardRegisters, Vcpu, VcpuExit, VcpuKicker, VcpuState,
 };
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
 
@@ -218,6 +218,26 @@ impl<P: Partition> Vm<P> {
         self.stop.clone()
     }
 
+    /// Stops the guest's clocks until [`Vm::resume_time`] (see
+    /// [`Partition::suspend_time`]).
+    pub fn suspend_time(&self) -> Result<()> {
+        Ok(self.shared.partition.suspend_time()?)
+    }
+
+    pub fn resume_time(&self) -> Result<()> {
+        Ok(self.shared.partition.resume_time()?)
+    }
+
+    /// The partition's own state, with time suspended.
+    pub fn save_state(&self) -> Result<PartitionState> {
+        Ok(self.shared.partition.save_state()?)
+    }
+
+    /// Puts back what [`Vm::save_state`] saved, with time suspended.
+    pub fn restore_state(&self, state: &PartitionState) -> Result<()> {
+        Ok(self.shared.partition.restore_state(state)?)
+    }
+
     /// Sets what happens when a guest local APIC finishes a level-triggered interrupt.
     pub fn set_eoi_handler(&mut self, handler: impl Fn(u8) + Send + Sync + 'static) {
         self.eoi = Some(Box::new(handler));
@@ -269,6 +289,16 @@ impl<P: Partition> VmVcpu<'_, P> {
 
     pub fn set_waiting_for_sipi(&mut self) -> Result<()> {
         Ok(self.vcpu.set_waiting_for_sipi()?)
+    }
+
+    /// The vCPU's whole state, with the VM's time suspended.
+    pub fn save_state(&self) -> Result<VcpuState> {
+        Ok(self.vcpu.save_state()?)
+    }
+
+    /// Puts back what [`VmVcpu::save_state`] saved, with the VM's time suspended.
+    pub fn restore_state(&mut self, state: &VcpuState) -> Result<()> {
+        Ok(self.vcpu.restore_state(state)?)
     }
 
     pub fn kicker(&self) -> <P::Vcpu as Vcpu>::Kicker {

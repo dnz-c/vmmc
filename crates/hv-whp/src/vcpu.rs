@@ -22,8 +22,8 @@ const STARTUP_SUSPEND: u64 = 1;
 
 /// A WHP virtual processor.
 pub struct WhpVcpu {
-    partition: Arc<PartitionInner>,
-    index: u32,
+    pub(crate) partition: Arc<PartitionInner>,
+    pub(crate) index: u32,
     exit: Aligned16<WHV_RUN_VP_EXIT_CONTEXT>,
     emulator: Emulator,
 }
@@ -205,6 +205,14 @@ impl hv::Vcpu for WhpVcpu {
 
     fn set_sregs(&mut self, s: &SpecialRegisters) -> hv::Result<()> {
         self.set_registers(&regs::SPECIAL_NAMES, &regs::special_to_values(s))
+    }
+
+    fn save_state(&self) -> hv::Result<hv::VcpuState> {
+        crate::state::save_vcpu(self)
+    }
+
+    fn restore_state(&mut self, state: &hv::VcpuState) -> hv::Result<()> {
+        crate::state::restore_vcpu(self, state)
     }
 
     fn local_apic(&self) -> hv::Result<Option<Vec<u8>>> {
