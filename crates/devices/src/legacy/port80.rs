@@ -4,11 +4,24 @@
 
 use vm_core::BusDevice;
 
+use crate::snapshot::{self, Snapshot, StateError};
+
 pub const POST_PORT: u16 = 0x80;
 
 #[derive(Debug, Default)]
 pub struct PostPort {
     last: u8,
+}
+
+impl Snapshot for PostPort {
+    fn save(&self) -> Vec<u8> {
+        snapshot::encode(&self.last)
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), StateError> {
+        self.last = snapshot::decode(state)?;
+        Ok(())
+    }
 }
 
 impl BusDevice for PostPort {

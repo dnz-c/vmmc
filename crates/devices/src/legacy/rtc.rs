@@ -9,10 +9,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use vm_core::BusDevice;
 
 use crate::clock::Clock;
 use crate::irq::IrqLine;
+use crate::snapshot::{self, Snapshot, StateError};
 use crate::timer::{Ticker, TimerMode};
 
 /// Index and data ports.
@@ -148,6 +150,55 @@ pub struct Rtc {
     /// read: its flags for updates and periods that passed since are derived from them.
     c_read_second: i64,
     c_read_at: Duration,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RtcState {
+    index: usize,
+    ram: Vec<u8>,
+    offset: i64,
+    setting: Option<i64>,
+    flags: u8,
+    enables: u8,
+    c_read_second: i64,
+    c_read_at: Duration,
+}
+
+impl Snapshot for Rtc {
+    fn save(&self) -> Vec<u8> {
+        snapshot::encode(&RtcState {
+            index: self.index,
+            ram: self.ram.to_vec(),
+            offset: self.offset,
+            setting: self.setting,
+            flags: self.interrupt.flags.load(Ordering::Acquire),
+            enables: self.interrupt.enables.load(Ordering::Acquire),
+            c_read_second: self.c_read_second,
+            c_read_at: self.c_read_at,
+        })
+    }
+
+    /// The guest's clock goes on from the host's: it stays as far from it as it was,
+    /// and so, like a real RTC, it counts the time the VM was saved.
+    fn restore(&mut self, state: &[u8]) -> Result<(), StateError> {
+        let state: RtcState = snapshot::decode(state)?;
+        self.index = state.index & 0x7f;
+        self.ram = state
+            .ram
+            .try_into()
+            .map_err(|_| StateError("the CMOS RAM was a different size".into()))?;
+        self.offset = state.offset;
+        self.setting = state.setting;
+        self.interrupt.flags.store(state.flags, Ordering::Release);
+        self.interrupt
+            .enables
+            .store(state.enables, Ordering::Release);
+        self.c_read_second = state.c_read_second;
+        self.c_read_at = state.c_read_at;
+        self.programmed = None;
+        self.reprogram();
+        Ok(())
+    }
 }
 
 impl Rtc {
@@ -467,6 +518,31 @@ mod tests {
     fn write(rtc: &mut Rtc, index: u8, value: u8) {
         rtc.write(0, &[index]);
         rtc.write(1, &[value]);
+    }
+
+    #[test]
+    fn a_restored_rtc_keeps_the_guests_time_and_periodic_interrupt() {
+        use crate::snapshot::Snapshot;
+        let mut f = fixture();
+        // The guest sets the clock an hour ahead, in binary, and turns on 64 Hz.
+        write(&mut f.rtc, REG_B as u8, B_SET | B_24_HOUR | B_BINARY);
+        let hour = read(&mut f.rtc, HOURS as u8);
+        write(&mut f.rtc, HOURS as u8, (hour + 1) % 24);
+        write(&mut f.rtc, REG_B as u8, B_24_HOUR | B_BINARY | B_PERIODIC);
+        write(&mut f.rtc, REG_A as u8, 0x2a);
+        write(&mut f.rtc, 0x40, 0x5a);
+        let state = f.rtc.save();
+
+        let mut g = fixture();
+        g.rtc.restore(&state).unwrap();
+        assert_eq!(read(&mut g.rtc, HOURS as u8), (hour + 1) % 24);
+        assert_eq!(read(&mut g.rtc, 0x40), 0x5a);
+        assert_eq!(
+            g.ticker.last(),
+            Some(Some(TimerMode::Periodic(Duration::from_nanos(
+                1_000_000_000 / 64
+            ))))
+        );
     }
 
     #[test]

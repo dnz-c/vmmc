@@ -8,9 +8,11 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use vm_core::BusDevice;
 
 use crate::clock::Clock;
+use crate::snapshot::{self, Snapshot, StateError};
 use crate::timer::{Ticker, TimerMode};
 
 /// First of the four PIT ports (counters 0–2, then the mode/command register).
@@ -32,7 +34,7 @@ const REFRESH: u8 = 1 << 4;
 const OUT2: u8 = 1 << 5;
 const REFRESH_PERIOD_NS: u128 = 15_085;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Access {
     LowByte,
     HighByte,
@@ -57,7 +59,7 @@ impl Access {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Channel {
     mode: u8,
     access: Access,
@@ -303,6 +305,27 @@ impl Pit {
         }
     }
 
+    /// Sets the IRQ0 timer going as a restored channel 0 has it: periodic modes on
+    /// their period, a one-shot count for the rest of it, if it hasn't run out.
+    fn restore_irq0(&self) {
+        let channel = &self.channels[0];
+        if !channel.loaded {
+            self.irq0.program(None);
+            return;
+        }
+        if matches!(channel.mode, 2 | 3) {
+            return self.program_irq0();
+        }
+        let left = channel
+            .reload()
+            .saturating_sub(channel.ticks(self.clock.now()));
+        self.irq0.program(
+            (left > 0).then(|| {
+                TimerMode::OneShot(Duration::from_nanos(left * 1_000_000_000 / FREQUENCY))
+            }),
+        );
+    }
+
     /// Reprograms the IRQ0 timer after channel 0 got a new count.
     fn program_irq0(&self) {
         let channel = &self.channels[0];
@@ -363,6 +386,29 @@ impl BusDevice for Pit {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct PitState {
+    channels: [Channel; 3],
+    port61: u8,
+}
+
+impl Snapshot for Pit {
+    fn save(&self) -> Vec<u8> {
+        snapshot::encode(&PitState {
+            channels: self.channels.clone(),
+            port61: self.port61,
+        })
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), StateError> {
+        let state: PitState = snapshot::decode(state)?;
+        self.channels = state.channels;
+        self.port61 = state.port61;
+        self.restore_irq0();
+        Ok(())
+    }
+}
+
 /// Port 0x61, as a bus device sharing the PIT.
 pub struct Port61(pub Arc<Mutex<Pit>>);
 
@@ -415,6 +461,29 @@ mod tests {
     /// The time `ticks` PIT input clocks take, rounded up so the tick has happened.
     fn ticks(ticks: u64) -> Duration {
         Duration::from_nanos((ticks * 1_000_000_000).div_ceil(FREQUENCY))
+    }
+
+    #[test]
+    fn a_restored_pit_counts_on_and_runs_its_timer() {
+        use crate::snapshot::Snapshot;
+        let (mut saved, clock, _) = pit();
+        // Channel 0, mode 2, count 1000.
+        out(&mut saved, 3, 0x34);
+        out(&mut saved, 0, 0xe8);
+        out(&mut saved, 0, 0x03);
+        clock.advance(ticks(300));
+        let state = saved.save();
+
+        // A new PIT, on a clock that has gone on to the same time.
+        let (mut restored, restored_clock, ticker) = pit();
+        restored_clock.advance(ticks(300));
+        restored.restore(&state).unwrap();
+        let period = Duration::from_nanos(1000 * 1_000_000_000 / FREQUENCY);
+        assert_eq!(ticker.last(), Some(Some(TimerMode::Periodic(period))));
+        out(&mut restored, 3, 0x00);
+        let count = u16::from_le_bytes([inb(&mut restored, 0), inb(&mut restored, 0)]);
+        assert_eq!(count, 700);
+        assert_eq!(restored.save(), state);
     }
 
     #[test]

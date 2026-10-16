@@ -3,10 +3,12 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use vm_core::BusDevice;
 
 use crate::clock::Clock;
 use crate::irq::IrqLine;
+use crate::snapshot::{self, Snapshot, StateError};
 use crate::{PowerEvent, PowerHandler};
 
 /// I/O base of the PM block, as on Q35/ICH9 (and where OVMF puts it).
@@ -50,6 +52,32 @@ pub struct AcpiPm {
     clock: Arc<dyn Clock>,
     sci: IrqLine,
     power: PowerHandler,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AcpiPmState {
+    status: u16,
+    enable: u16,
+    control: u16,
+}
+
+impl Snapshot for AcpiPm {
+    fn save(&self) -> Vec<u8> {
+        snapshot::encode(&AcpiPmState {
+            status: self.status,
+            enable: self.enable,
+            control: self.control,
+        })
+    }
+
+    /// The SCI's level is in the restored IOAPIC already.
+    fn restore(&mut self, state: &[u8]) -> Result<(), StateError> {
+        let state: AcpiPmState = snapshot::decode(state)?;
+        self.status = state.status;
+        self.enable = state.enable;
+        self.control = state.control;
+        Ok(())
+    }
 }
 
 impl AcpiPm {

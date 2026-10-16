@@ -5,7 +5,10 @@
 //! It does not deliver interrupts yet: on WHP that needs ExtINT injection, which arrives
 //! with firmware boot.
 
+use serde::{Deserialize, Serialize};
 use vm_core::BusDevice;
+
+use crate::snapshot::{self, Snapshot, StateError};
 
 /// Command/data ports of the master and slave controllers.
 pub const MASTER_BASE: u16 = 0x20;
@@ -16,7 +19,7 @@ pub const ELCR_BASE: u16 = 0x4d0;
 pub const ELCR_PORTS: u16 = 2;
 
 /// Where an initialization sequence is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Init {
     Done,
     Icw2,
@@ -25,7 +28,7 @@ enum Init {
 }
 
 /// One 8259A.
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pic8259 {
     imr: u8,
     irr: u8,
@@ -150,9 +153,31 @@ impl BusDevice for Pic8259 {
     }
 }
 
+impl Snapshot for Pic8259 {
+    fn save(&self) -> Vec<u8> {
+        snapshot::encode(self)
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), StateError> {
+        *self = snapshot::decode(state)?;
+        Ok(())
+    }
+}
+
 /// Edge/level control registers (ELCR) at 0x4d0/0x4d1.
 #[derive(Debug, Default)]
 pub struct Elcr([u8; 2]);
+
+impl Snapshot for Elcr {
+    fn save(&self) -> Vec<u8> {
+        snapshot::encode(&self.0)
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), StateError> {
+        self.0 = snapshot::decode(state)?;
+        Ok(())
+    }
+}
 
 /// Bits that must stay edge-triggered: IRQ0, 1 and 2 on the master; IRQ8 and 13 on the
 /// slave.

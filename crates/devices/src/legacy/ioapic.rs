@@ -5,9 +5,11 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use vm_core::BusDevice;
 
 use crate::irq::{MSI_ADDRESS_BASE, MsiMessage, MsiSink};
+use crate::snapshot::{self, Snapshot, StateError};
 
 /// Guest-physical base address of the I/O APIC's registers.
 pub const IOAPIC_BASE: u64 = 0xfec0_0000;
@@ -45,6 +47,37 @@ pub struct IoApic {
     /// Current level of each input pin.
     levels: [bool; NUM_PINS],
     sink: Arc<dyn MsiSink>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct IoApicState {
+    id: u8,
+    select: u8,
+    redirection: Vec<u64>,
+    levels: Vec<bool>,
+}
+
+impl Snapshot for IoApic {
+    fn save(&self) -> Vec<u8> {
+        snapshot::encode(&IoApicState {
+            id: self.id,
+            select: self.select,
+            redirection: self.redirection.to_vec(),
+            levels: self.levels.to_vec(),
+        })
+    }
+
+    /// Interrupts the saved state had in flight are in the saved local APICs: nothing
+    /// is sent again.
+    fn restore(&mut self, state: &[u8]) -> Result<(), StateError> {
+        let state: IoApicState = snapshot::decode(state)?;
+        let pins = || StateError("the IOAPIC had a different number of pins".into());
+        self.id = state.id;
+        self.select = state.select;
+        self.redirection = state.redirection.try_into().map_err(|_| pins())?;
+        self.levels = state.levels.try_into().map_err(|_| pins())?;
+        Ok(())
+    }
 }
 
 impl IoApic {
@@ -236,6 +269,26 @@ mod tests {
             u32::from(destination) << 24,
         );
         write_reg(ioapic, REG_REDIRECTION + 2 * pin, low);
+    }
+
+    #[test]
+    fn a_restored_ioapic_routes_as_before() {
+        use crate::snapshot::testing;
+        let sink = Arc::new(RecordingSink::default());
+        let mut ioapic = IoApic::new(0, sink.clone());
+        // Pin 3: level-triggered, vector 0x43, raised and in service.
+        ioapic.write(IOREGSEL, &[0x16]);
+        ioapic.write(IOWIN, &(0x43 | TRIGGER_LEVEL as u32).to_le_bytes());
+        ioapic.set_level(3, true);
+        assert_eq!(sink.take().len(), 1);
+
+        let fresh_sink = Arc::new(RecordingSink::default());
+        let mut fresh = IoApic::new(0, fresh_sink.clone());
+        testing::round_trip(&ioapic, &mut fresh);
+        assert!(fresh_sink.take().is_empty(), "restoring sends nothing");
+        // Its EOI fires the pin again, which is still high.
+        fresh.end_of_interrupt(0x43);
+        assert_eq!(fresh_sink.take()[0].vector(), 0x43);
     }
 
     #[test]

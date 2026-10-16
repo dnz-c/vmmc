@@ -13,6 +13,7 @@ pub mod irq;
 pub mod legacy;
 pub mod nic;
 pub mod pci;
+pub mod snapshot;
 pub mod storage;
 pub mod timer;
 pub mod tpm;

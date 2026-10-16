@@ -2,10 +2,15 @@
 
 use std::io::Write;
 
+use serde::{Deserialize, Serialize};
 use vm_core::BusDevice;
 use vm_superio::Trigger;
+use vm_superio::serial::SerialState;
 
 use crate::irq::IrqLine;
+use crate::snapshot::{self, Snapshot, StateError};
+
+type Uart = vm_superio::Serial<IrqTrigger, vm_superio::serial::NoEvents, Box<dyn Write + Send>>;
 
 /// COM1's I/O base and IRQ.
 pub const COM1_BASE: u16 = 0x3f8;
@@ -13,6 +18,7 @@ pub const COM1_IRQ: u8 = 4;
 pub const SERIAL_PORTS: u16 = 8;
 
 /// Pulses the UART's (edge-triggered) ISA interrupt line.
+#[derive(Clone)]
 pub struct IrqTrigger(IrqLine);
 
 impl Trigger for IrqTrigger {
@@ -25,21 +31,87 @@ impl Trigger for IrqTrigger {
 }
 
 pub struct Serial {
-    uart: vm_superio::Serial<IrqTrigger, vm_superio::serial::NoEvents, Box<dyn Write + Send>>,
+    /// `None` only for a moment, while restoring.
+    uart: Option<Uart>,
+    irq: IrqTrigger,
+}
+
+/// [`SerialState`], which isn't serde.
+#[derive(Serialize, Deserialize)]
+struct UartState {
+    baud_divisor_low: u8,
+    baud_divisor_high: u8,
+    interrupt_enable: u8,
+    interrupt_identification: u8,
+    line_control: u8,
+    line_status: u8,
+    modem_control: u8,
+    modem_status: u8,
+    scratch: u8,
+    in_buffer: Vec<u8>,
+}
+
+impl Snapshot for Serial {
+    fn save(&self) -> Vec<u8> {
+        let state = self.uart().state();
+        snapshot::encode(&UartState {
+            baud_divisor_low: state.baud_divisor_low,
+            baud_divisor_high: state.baud_divisor_high,
+            interrupt_enable: state.interrupt_enable,
+            interrupt_identification: state.interrupt_identification,
+            line_control: state.line_control,
+            line_status: state.line_status,
+            modem_control: state.modem_control,
+            modem_status: state.modem_status,
+            scratch: state.scratch,
+            in_buffer: state.in_buffer,
+        })
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), StateError> {
+        let state: UartState = snapshot::decode(state)?;
+        let state = SerialState {
+            baud_divisor_low: state.baud_divisor_low,
+            baud_divisor_high: state.baud_divisor_high,
+            interrupt_enable: state.interrupt_enable,
+            interrupt_identification: state.interrupt_identification,
+            line_control: state.line_control,
+            line_status: state.line_status,
+            modem_control: state.modem_control,
+            modem_status: state.modem_status,
+            scratch: state.scratch,
+            in_buffer: state.in_buffer,
+        };
+        let out = self.uart.take().expect("the UART is there").into_writer();
+        let uart = Uart::from_state(&state, self.irq.clone(), vm_superio::serial::NoEvents, out)
+            .map_err(|e| StateError(format!("serial port: {e:?}")))?;
+        self.uart = Some(uart);
+        Ok(())
+    }
 }
 
 impl Serial {
     /// A UART that writes the guest's output to `out` and interrupts on `irq`.
     pub fn new(irq: IrqLine, out: Box<dyn Write + Send>) -> Self {
+        let irq = IrqTrigger(irq);
         Self {
-            uart: vm_superio::Serial::new(IrqTrigger(irq), out),
+            uart: Some(vm_superio::Serial::new(irq.clone(), out)),
+            irq,
         }
+    }
+
+    fn uart(&self) -> &Uart {
+        self.uart.as_ref().expect("the UART is there")
+    }
+
+    fn uart_mut(&mut self) -> &mut Uart {
+        self.uart.as_mut().expect("the UART is there")
     }
 
     /// Queues host input for the guest. Returns how many bytes fit; the rest should be
     /// offered again once the guest has read some.
     pub fn enqueue_input(&mut self, input: &[u8]) -> usize {
-        match self.uart.enqueue_raw_bytes(input) {
+        match self.uart_mut().enqueue_raw_bytes(input) {
             Ok(count) => count,
             Err(vm_superio::serial::Error::FullFifo) => 0,
             Err(e) => {
@@ -52,11 +124,11 @@ impl Serial {
 
 impl BusDevice for Serial {
     fn read(&mut self, offset: u64, data: &mut [u8]) {
-        data.fill(self.uart.read(offset as u8));
+        data.fill(self.uart_mut().read(offset as u8));
     }
 
     fn write(&mut self, offset: u64, data: &[u8]) {
-        if let Err(e) = self.uart.write(offset as u8, data[0]) {
+        if let Err(e) = self.uart_mut().write(offset as u8, data[0]) {
             tracing::warn!(%e, "serial output failed");
         }
     }
@@ -102,6 +174,27 @@ mod tests {
         let out = Captured::default();
         let serial = Serial::new(IrqLine::new(ioapic, COM1_IRQ), Box::new(out.clone()));
         (serial, out, sink)
+    }
+
+    #[test]
+    fn a_restored_uart_keeps_its_input_and_settings() {
+        use crate::snapshot::testing;
+        let (mut saved, _, _) = serial();
+        saved.write(3, &[0x83]); // DLAB, 8 bits
+        saved.write(0, &[0x01]); // 115200 baud
+        saved.write(3, &[0x03]);
+        saved.enqueue_input(b"ab");
+        let (mut fresh, out, _) = serial();
+        testing::round_trip(&saved, &mut fresh);
+        let mut data = [0u8];
+        fresh.read(0, &mut data);
+        assert_eq!(data[0], b'a');
+        fresh.write(0, b"x");
+        assert_eq!(
+            *out.0.lock().unwrap(),
+            b"x",
+            "output still goes to the writer"
+        );
     }
 
     #[test]

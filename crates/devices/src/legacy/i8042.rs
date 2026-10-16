@@ -13,9 +13,11 @@
 
 use std::collections::VecDeque;
 
+use serde::{Deserialize, Serialize};
 use vm_core::BusDevice;
 
 use crate::irq::IrqLine;
+use crate::snapshot::{self, Snapshot, StateError};
 use crate::{PowerEvent, PowerHandler};
 
 /// Data port; the status/command port is at `I8042_DATA + 4`.
@@ -42,7 +44,7 @@ const RESEND: u8 = 0xfe;
 const SELF_TEST_PASSED: u8 = 0xaa;
 
 /// Where a byte in the output buffer came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Source {
     Controller,
     Keyboard,
@@ -50,7 +52,7 @@ enum Source {
 }
 
 /// What the next byte written to the data port means.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Pending {
     /// A byte for the keyboard.
     Keyboard,
@@ -75,6 +77,45 @@ pub struct I8042 {
     irq1: IrqLine,
     irq12: IrqLine,
     power: PowerHandler,
+}
+
+#[derive(Serialize, Deserialize)]
+struct I8042State {
+    config: u8,
+    pending: Pending,
+    last_was_command: bool,
+    buffer: Option<(u8, Source)>,
+    controller: VecDeque<u8>,
+    keyboard: Keyboard,
+    mouse: Mouse,
+}
+
+impl Snapshot for I8042 {
+    fn save(&self) -> Vec<u8> {
+        snapshot::encode(&I8042State {
+            config: self.config,
+            pending: self.pending,
+            last_was_command: self.last_was_command,
+            buffer: self.buffer,
+            controller: self.controller.clone(),
+            keyboard: self.keyboard.clone(),
+            mouse: self.mouse.clone(),
+        })
+    }
+
+    /// A byte waiting in the output buffer was already announced: its interrupt is in
+    /// the restored interrupt controllers.
+    fn restore(&mut self, state: &[u8]) -> Result<(), StateError> {
+        let state: I8042State = snapshot::decode(state)?;
+        self.config = state.config;
+        self.pending = state.pending;
+        self.last_was_command = state.last_was_command;
+        self.buffer = state.buffer;
+        self.controller = state.controller;
+        self.keyboard = state.keyboard;
+        self.mouse = state.mouse;
+        Ok(())
+    }
 }
 
 impl I8042 {
@@ -248,7 +289,7 @@ impl BusDevice for I8042CommandPort {
 pub const PAUSE: u16 = 0xe11d;
 
 /// What the next byte written to the keyboard means.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum KeyboardArgument {
     None,
     Leds,
@@ -257,6 +298,7 @@ enum KeyboardArgument {
 }
 
 /// A PS/2 MF2 keyboard.
+#[derive(Clone, Serialize, Deserialize)]
 struct Keyboard {
     output: VecDeque<u8>,
     argument: KeyboardArgument,
@@ -417,7 +459,7 @@ fn set1_to_set2(code: u8) -> Option<u8> {
 }
 
 /// What the next byte written to the mouse means.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum MouseArgument {
     None,
     Resolution,
@@ -425,6 +467,7 @@ enum MouseArgument {
 }
 
 /// A PS/2 mouse that becomes an IntelliMouse (with a wheel) when the guest knocks.
+#[derive(Clone, Serialize, Deserialize)]
 struct Mouse {
     output: VecDeque<u8>,
     argument: MouseArgument,
@@ -649,6 +692,25 @@ mod tests {
     fn to_mouse(dev: &mut I8042, value: u8) {
         command(dev, 0xd4);
         dev.write(0, &[value]);
+    }
+
+    #[test]
+    fn a_restored_controller_hands_over_what_was_waiting() {
+        use crate::snapshot::Snapshot;
+        let mut f = i8042();
+        // Two keys waiting, the first already in the output buffer.
+        f.dev.key(0x1e, true);
+        f.dev.key(0x1e, false);
+        let state = f.dev.save();
+
+        let mut g = i8042();
+        g.dev.restore(&state).unwrap();
+        assert_eq!(read_all(&mut g.dev), [0x1e, 0x9e]);
+        assert_eq!(g.dev.save(), {
+            f.dev.restore(&state).unwrap();
+            read_all(&mut f.dev);
+            f.dev.save()
+        });
     }
 
     #[test]
