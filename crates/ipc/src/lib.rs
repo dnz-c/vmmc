@@ -16,7 +16,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// The protocol version; both ends must speak the same one.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 /// No message is larger.
 pub const MAX_MESSAGE: usize = 1 << 20;
 
@@ -59,6 +59,20 @@ pub enum Request {
         drive: u32,
         path: Option<String>,
     },
+    /// Takes a snapshot of the running VM, with its memory: answered with
+    /// [`Response::Snapshot`].
+    Snapshot {
+        name: String,
+        description: String,
+    },
+    /// Reverts the VM to a snapshot (by ID or name): what it did since is gone. A
+    /// snapshot of a running VM carries on from its state; one taken while the VM was
+    /// off leaves it off, and the worker exits.
+    Revert {
+        snapshot: String,
+    },
+    /// Saves the VM's state and stops it; starting it again resumes it. The worker exits.
+    Suspend,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +91,11 @@ pub enum Response {
     Screen {
         handle: u64,
         size: u64,
+    },
+    /// A snapshot was taken: its ID, and how long the guest was paused for it.
+    Snapshot {
+        id: String,
+        paused_ms: u64,
     },
     Error(String),
 }

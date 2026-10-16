@@ -517,6 +517,12 @@ impl<P: Partition + 'static> Machine<P> {
                     switchable_disks.push(switchable.clone());
                     switchable as Arc<dyn disk::BlockBackend>
                 });
+                tracing::debug!(
+                    path = %disk.path.display(),
+                    read_only,
+                    backend_read_only = backend.as_ref().map(|backend| backend.is_read_only()),
+                    "disk"
+                );
                 let serial: String = id[..6].iter().map(|b| format!("{b:02X}")).collect();
                 let Some(backend) = backend else {
                     sata_drives.push(Drive::Cdrom(Cdrom::new(None, &format!("VMMC{serial}"))));

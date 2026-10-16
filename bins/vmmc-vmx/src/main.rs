@@ -554,6 +554,7 @@ fn run(args: RunArgs, frontend: Frontend) -> Result<RunOutcome, Box<dyn Error>> 
         None => None,
     };
     let targets = console::Targets::new(screenshots.clone(), args.save_state.clone());
+    targets.set_vm(args.loaded.clone());
     let _raw = match frontend {
         Frontend::Console => {
             let raw = console::RawConsole::enable();
@@ -655,7 +656,22 @@ fn run_machines(
         .loaded
         .as_ref()
         .and_then(|vm| install::Installer::start(vm, targets.clone()));
+    // A suspended VM resumes.
+    let mut resuming = None;
+    if args.restore.is_none()
+        && let Some(vm) = &args.loaded
+    {
+        let suspended = vmconfig::snapshots::suspended_file(vm);
+        if suspended.is_file() {
+            args.restore = Some(suspended.clone());
+            resuming = Some(suspended);
+        }
+    }
     loop {
+        // A snapshot or a revert changes the VM's disks.
+        if let Some(vm) = targets.vm() {
+            args.loaded = Some(vm);
+        }
         // Only one VM may have memory mapped per process, so the previous machine is
         // gone before the next one is built.
         let mut machine = Machine::new(
@@ -689,11 +705,30 @@ fn run_machines(
                 fs::File::open(&path).map_err(|e| format!("can't open {}: {e}", path.display()))?;
             machine
                 .restore(&mut std::io::BufReader::with_capacity(1 << 20, file))
-                .map_err(|e| format!("can't restore {}: {e}", path.display()))?;
+                .map_err(|e| {
+                    if resuming.is_some() {
+                        format!(
+                            "can't resume from {}: {e}. Delete it to start the VM afresh, \
+                             as after a power cut",
+                            path.display()
+                        )
+                    } else {
+                        format!("can't restore {}: {e}", path.display())
+                    }
+                })?;
             eprint!(
                 "\r\nvmmc-vmx: restored the VM's state from {}\r\n",
                 path.display()
             );
+            // A suspended state is used up: the VM goes on from it.
+            if let Some(suspended) = resuming.take()
+                && let Err(e) = fs::remove_file(&suspended)
+            {
+                eprint!(
+                    "\r\nvmmc-vmx: can't remove {}: {e}\r\n",
+                    suspended.display()
+                );
+            }
         }
         targets.set(Some(console::Target {
             serial: machine.serial_input(),
@@ -705,9 +740,42 @@ fn run_machines(
             usb: machine.usb_input(),
             discs: machine.disc_drives(),
             snapshot: machine.snapshotter(),
+            disks: machine.disks(),
         }));
         let outcome = machine.run();
         targets.set(None);
+        if let Some(console::Restart::Revert { snapshot, done }) = targets.take_restart() {
+            // The machine's disks close before the revert changes them.
+            drop(machine);
+            let reverted = (|| {
+                // As it is now: a snapshot since this machine started moved its disks.
+                let mut vm = targets
+                    .vm()
+                    .or_else(|| args.loaded.clone())
+                    .ok_or("the VM has no file")?;
+                let state = vmconfig::snapshots::revert(&mut vm, &snapshot)?;
+                targets.set_vm(Some(vm.clone()));
+                args.loaded = Some(vm);
+                Ok::<_, String>(state)
+            })();
+            match reverted {
+                Ok(Some(state)) => {
+                    args.restore = Some(state);
+                    let _ = done.send(Ok("reverted to the snapshot".into()));
+                    continue;
+                }
+                Ok(None) => {
+                    let _ = done.send(Ok(
+                        "reverted to the snapshot, which was taken with the VM off".into(),
+                    ));
+                    return Ok(RunOutcome::PowerOff);
+                }
+                Err(e) => {
+                    let _ = done.send(Err(e.clone()));
+                    return Err(e.into());
+                }
+            }
+        }
         // The end of an install: start again from the disk, the install discs out.
         if let (Some(installer), Ok(ended)) = (&installer, &outcome)
             && !targets.quitting()

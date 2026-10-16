@@ -130,6 +130,76 @@ pub fn tools_iso() -> Option<PathBuf> {
 /// The vmmc Tools disc's file name.
 pub const TOOLS_ISO: &str = "vmmc-tools.iso";
 
+/// Whether `vm` is suspended: its next start resumes it.
+pub fn is_suspended(vm: &Vm) -> bool {
+    vmconfig::snapshots::suspended_file(vm).is_file()
+}
+
+/// Takes a snapshot of `vm`: of a running VM through its worker, with its memory, or
+/// of a VM that's off. Returns what happened, to tell the user.
+#[cfg(windows)]
+pub fn take_snapshot(vm: &mut Vm, name: &str, description: &str) -> Result<String, String> {
+    if let Ok(mut connection) = connect(vm, Duration::from_secs(2)) {
+        return match connection.call(&Request::Snapshot {
+            name: name.to_owned(),
+            description: description.to_owned(),
+        })? {
+            Response::Snapshot { paused_ms, .. } => Ok(format!(
+                "took snapshot {name:?} of the running VM (it paused for {paused_ms} ms)"
+            )),
+            other => Err(format!("unexpected answer {other:?}")),
+        };
+    }
+    if is_suspended(vm) {
+        return Err(format!(
+            "{} is suspended: start it, or discard its suspended state, first",
+            vm.config.name
+        ));
+    }
+    vmconfig::snapshots::take(vm, name, description)?;
+    Ok(format!("took snapshot {name:?}"))
+}
+
+/// Reverts `vm` to a snapshot, by ID or name: a running VM through its worker, which
+/// carries on from the snapshot. A VM that's off resumes from it when started, if it
+/// was taken while the VM ran.
+#[cfg(windows)]
+pub fn revert(vm: &mut Vm, snapshot: &str) -> Result<String, String> {
+    if let Ok(mut connection) = connect(vm, Duration::from_secs(2)) {
+        connection.command(&Request::Revert {
+            snapshot: snapshot.to_owned(),
+        })?;
+        return Ok("reverted the running VM".into());
+    }
+    let tree = vmconfig::snapshots::Tree::load(vm).map_err(|e| e.to_string())?;
+    let id = tree
+        .find(snapshot)
+        .ok_or_else(|| format!("{} has no snapshot {snapshot:?}", vm.config.name))?
+        .id
+        .clone();
+    match vmconfig::snapshots::revert(vm, &id)? {
+        Some(state) => {
+            let suspended = vmconfig::snapshots::suspended_file(vm);
+            std::fs::copy(&state, &suspended)
+                .map_err(|e| format!("can't copy {}: {e}", state.display()))?;
+            Ok("reverted; the VM resumes from the snapshot when it starts".into())
+        }
+        None => Ok("reverted".into()),
+    }
+}
+
+/// Suspends the running `vm`: its state is saved, and its next start resumes it.
+#[cfg(windows)]
+pub fn suspend(vm: &Vm) -> Result<(), String> {
+    let mut connection = connect(vm, Duration::from_secs(2))?;
+    match connection.command(&Request::Suspend) {
+        Ok(()) => Ok(()),
+        // The worker ends as it answers; the state says whether it was saved.
+        Err(_) if is_suspended(vm) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Puts the vmmc Tools disc into the running VM's first DVD drive. Returns what the
 /// user should know next.
 #[cfg(windows)]

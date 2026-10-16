@@ -123,6 +123,73 @@ fn new_vm(root: &Path, name: &str) -> Result<Vm, String> {
     })
 }
 
+/// Snapshots of the running idle VM through its worker: one with its memory, a revert
+/// to it, a suspend, and the start that resumes it.
+fn snapshots(vm: &mut Vm) -> Result<(), String> {
+    let log = vm.dir().join(vmmc_client::LOG_FILE);
+    let restored = |log: &Path| log_text(log).matches("restored the VM's state").count();
+    let image = vm.resolve(&vm.config.disks[0].path);
+    eprintln!(
+        "xtask: {}",
+        vmmc_client::take_snapshot(vm, "In the firmware", "")?
+    );
+    *vm = Vm::load(&vm.path).map_err(|e| e.to_string())?;
+    let tree = vmconfig::snapshots::Tree::load(vm).map_err(|e| e.to_string())?;
+    let snapshot = tree
+        .find("In the firmware")
+        .ok_or("the snapshot isn't in the tree")?;
+    if !snapshot.running || !vmconfig::snapshots::state_file(vm, &snapshot.id).is_file() {
+        return Err("the snapshot has no memory state".into());
+    }
+    let delta = vm.resolve(&vm.config.disks[0].path);
+    if delta == image || !delta.is_file() {
+        return Err(format!(
+            "the disk didn't move to a delta: {}",
+            delta.display()
+        ));
+    }
+
+    // Reverted while it runs: the worker carries on from the snapshot.
+    eprintln!("xtask: {}", vmmc_client::revert(vm, "In the firmware")?);
+    let deadline = Instant::now() + TIMEOUT;
+    while restored(&log) < 1 {
+        if Instant::now() > deadline {
+            return Err("the reverted VM didn't start from the snapshot".into());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    *vm = Vm::load(&vm.path).map_err(|e| e.to_string())?;
+    if vmmc_client::connect(vm, Duration::from_secs(5))?
+        .status()?
+        .state
+        != ipc::State::Running
+    {
+        return Err("the reverted VM isn't running".into());
+    }
+    // The delta that held what came after the snapshot is gone.
+    if delta.exists() {
+        return Err(format!("the revert left {}", delta.display()));
+    }
+
+    // Suspended, then resumed by its next start.
+    vmmc_client::suspend(vm)?;
+    wait_until_stopped(vm)?;
+    if !vmmc_client::is_suspended(vm) {
+        return Err("the suspended VM has no saved state".into());
+    }
+    vmmc_client::start(vm)?;
+    let deadline = Instant::now() + TIMEOUT;
+    // The new worker's log starts afresh.
+    while restored(&log) < 1 || vmmc_client::is_suspended(vm) {
+        if Instant::now() > deadline {
+            return Err("the suspended VM didn't resume".into());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    eprintln!("xtask: snapshot, revert, suspend and resume worked through the worker");
+    Ok(())
+}
+
 pub fn test() -> Result<(), String> {
     let workspace = workspace();
     let native = native::fetch(&workspace)?;
@@ -191,7 +258,7 @@ pub fn test() -> Result<(), String> {
     drop((connection, screen));
 
     // 2. Nothing to boot: the firmware waits, until a hard stop.
-    let idle = new_vm(&root, "Idle")?;
+    let mut idle = new_vm(&root, "Idle")?;
     let mut connection = vmmc_client::start(&idle)?;
     let again = vmmc_client::start(&idle).err().unwrap_or_default();
     if !again.contains("running already") {
@@ -228,6 +295,13 @@ pub fn test() -> Result<(), String> {
         Duration::from_secs(5),
         0,
     )?;
+    if let Err(e) = snapshots(&mut idle) {
+        if let Ok(mut connection) = vmmc_client::connect(&idle, Duration::from_secs(2)) {
+            let _ = connection.command(&Request::Stop);
+        }
+        return Err(e);
+    }
+    let mut connection = vmmc_client::connect(&idle, Duration::from_secs(5))?;
     connection.command(&Request::Stop)?;
     wait_until_stopped(&idle)?;
     eprintln!("xtask: a hard stop ended the idle VM");

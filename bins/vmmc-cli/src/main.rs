@@ -81,6 +81,109 @@ enum Command {
     /// Disk images.
     #[command(subcommand)]
     Disk(DiskCommand),
+    /// Snapshots: a VM as it was, to go back to.
+    #[command(subcommand)]
+    Snapshot(SnapshotCommand),
+    /// Save a running VM's state and stop it; its next start resumes it.
+    Suspend { vm: String },
+}
+
+#[derive(Subcommand)]
+enum SnapshotCommand {
+    /// Take a snapshot: of a running VM with its memory, or of one that's off.
+    Create {
+        vm: String,
+        name: String,
+        #[arg(long, default_value = "")]
+        description: String,
+    },
+    /// A VM's snapshots, as the tree they make.
+    List { vm: String },
+    /// Go back to a snapshot (by name or ID): what the VM did since is gone.
+    Revert { vm: String, snapshot: String },
+    /// Delete a snapshot. Its disk images stay, under the disks that came after it.
+    Delete { vm: String, snapshot: String },
+}
+
+/// A VM's snapshots, indented under the one each was taken from.
+fn snapshot_tree(tree: &vmconfig::snapshots::Tree) -> String {
+    fn walk(
+        tree: &vmconfig::snapshots::Tree,
+        parent: Option<&str>,
+        depth: usize,
+        lines: &mut Vec<String>,
+    ) {
+        for snapshot in tree.children(parent) {
+            let mut line = format!(
+                "{}{}  ({}{})",
+                "  ".repeat(depth),
+                snapshot.name,
+                snapshot.created,
+                if snapshot.running {
+                    ", with memory"
+                } else {
+                    ""
+                }
+            );
+            if tree.current.as_deref() == Some(snapshot.id.as_str()) {
+                line += "  <- the VM goes on from here";
+            }
+            lines.push(line);
+            if !snapshot.description.is_empty() {
+                lines.push(format!("{}  {}", "  ".repeat(depth), snapshot.description));
+            }
+            walk(tree, Some(&snapshot.id), depth + 1, lines);
+        }
+    }
+    let mut lines = Vec::new();
+    walk(tree, None, 0, &mut lines);
+    if lines.is_empty() {
+        "no snapshots".into()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn snapshot_command(command: SnapshotCommand) -> Result<(), String> {
+    match command {
+        SnapshotCommand::List { vm } => {
+            let vm = find_vm(&vm)?;
+            let tree = vmconfig::snapshots::Tree::load(&vm).map_err(|e| e.to_string())?;
+            println!("{}", snapshot_tree(&tree));
+        }
+        SnapshotCommand::Delete { vm, snapshot } => {
+            let vm = find_vm(&vm)?;
+            let tree = vmconfig::snapshots::Tree::load(&vm).map_err(|e| e.to_string())?;
+            let found = tree
+                .find(&snapshot)
+                .ok_or_else(|| format!("{} has no snapshot {snapshot:?}", vm.config.name))?;
+            let name = found.name.clone();
+            vmconfig::snapshots::delete(&vm, &found.id.clone())?;
+            println!("deleted snapshot {name:?}");
+        }
+        #[cfg(windows)]
+        SnapshotCommand::Create {
+            vm,
+            name,
+            description,
+        } => {
+            let mut vm = find_vm(&vm)?;
+            println!(
+                "{}",
+                vmmc_client::take_snapshot(&mut vm, &name, &description)?
+            );
+        }
+        #[cfg(windows)]
+        SnapshotCommand::Revert { vm, snapshot } => {
+            let mut vm = find_vm(&vm)?;
+            println!("{}", vmmc_client::revert(&mut vm, &snapshot)?);
+        }
+        #[cfg(not(windows))]
+        SnapshotCommand::Create { .. } | SnapshotCommand::Revert { .. } => {
+            return Err("snapshots need Windows for now".into());
+        }
+    }
+    Ok(())
 }
 
 #[derive(Args)]
@@ -305,6 +408,8 @@ fn list() -> Result<String, String> {
             Ok(vm) => {
                 let started = if running(&vm) {
                     "running".into()
+                } else if vmmc_client::is_suspended(&vm) {
+                    "suspended".into()
                 } else {
                     vm.config
                         .last_powered_on
@@ -387,6 +492,14 @@ fn worker_command(command: Command) -> Result<(), String> {
             let vm = find_vm(&vm)?;
             println!("{}", vmmc_client::insert_tools(&vm)?);
         }
+        Command::Suspend { vm } => {
+            let vm = find_vm(&vm)?;
+            vmmc_client::suspend(&vm)?;
+            println!(
+                "{} is suspended: `vmmc-cli start` resumes it",
+                vm.config.name
+            );
+        }
         Command::Status { vm } => {
             let vm = find_vm(&vm)?;
             match connect(&vm) {
@@ -453,7 +566,9 @@ fn run(command: Command) -> Result<(), String> {
         | Command::Stop { .. }
         | Command::Reset { .. }
         | Command::Status { .. }
+        | Command::Suspend { .. }
         | Command::Tools { .. }) => worker_command(command)?,
+        Command::Snapshot(command) => snapshot_command(command)?,
         Command::Add { file, folder } => {
             let file = std::path::absolute(&file).map_err(|e| e.to_string())?;
             vmconfig::Vm::load(&file).map_err(|e| e.to_string())?;

@@ -188,11 +188,14 @@ pub struct Pending {
 }
 
 /// Starts a snapshot: says where each writable disk's delta goes and where the state
-/// goes. Nothing is written yet.
+/// goes, and makes the folder for it.
 pub fn begin(vm: &Vm, name: &str, description: &str) -> Result<Pending, String> {
     if name.trim().is_empty() {
         return Err("a snapshot needs a name".into());
     }
+    let snapshots = dir(vm);
+    fs::create_dir_all(&snapshots)
+        .map_err(|e| format!("can't create {}: {e}", snapshots.display()))?;
     let id = crate::format_uuid(&crate::random_uuid());
     let mut deltas = Vec::new();
     for disk in vm.config.disks.iter().filter(|disk| !disk.read_only) {

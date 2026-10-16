@@ -147,13 +147,46 @@ fn serve_client(shared: &Shared, mut pipe: std::fs::File) {
 
 fn handle(shared: &Shared, request: Request) -> Response {
     let targets = &shared.targets;
-    let target = targets.get();
     match request {
         Request::Hello { .. } => Response::Error("already said hello".into()),
+        // Before taking the machine's handles: a revert waits for the machine to stop,
+        // and its disks must close then.
+        Request::Snapshot { name, description } => {
+            match targets.take_snapshot(&name, &description) {
+                Ok((id, paused)) => {
+                    eprintln!(
+                        "vmmc-vmx: took snapshot {name:?} (paused for {} ms)",
+                        paused.as_millis()
+                    );
+                    Response::Snapshot {
+                        id,
+                        paused_ms: paused.as_millis() as u64,
+                    }
+                }
+                Err(e) => Response::Error(format!("can't take the snapshot: {e}")),
+            }
+        }
+        Request::Revert { snapshot } => match targets.revert(&snapshot) {
+            Ok(done) => {
+                eprintln!("vmmc-vmx: {done}");
+                Response::Done
+            }
+            Err(e) => Response::Error(format!("can't revert: {e}")),
+        },
+        Request::Suspend => match targets.suspend() {
+            Ok(paused) => {
+                eprintln!(
+                    "vmmc-vmx: suspended (paused for {} ms to save)",
+                    paused.as_millis()
+                );
+                Response::Done
+            }
+            Err(e) => Response::Error(format!("can't suspend: {e}")),
+        },
         Request::Status => {
             let picture = shared.picture.load(Ordering::Relaxed);
             Response::Status(Status {
-                state: if target.is_some() {
+                state: if targets.get().is_some() {
                     State::Running
                 } else {
                     State::Starting
@@ -171,7 +204,7 @@ fn handle(shared: &Shared, request: Request) -> Response {
             size: ipc::screen::SECTION_LEN as u64,
         },
         request => {
-            let Some(target) = target else {
+            let Some(target) = targets.get() else {
                 return Response::Error("the VM is starting".into());
             };
             match request {
@@ -205,7 +238,13 @@ fn handle(shared: &Shared, request: Request) -> Response {
                     slot.change(medium);
                     eprintln!("vmmc-vmx: a client changed the disc in DVD drive {drive}");
                 }
-                Request::Hello { .. } | Request::Status | Request::Stop | Request::Screen => {
+                Request::Hello { .. }
+                | Request::Status
+                | Request::Stop
+                | Request::Screen
+                | Request::Snapshot { .. }
+                | Request::Revert { .. }
+                | Request::Suspend => {
                     unreachable!("handled above")
                 }
             }

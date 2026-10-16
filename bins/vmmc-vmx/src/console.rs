@@ -11,7 +11,7 @@
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -24,6 +24,10 @@ const CTRL_A: u8 = 0x01;
 
 /// The stop code used when the user quits with Ctrl-A x.
 pub const QUIT_CODE: u32 = 0;
+/// The stop code a revert stops the machine with, for the run loop to revert it.
+pub const REVERT_CODE: u32 = 7;
+/// How long a revert may take.
+const REVERT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// What a piece of terminal input means.
 #[derive(Debug, PartialEq, Eq)]
@@ -151,6 +155,40 @@ pub struct Target {
     pub usb: UsbInput,
     pub discs: Vec<machine::DiscDrive>,
     pub snapshot: machine::Snapshotter,
+    /// The writable disks, in the VM file's order.
+    pub disks: Vec<Arc<disk::Switchable>>,
+}
+
+/// What the run loop does once the machine has stopped.
+pub enum Restart {
+    /// Reverts the VM to a snapshot, and says how that went.
+    Revert {
+        snapshot: String,
+        done: mpsc::Sender<Result<String, String>>,
+    },
+}
+
+/// Moves each disk's writes to its delta, or, if one can't, puts back the ones already
+/// moved.
+fn switch_disks(disks: &[Arc<disk::Switchable>], deltas: &[PathBuf]) -> Result<(), String> {
+    let images: Vec<PathBuf> = disks.iter().map(|disk| disk.path()).collect();
+    for (index, (disk, delta)) in disks.iter().zip(deltas).enumerate() {
+        if let Err(e) = disk.switch_to_delta(delta) {
+            unswitch(&disks[..index], &images, deltas);
+            return Err(format!("{}: {e}", images[index].display()));
+        }
+    }
+    Ok(())
+}
+
+/// Puts each disk back on its image, and removes the delta it had moved to.
+fn unswitch(disks: &[Arc<disk::Switchable>], images: &[PathBuf], deltas: &[PathBuf]) {
+    for ((disk, image), delta) in disks.iter().zip(images).zip(deltas) {
+        if let Err(e) = disk.replace(image) {
+            eprint!("\r\nvmmc-vmx: can't put {} back: {e}\r\n", image.display());
+        }
+        let _ = std::fs::remove_file(delta);
+    }
 }
 
 /// Where console input goes. A guest reset rebuilds the machine, so the target changes
@@ -162,6 +200,9 @@ pub struct Targets {
     screenshots: Option<Arc<Screenshots>>,
     /// Where Ctrl-A v and u save the VM's state.
     state_file: Option<PathBuf>,
+    /// The VM's file as it is now (a snapshot changes its disks), if it has one.
+    vm: Arc<Mutex<Option<vmconfig::Vm>>>,
+    restart: Arc<Mutex<Option<Restart>>>,
 }
 
 impl Targets {
@@ -197,6 +238,105 @@ impl Targets {
             path.display(),
             paused.as_millis()
         ))
+    }
+
+    pub fn set_vm(&self, vm: Option<vmconfig::Vm>) {
+        *self.vm.lock().unwrap_or_else(PoisonError::into_inner) = vm;
+    }
+
+    pub fn vm(&self) -> Option<vmconfig::Vm> {
+        self.vm
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// What the run loop has to do now that the machine stopped.
+    pub fn take_restart(&self) -> Option<Restart> {
+        self.restart
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    /// Takes a snapshot of the running VM, with its memory. While the guest is paused,
+    /// its state is saved, its disks move to new deltas, and the snapshot joins the
+    /// VM's file. Returns its ID, and how long the guest was paused.
+    pub fn take_snapshot(
+        &self,
+        name: &str,
+        description: &str,
+    ) -> Result<(String, Duration), String> {
+        let target = self.get().ok_or("the VM is starting")?;
+        let mut vm = self.vm.lock().unwrap_or_else(PoisonError::into_inner);
+        let vm = vm
+            .as_mut()
+            .ok_or("only a VM with a .vmmc file has snapshots")?;
+        let pending = vmconfig::snapshots::begin(vm, name, description)?;
+        let Some(disks) = target.disks.get(..pending.deltas.len()) else {
+            return Err("the VM's disks aren't the machine's".into());
+        };
+        let images: Vec<PathBuf> = disks.iter().map(|disk| disk.path()).collect();
+        let id = pending.id.clone();
+        let state = pending.state.clone();
+        let deltas = pending.deltas.clone();
+        let paused = target
+            .snapshot
+            .save_file(&state, None, || {
+                switch_disks(disks, &deltas)?;
+                pending.commit(vm, true).map(|_| ()).map_err(|e| {
+                    unswitch(disks, &images, &deltas);
+                    e.to_string()
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        Ok((id, paused))
+    }
+
+    /// Reverts the running VM to a snapshot: the machine stops, and the run loop
+    /// reverts the VM's files and starts it again from the snapshot's state.
+    pub fn revert(&self, snapshot: &str) -> Result<String, String> {
+        // Only its stop handle: the machine's disks must close before the revert
+        // removes the deltas they wrote.
+        let stop = self.get().ok_or("the VM is starting")?.stop;
+        let vm = self
+            .vm()
+            .ok_or("only a VM with a .vmmc file has snapshots")?;
+        let tree = vmconfig::snapshots::Tree::load(&vm).map_err(|e| e.to_string())?;
+        let found = tree
+            .find(snapshot)
+            .ok_or_else(|| format!("{} has no snapshot {snapshot:?}", vm.config.name))?;
+        let state = vmconfig::snapshots::state_file(&vm, &found.id);
+        if found.running && !state.is_file() {
+            return Err(format!(
+                "the snapshot's state {} is missing",
+                state.display()
+            ));
+        }
+        let (done, wait) = mpsc::channel();
+        *self.restart.lock().unwrap_or_else(PoisonError::into_inner) = Some(Restart::Revert {
+            snapshot: found.id.clone(),
+            done,
+        });
+        stop.request_stop(StopReason::Requested(REVERT_CODE));
+        wait.recv_timeout(REVERT_TIMEOUT)
+            .map_err(|_| "the revert didn't finish".to_owned())?
+    }
+
+    /// Saves the VM's state where its next start resumes it, and stops it.
+    pub fn suspend(&self) -> Result<Duration, String> {
+        let target = self.get().ok_or("the VM is starting")?;
+        let vm = self
+            .vm()
+            .ok_or("only a VM with a .vmmc file can be suspended")?;
+        let path = vmconfig::snapshots::suspended_file(&vm);
+        // Before the machine stops: this process ends then.
+        self.quit.store(true, Ordering::Relaxed);
+        target
+            .snapshot
+            .save_file(&path, Some(StopReason::Requested(QUIT_CODE)), || Ok(()))
+            .inspect_err(|_| self.quit.store(false, Ordering::Relaxed))
+            .map_err(|e| e.to_string())
     }
 
     /// The display of the machine running now.
