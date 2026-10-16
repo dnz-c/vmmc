@@ -15,15 +15,17 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 
+use serde::{Deserialize, Serialize};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 use super::ata::{
     self, AtaDisk, ERROR_ABRT, STATUS_BSY, STATUS_DRDY, STATUS_DRQ, STATUS_DSC, STATUS_ERR,
     Taskfile, Transfer,
 };
-use super::atapi::{Cdrom, Outcome};
+use super::atapi::{Cdrom, CdromState, Outcome};
 use crate::irq::{IrqLine, MsiMessage, MsiSink};
 use crate::pci::{BarKind, ConfigSpace, Identity, PciDevice, config, msi};
+use crate::snapshot::{self, Snapshot, StateError};
 
 pub const AHCI_SLOT: u8 = 0x1f;
 pub const AHCI_FUNCTION: u8 = 2;
@@ -110,7 +112,7 @@ impl Drive {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 struct PortRegs {
     clb: u64,
     fb: u64,
@@ -157,6 +159,7 @@ impl PortRegs {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 struct Registers {
     ghc: u32,
     is: u32,
@@ -422,6 +425,8 @@ fn execute(memory: &GuestMemoryMmap, drive: &mut Drive, command: &Command) -> Co
 
 enum Message {
     Notify,
+    /// Answered once everything before it is done.
+    Sync(Sender<()>),
     Stop,
 }
 
@@ -432,7 +437,15 @@ fn run_port(
     drive: Arc<Mutex<Drive>>,
     messages: Receiver<Message>,
 ) {
-    while let Ok(Message::Notify) = messages.recv() {
+    loop {
+        match messages.recv() {
+            Ok(Message::Notify) => {}
+            Ok(Message::Sync(done)) => {
+                let _ = done.send(());
+                continue;
+            }
+            Ok(Message::Stop) | Err(_) => return,
+        }
         loop {
             let (slot, clb) = {
                 let regs = lock(&shared.regs);
@@ -781,6 +794,82 @@ impl Ahci {
                 port.tfd = TFD_IDLE;
             }
             false
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct AhciState {
+    config: Vec<u8>,
+    registers: Registers,
+    sent_signature: [bool; PORTS],
+    /// Each DVD drive's, by port.
+    cdroms: Vec<(usize, CdromState)>,
+}
+
+impl Snapshot for Ahci {
+    fn save(&self) -> Vec<u8> {
+        let cdroms = self
+            .ports
+            .iter()
+            .enumerate()
+            .filter_map(|(index, port)| match &*lock(&port.as_ref()?.drive) {
+                Drive::Cdrom(cdrom) => Some((index, cdrom.save())),
+                Drive::Disk(_) => None,
+            })
+            .collect();
+        snapshot::encode(&AhciState {
+            config: self.config.save(),
+            registers: lock(&self.shared.regs).clone(),
+            sent_signature: std::array::from_fn(|index| {
+                self.sent_signature[index].load(Ordering::Relaxed)
+            }),
+            cdroms,
+        })
+    }
+
+    /// Interrupts already raised are in the restored interrupt controllers. Commands
+    /// the guest had issued and the ports hadn't run yet run now.
+    fn restore(&mut self, state: &[u8]) -> Result<(), StateError> {
+        let state: AhciState = snapshot::decode(state)?;
+        for (index, (saved, port)) in state
+            .registers
+            .ports
+            .iter()
+            .zip(&lock(&self.shared.regs).ports)
+            .enumerate()
+        {
+            if saved.signature != port.signature {
+                return Err(StateError(format!(
+                    "AHCI port {index} had a different drive"
+                )));
+            }
+        }
+        self.config.restore(&state.config)?;
+        *lock(&self.shared.msi) = msi::message(&self.config, self.msi_capability);
+        *lock(&self.shared.regs) = state.registers;
+        for (sent, saved) in self.sent_signature.iter().zip(state.sent_signature) {
+            sent.store(saved, Ordering::Relaxed);
+        }
+        for (index, saved) in state.cdroms {
+            if let Some(Some(port)) = self.ports.get(index)
+                && let Drive::Cdrom(cdrom) = &mut *lock(&port.drive)
+            {
+                cdrom.restore(saved);
+            }
+        }
+        for port in self.ports.iter().flatten() {
+            let _ = port.messages.send(Message::Notify);
+        }
+        Ok(())
+    }
+
+    fn quiesce(&mut self) {
+        for port in self.ports.iter().flatten() {
+            let (done, wait) = mpsc::channel();
+            if port.messages.send(Message::Sync(done)).is_ok() {
+                let _ = wait.recv();
+            }
         }
     }
 }

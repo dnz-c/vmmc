@@ -17,14 +17,17 @@
 //! Interrupts are MSI-X only, which Windows, Linux and OVMF (which polls) all handle.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 use super::{Setup, UsbDevice};
 use crate::irq::{IrqLine, MsiSink};
-use crate::pci::msix::{self, MsixTable};
+use crate::pci::msix::{self, MsixState, MsixTable};
 use crate::pci::{BarKind, ConfigSpace, Identity, PciDevice, config};
+use crate::snapshot::{self, Snapshot, StateError};
 
 pub const XHCI_BAR: u8 = 0;
 pub const XHCI_BAR_SIZE: u64 = 0x10000;
@@ -206,7 +209,7 @@ impl Trb {
 }
 
 /// Where the controller reads a ring next.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Ring {
     dequeue: u64,
     cycle: bool,
@@ -243,7 +246,7 @@ fn next_trb(memory: &GuestMemoryMmap, ring: &mut Ring) -> Option<(u64, Trb)> {
     None
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 struct Endpoint {
     state: u32,
     kind: u32,
@@ -273,7 +276,7 @@ struct Port {
     device: Option<Box<dyn UsbDevice>>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct Interrupter {
     iman: u32,
     imod: u32,
@@ -1335,6 +1338,118 @@ impl Xhci {
     fn is_wide(&self, offset: u64) -> bool {
         matches!(offset, o if o == OPERATIONAL + CRCR || o == OPERATIONAL + DCBAAP)
             || matches!(offset, o if o == INTERRUPTER_0 + ERSTBA || o == INTERRUPTER_0 + ERDP)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedSlot {
+    enabled: bool,
+    port: u8,
+    endpoints: Vec<Endpoint>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedPort {
+    portsc: u32,
+    device: Option<Vec<u8>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct XhciState {
+    config: Vec<u8>,
+    msix: MsixState,
+    usbcmd: u32,
+    usbsts: u32,
+    dnctrl: u32,
+    dcbaap: u64,
+    config_register: u32,
+    command_ring: Ring,
+    command_ring_running: bool,
+    interrupter: Interrupter,
+    ports: Vec<SavedPort>,
+    slots: Vec<SavedSlot>,
+    /// How long the controller had run (its microframe index counts it).
+    running_for: Duration,
+    events_pending: bool,
+}
+
+impl Snapshot for Xhci {
+    fn save(&self) -> Vec<u8> {
+        snapshot::encode(&XhciState {
+            config: self.config.save(),
+            msix: self.msix.save(),
+            usbcmd: self.usbcmd,
+            usbsts: self.usbsts,
+            dnctrl: self.dnctrl,
+            dcbaap: self.dcbaap,
+            config_register: self.config_register,
+            command_ring: self.command_ring,
+            command_ring_running: self.command_ring_running,
+            interrupter: self.interrupter.clone(),
+            ports: self
+                .ports
+                .iter()
+                .map(|port| SavedPort {
+                    portsc: port.portsc,
+                    device: port.device.as_ref().map(|device| device.save()),
+                })
+                .collect(),
+            slots: self
+                .slots
+                .iter()
+                .map(|slot| SavedSlot {
+                    enabled: slot.enabled,
+                    port: slot.port,
+                    endpoints: slot.endpoints.to_vec(),
+                })
+                .collect(),
+            running_for: self.started.elapsed(),
+            events_pending: self.events_pending,
+        })
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), StateError> {
+        let state: XhciState = snapshot::decode(state)?;
+        if state.ports.len() != self.ports.len() || state.slots.len() != self.slots.len() {
+            return Err(StateError(
+                "the xHCI had a different number of ports or slots".into(),
+            ));
+        }
+        self.config.restore(&state.config)?;
+        self.msix.restore(state.msix)?;
+        self.usbcmd = state.usbcmd;
+        self.usbsts = state.usbsts;
+        self.dnctrl = state.dnctrl;
+        self.dcbaap = state.dcbaap;
+        self.config_register = state.config_register;
+        self.command_ring = state.command_ring;
+        self.command_ring_running = state.command_ring_running;
+        self.interrupter = state.interrupter;
+        for (index, (port, saved)) in self.ports.iter_mut().zip(state.ports).enumerate() {
+            port.portsc = saved.portsc;
+            match (&mut port.device, saved.device) {
+                (Some(device), Some(saved)) => device.restore(&saved)?,
+                (None, None) => {}
+                _ => {
+                    return Err(StateError(format!(
+                        "xHCI port {} had a different device",
+                        index + 1
+                    )));
+                }
+            }
+        }
+        for (slot, saved) in self.slots.iter_mut().zip(state.slots) {
+            slot.enabled = saved.enabled;
+            slot.port = saved.port;
+            slot.endpoints = saved.endpoints.try_into().map_err(|_| {
+                StateError("an xHCI slot had a different number of endpoints".into())
+            })?;
+        }
+        self.started = Instant::now()
+            .checked_sub(state.running_for)
+            .unwrap_or_else(Instant::now);
+        self.events_pending = state.events_pending;
+        Ok(())
     }
 }
 

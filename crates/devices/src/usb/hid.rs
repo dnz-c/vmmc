@@ -153,6 +153,15 @@ impl Identity {
     }
 }
 
+/// What a HID device saves: its control endpoint's state, and its input's.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HidState<T> {
+    configuration: u8,
+    idle: u8,
+    protocol: u8,
+    input: T,
+}
+
 /// The control-endpoint state every HID device keeps.
 struct Function {
     identity: Identity,
@@ -242,7 +251,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-#[derive(Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 struct TabletState {
     x: u16,
     y: u16,
@@ -309,6 +318,24 @@ impl Tablet {
 }
 
 impl UsbDevice for Tablet {
+    fn save(&self) -> Vec<u8> {
+        crate::snapshot::encode(&HidState {
+            configuration: self.function.configuration,
+            idle: self.function.idle,
+            protocol: self.function.protocol,
+            input: lock(&self.state).clone(),
+        })
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), crate::snapshot::StateError> {
+        let state: HidState<_> = crate::snapshot::decode(state)?;
+        self.function.configuration = state.configuration;
+        self.function.idle = state.idle;
+        self.function.protocol = state.protocol;
+        *lock(&self.state) = state.input;
+        Ok(())
+    }
+
     fn speed(&self) -> u8 {
         SPEED_FULL
     }
@@ -332,7 +359,7 @@ impl UsbDevice for Tablet {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 struct KeyboardState {
     /// Modifier keys held: bit 0 left Ctrl to bit 7 right GUI.
     modifiers: u8,
@@ -420,6 +447,24 @@ impl Keyboard {
 }
 
 impl UsbDevice for Keyboard {
+    fn save(&self) -> Vec<u8> {
+        crate::snapshot::encode(&HidState {
+            configuration: self.function.configuration,
+            idle: self.function.idle,
+            protocol: self.function.protocol,
+            input: lock(&self.state).clone(),
+        })
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), crate::snapshot::StateError> {
+        let state: HidState<_> = crate::snapshot::decode(state)?;
+        self.function.configuration = state.configuration;
+        self.function.idle = state.idle;
+        self.function.protocol = state.protocol;
+        *lock(&self.state) = state.input;
+        Ok(())
+    }
+
     fn speed(&self) -> u8 {
         SPEED_FULL
     }

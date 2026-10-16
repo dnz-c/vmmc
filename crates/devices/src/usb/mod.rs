@@ -44,4 +44,10 @@ pub trait UsbDevice: Send {
     fn interrupt_in(&mut self, endpoint: u8) -> Option<Vec<u8>>;
     /// A port or device reset: back to unconfigured, with nothing pending.
     fn reset(&mut self);
+
+    /// The device's state, for a snapshot.
+    fn save(&self) -> Vec<u8>;
+
+    /// Puts back what [`UsbDevice::save`] saved.
+    fn restore(&mut self, state: &[u8]) -> Result<(), crate::snapshot::StateError>;
 }

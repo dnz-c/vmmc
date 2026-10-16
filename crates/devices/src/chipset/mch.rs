@@ -10,6 +10,7 @@ use vm_core::{Bus, SharedDevice};
 
 use super::touches;
 use crate::pci::{ConfigSpace, Identity, PciDevice};
+use crate::snapshot::{self, Snapshot, StateError};
 
 pub const MCH_SLOT: u8 = 0;
 pub const MCH_DEVICE_ID: u16 = 0x29c0;
@@ -99,6 +100,18 @@ impl Mch {
                 Err(e) => tracing::warn!(base, size, %e, "can't place the ECAM window"),
             }
         }
+    }
+}
+
+impl Snapshot for Mch {
+    fn save(&self) -> Vec<u8> {
+        snapshot::encode(&self.config.save())
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), StateError> {
+        self.config.restore(&snapshot::decode::<Vec<u8>>(state)?)?;
+        self.sync_ecam();
+        Ok(())
     }
 }
 

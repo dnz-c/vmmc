@@ -11,17 +11,21 @@
 //! Every queue address, size, PRP and LBA comes from the guest and is checked before
 //! use. Data moves through PRPs (4 KiB pages); SGLs aren't offered.
 
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
 
 use disk::BlockBackend;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 use crate::irq::MsiSink;
-use crate::pci::msix::{self, MsixTable};
+use crate::pci::msix::{self, MsixState, MsixTable};
 use crate::pci::{BarKind, ConfigSpace, Identity, PciDevice};
+use crate::snapshot::{self, Snapshot, StateError};
 
 /// BAR 0 holds everything.
 pub const NVME_BAR: u8 = 0;
@@ -216,14 +220,19 @@ impl CompletionQueue {
 
 enum Message {
     Notify,
+    /// Answered once everything before it is done.
+    Sync(Sender<()>),
     Stop,
 }
 
 /// An I/O submission queue and its worker.
 struct SubmissionQueue {
     cq: Arc<CompletionQueue>,
+    base: u64,
     entries: u32,
     tail: Arc<AtomicU16>,
+    /// The worker's head: the next entry it takes, once it completed the one before.
+    head: Arc<AtomicU32>,
     messages: Sender<Message>,
     /// Tells the worker to give up waiting for completion queue room.
     stopping: Arc<AtomicBool>,
@@ -518,15 +527,24 @@ struct QueueWork {
     base: u64,
     entries: u32,
     tail: Arc<AtomicU16>,
+    head: Arc<AtomicU32>,
     cq: Arc<CompletionQueue>,
     stopping: Arc<AtomicBool>,
 }
 
 /// Serves one I/O submission queue until told to stop.
 fn run_queue(work: QueueWork, messages: Receiver<Message>) {
-    let mut head = 0u32;
-    while let Ok(Message::Notify) = messages.recv() {
+    loop {
+        match messages.recv() {
+            Ok(Message::Notify) => {}
+            Ok(Message::Sync(done)) => {
+                let _ = done.send(());
+                continue;
+            }
+            Ok(Message::Stop) | Err(_) => return,
+        }
         loop {
+            let head = work.head.load(Ordering::Acquire);
             let tail = u32::from(work.tail.load(Ordering::Acquire));
             if head == tail {
                 break;
@@ -534,17 +552,20 @@ fn run_queue(work: QueueWork, messages: Receiver<Message>) {
             let mut raw = [0u8; SQ_ENTRY as usize];
             let address = GuestAddress(work.base + u64::from(head) * SQ_ENTRY);
             let read = work.shared.memory.read_slice(&mut raw, address).is_ok();
-            head = (head + 1) % work.entries;
+            let next = (head + 1) % work.entries;
             let command = Command::parse(&raw);
             let result = if read {
                 work.shared.io_command(&command)
             } else {
                 Err(Status::DATA_TRANSFER_ERROR)
             };
-            let entry = completion(&command, work.sqid, head, result);
+            let entry = completion(&command, work.sqid, next, result);
             if !work.cq.post(&work.shared, entry, Some(&work.stopping)) {
                 return;
             }
+            // Only now: a snapshot taken while the completion waits for room runs the
+            // command again rather than lose it.
+            work.head.store(next, Ordering::Release);
         }
     }
 }
@@ -573,7 +594,7 @@ struct AdminQueue {
     cq: Arc<CompletionQueue>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 struct Features {
     arbitration: u32,
     power_management: u32,
@@ -1006,34 +1027,53 @@ impl Nvme {
         else {
             return Err(Status::INVALID_COMPLETION_QUEUE);
         };
+        self.sqs[qid] = Some(
+            self.start_sq(qid, command.prp1, entries, cq, 0, 0)
+                .map_err(|e| {
+                    tracing::error!(%e, "NVMe: can't start a queue thread");
+                    Status::INTERNAL_ERROR
+                })?,
+        );
+        Ok(0)
+    }
+
+    /// An I/O submission queue and its worker, at `head` and `tail`.
+    fn start_sq(
+        &self,
+        qid: usize,
+        base: u64,
+        entries: u32,
+        cq: Arc<CompletionQueue>,
+        head: u32,
+        tail: u16,
+    ) -> std::io::Result<SubmissionQueue> {
         let (messages, receiver) = mpsc::channel();
-        let tail = Arc::new(AtomicU16::new(0));
+        let tail = Arc::new(AtomicU16::new(tail));
+        let head = Arc::new(AtomicU32::new(head));
         let stopping = Arc::new(AtomicBool::new(false));
         let work = QueueWork {
             shared: self.shared.clone(),
             sqid: qid as u16,
-            base: command.prp1,
+            base,
             entries,
             tail: tail.clone(),
+            head: head.clone(),
             cq: cq.clone(),
             stopping: stopping.clone(),
         };
         let thread = thread::Builder::new()
             .name(format!("nvme-sq{qid}"))
-            .spawn(move || run_queue(work, receiver))
-            .map_err(|e| {
-                tracing::error!(%e, "NVMe: can't start a queue thread");
-                Status::INTERNAL_ERROR
-            })?;
-        self.sqs[qid] = Some(SubmissionQueue {
+            .spawn(move || run_queue(work, receiver))?;
+        Ok(SubmissionQueue {
             cq,
+            base,
             entries,
             tail,
+            head,
             messages,
             stopping,
             thread: Some(thread),
-        });
-        Ok(0)
+        })
     }
 
     fn delete_sq(&mut self, command: &Command) -> CommandResult {
@@ -1181,6 +1221,194 @@ impl Nvme {
         }
         to_guest(&self.shared, command, &data)?;
         Ok(0)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedCq {
+    id: u16,
+    base: u64,
+    entries: u32,
+    vector: Option<u16>,
+    head: u32,
+    tail: u32,
+    phase: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedSq {
+    qid: usize,
+    cqid: u16,
+    base: u64,
+    entries: u32,
+    head: u32,
+    tail: u16,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedAdmin {
+    base: u64,
+    entries: u32,
+    head: u32,
+    tail: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct NvmeState {
+    config: Vec<u8>,
+    msix: MsixState,
+    registers: Vec<u8>,
+    admin: Option<SavedAdmin>,
+    cqs: Vec<SavedCq>,
+    sqs: Vec<SavedSq>,
+    pending_events: Vec<u16>,
+    features: Features,
+    write_cache: bool,
+    /// Units read and written, read and write commands.
+    counters: [u64; 4],
+}
+
+/// How long a quiesce waits for a queue worker, which can be stuck waiting for room in
+/// a full completion queue the paused guest won't empty.
+const QUIESCE_TIMEOUT: Duration = Duration::from_secs(5);
+
+impl Snapshot for Nvme {
+    fn save(&self) -> Vec<u8> {
+        let saved_cq = |cq: &CompletionQueue| {
+            let state = lock(&cq.state);
+            SavedCq {
+                id: cq.id,
+                base: cq.base,
+                entries: cq.entries,
+                vector: cq.vector,
+                head: state.head,
+                tail: state.tail,
+                phase: state.phase,
+            }
+        };
+        let counters = &self.shared;
+        snapshot::encode(&NvmeState {
+            config: self.config.save(),
+            msix: lock(&self.shared.msix).save(),
+            registers: self.registers.to_vec(),
+            admin: self.admin.as_ref().map(|admin| SavedAdmin {
+                base: admin.base,
+                entries: admin.entries,
+                head: admin.head,
+                tail: admin.tail,
+            }),
+            cqs: self.cqs.iter().flatten().map(|cq| saved_cq(cq)).collect(),
+            sqs: self
+                .sqs
+                .iter()
+                .enumerate()
+                .filter_map(|(qid, sq)| {
+                    let sq = sq.as_ref()?;
+                    Some(SavedSq {
+                        qid,
+                        cqid: sq.cq.id,
+                        base: sq.base,
+                        entries: sq.entries,
+                        head: sq.head.load(Ordering::Acquire),
+                        tail: sq.tail.load(Ordering::Acquire),
+                    })
+                })
+                .collect(),
+            pending_events: self.pending_events.clone(),
+            features: self.features,
+            write_cache: self.shared.write_cache.load(Ordering::Relaxed),
+            counters: [
+                counters.units_read.load(Ordering::Relaxed),
+                counters.units_written.load(Ordering::Relaxed),
+                counters.read_commands.load(Ordering::Relaxed),
+                counters.write_commands.load(Ordering::Relaxed),
+            ],
+        })
+    }
+
+    /// Commands the guest had submitted and the controller hadn't taken run now.
+    fn restore(&mut self, state: &[u8]) -> Result<(), StateError> {
+        let state: NvmeState = snapshot::decode(state)?;
+        let bad = |what: &str| StateError(format!("NVMe: {what}"));
+        for sq in &mut self.sqs {
+            *sq = None;
+        }
+        self.cqs.fill(None);
+        self.config.restore(&state.config)?;
+        lock(&self.shared.msix).restore(state.msix)?;
+        self.registers = state
+            .registers
+            .try_into()
+            .map_err(|_| bad("the registers were a different size"))?;
+        for saved in state.cqs {
+            let cq = CompletionQueue::new(saved.id, saved.base, saved.entries, saved.vector);
+            *lock(&cq.state) = CqState {
+                head: saved.head,
+                tail: saved.tail,
+                phase: saved.phase,
+            };
+            *self
+                .cqs
+                .get_mut(usize::from(saved.id))
+                .ok_or_else(|| bad("a completion queue out of range"))? = Some(Arc::new(cq));
+        }
+        self.admin = match state.admin {
+            Some(saved) => Some(AdminQueue {
+                base: saved.base,
+                entries: saved.entries,
+                head: saved.head,
+                tail: saved.tail,
+                cq: self.cqs[0]
+                    .clone()
+                    .ok_or_else(|| bad("an admin queue without its completion queue"))?,
+            }),
+            None => None,
+        };
+        for saved in state.sqs {
+            let cq = self
+                .cqs
+                .get(usize::from(saved.cqid))
+                .and_then(Option::clone)
+                .ok_or_else(|| bad("a submission queue without its completion queue"))?;
+            if saved.qid == 0 || saved.qid >= self.sqs.len() {
+                return Err(bad("a submission queue out of range"));
+            }
+            let sq = self
+                .start_sq(
+                    saved.qid,
+                    saved.base,
+                    saved.entries,
+                    cq,
+                    saved.head,
+                    saved.tail,
+                )
+                .map_err(|e| bad(&format!("can't start a queue thread: {e}")))?;
+            let _ = sq.messages.send(Message::Notify);
+            self.sqs[saved.qid] = Some(sq);
+        }
+        self.pending_events = state.pending_events;
+        self.features = state.features;
+        self.shared
+            .write_cache
+            .store(state.write_cache, Ordering::Relaxed);
+        let [read, written, reads, writes] = state.counters;
+        self.shared.units_read.store(read, Ordering::Relaxed);
+        self.shared.units_written.store(written, Ordering::Relaxed);
+        self.shared.read_commands.store(reads, Ordering::Relaxed);
+        self.shared.write_commands.store(writes, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn quiesce(&mut self) {
+        for (qid, sq) in self.sqs.iter().enumerate() {
+            let Some(sq) = sq else { continue };
+            let (done, wait) = mpsc::channel();
+            if sq.messages.send(Message::Sync(done)).is_ok()
+                && wait.recv_timeout(QUIESCE_TIMEOUT).is_err()
+            {
+                tracing::warn!(qid, "NVMe: a queue is waiting for completion queue room");
+            }
+        }
     }
 }
 

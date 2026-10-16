@@ -12,7 +12,10 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
+use serde::{Deserialize, Serialize};
 use vm_core::BusDevice;
+
+use crate::snapshot::{self, Snapshot, StateError};
 
 /// Where the TPM's registers live (the PTP's fixed address), and how much of it.
 pub const TPM_BASE: u64 = 0xfed4_0000;
@@ -26,6 +29,36 @@ pub trait TpmBackend: Send {
     fn execute(&mut self, locality: u8, command: &[u8]) -> Vec<u8>;
     /// The platform reset (`_TPM_Init`): PCRs clear, and TPM2_Startup comes next.
     fn reset(&mut self);
+    /// All of the TPM's NV memory.
+    fn nv(&self) -> Vec<u8>;
+    /// Replaces the TPM's NV memory, powering it off and on: a platform reset follows.
+    fn set_nv(&mut self, nv: &[u8]) -> Result<(), String>;
+}
+
+/// TPM2_Shutdown(TPM_SU_STATE) and TPM2_Startup(TPM_SU_STATE): what a suspend and the
+/// resume after it send, saving the TPM's volatile state (PCRs, sessions) in NV memory
+/// and taking it back from there.
+const SHUTDOWN_STATE: [u8; 12] = [0x80, 0x01, 0, 0, 0, 12, 0, 0, 0x01, 0x45, 0, 1];
+const STARTUP_STATE: [u8; 12] = [0x80, 0x01, 0, 0, 0, 12, 0, 0, 0x01, 0x44, 0, 1];
+
+fn response_code(response: &[u8]) -> u32 {
+    response.get(6..10).map_or(u32::MAX, |code| {
+        u32::from_be_bytes(code.try_into().unwrap())
+    })
+}
+
+#[derive(Serialize, Deserialize)]
+struct CrbState {
+    assigned: bool,
+    idle: bool,
+    cancel: u32,
+    interrupt_enable: u32,
+    interrupt_status: u32,
+    buffer: Vec<u8>,
+    /// The TPM's NV memory, with its volatile state in it if `started`.
+    nv: Vec<u8>,
+    /// The guest had started the TPM (TPM2_Startup), so it resumes.
+    started: bool,
 }
 
 /// A TPM the machine shares with whoever keeps it across machine rebuilds.
@@ -186,6 +219,61 @@ impl Crb {
     }
 }
 
+impl Snapshot for Crb {
+    /// Saves the TPM's volatile state into its NV memory, as a suspend does, takes a
+    /// copy, and resumes it: the guest carries on with its PCRs and sessions as they
+    /// were.
+    fn save(&self) -> Vec<u8> {
+        let mut tpm = self.tpm.lock().unwrap_or_else(PoisonError::into_inner);
+        // A TPM the guest hasn't started yet refuses the shutdown; its NV is all it has.
+        let started = response_code(&tpm.execute(0, &SHUTDOWN_STATE)) == 0;
+        let nv = tpm.nv();
+        if started {
+            tpm.reset();
+            let code = response_code(&tpm.execute(0, &STARTUP_STATE));
+            if code != 0 {
+                tracing::warn!(code, "the TPM didn't resume after a snapshot");
+            }
+        }
+        snapshot::encode(&CrbState {
+            assigned: self.assigned,
+            idle: self.idle,
+            cancel: self.cancel,
+            interrupt_enable: self.interrupt_enable,
+            interrupt_status: self.interrupt_status,
+            buffer: self.buffer.to_vec(),
+            nv,
+            started,
+        })
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), StateError> {
+        let state: CrbState = snapshot::decode(state)?;
+        let mut tpm = self.tpm.lock().unwrap_or_else(PoisonError::into_inner);
+        tpm.set_nv(&state.nv)
+            .map_err(|e| StateError(format!("TPM: {e}")))?;
+        if state.started {
+            let code = response_code(&tpm.execute(0, &STARTUP_STATE));
+            if code != 0 {
+                return Err(StateError(format!(
+                    "the TPM didn't resume from the saved state (response code {code:#x})"
+                )));
+            }
+        }
+        drop(tpm);
+        self.assigned = state.assigned;
+        self.idle = state.idle;
+        self.cancel = state.cancel;
+        self.interrupt_enable = state.interrupt_enable;
+        self.interrupt_status = state.interrupt_status;
+        self.buffer = state
+            .buffer
+            .try_into()
+            .map_err(|_| StateError("the TPM buffer was a different size".into()))?;
+        Ok(())
+    }
+}
+
 impl BusDevice for Crb {
     fn read(&mut self, offset: u64, data: &mut [u8]) {
         if offset >= DATA_BUFFER {
@@ -233,6 +321,14 @@ mod tests {
     }
 
     impl TpmBackend for Echo {
+        fn nv(&self) -> Vec<u8> {
+            Vec::new()
+        }
+
+        fn set_nv(&mut self, _: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+
         fn execute(&mut self, _: u8, command: &[u8]) -> Vec<u8> {
             self.commands.push(command.to_vec());
             let mut response = vec![0x80, 0x01, 0, 0, 0, 12, 0, 0, 0, 0];

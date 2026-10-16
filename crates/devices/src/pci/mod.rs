@@ -9,8 +9,11 @@ use std::sync::{Arc, Mutex};
 
 pub use config::{BarKind, BarMapping, ConfigSpace, Identity};
 
-/// A PCI function as the root complex sees it.
-pub trait PciDevice: Send {
+use crate::snapshot::Snapshot;
+
+/// A PCI function as the root complex sees it. The root saves and restores it, with
+/// its configuration space, as part of the bus.
+pub trait PciDevice: Snapshot {
     fn config(&self) -> &ConfigSpace;
     fn config_mut(&mut self) -> &mut ConfigSpace;
 

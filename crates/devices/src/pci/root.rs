@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, Weak};
 use vm_core::{Bus, BusDevice};
 
 use super::{BarMapping, SharedPciDevice};
+use crate::snapshot::{self, Snapshot, StateError};
 use crate::{PowerEvent, PowerHandler};
 
 /// Port I/O configuration mechanism #1: address at 0xcf8, data at 0xcfc.
@@ -171,6 +172,67 @@ impl PciRoot {
     }
 }
 
+impl Snapshot for PciRoot {
+    /// Every function's state, by slot and function.
+    fn save(&self) -> Vec<u8> {
+        let functions: Vec<((u8, u8), Vec<u8>)> = self
+            .functions
+            .iter()
+            .map(|(&key, function)| {
+                let state = function
+                    .device
+                    .lock()
+                    .expect("a PCI device panicked")
+                    .save();
+                (key, state)
+            })
+            .collect();
+        snapshot::encode(&functions)
+    }
+
+    /// Restores each function, then maps its BARs where the restored state has them.
+    fn restore(&mut self, state: &[u8]) -> Result<(), StateError> {
+        let functions: Vec<((u8, u8), Vec<u8>)> = snapshot::decode(state)?;
+        let saved: Vec<(u8, u8)> = functions.iter().map(|(key, _)| *key).collect();
+        let here: Vec<(u8, u8)> = self.functions.keys().copied().collect();
+        if saved != here {
+            return Err(StateError(format!(
+                "the PCI bus had other devices: {saved:?}, not {here:?}"
+            )));
+        }
+        for ((slot, function), state) in functions {
+            self.functions[&(slot, function)]
+                .device
+                .lock()
+                .expect("a PCI device panicked")
+                .restore(&state)
+                .map_err(|e| StateError(format!("PCI {slot:02x}.{function}: {e}")))?;
+            self.sync_bars((slot, function));
+        }
+        Ok(())
+    }
+
+    fn quiesce(&mut self) {
+        for function in self.functions.values() {
+            function
+                .device
+                .lock()
+                .expect("a PCI device panicked")
+                .quiesce();
+        }
+    }
+
+    fn resume(&mut self) {
+        for function in self.functions.values() {
+            function
+                .device
+                .lock()
+                .expect("a PCI device panicked")
+                .resume();
+        }
+    }
+}
+
 /// One BAR of a device, as it sits on the MMIO bus.
 struct BarRegion {
     device: SharedPciDevice,
@@ -225,6 +287,17 @@ impl PciConfigIo {
         let function = ((self.address >> 8) & 0x7) as u8;
         let register = (self.address & 0xfc) as u16 + data_offset as u16;
         Some((bus, slot, function, register))
+    }
+}
+
+impl Snapshot for PciConfigIo {
+    fn save(&self) -> Vec<u8> {
+        snapshot::encode(&(self.address, self.reset_control))
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), StateError> {
+        (self.address, self.reset_control) = snapshot::decode(state)?;
+        Ok(())
     }
 }
 
@@ -375,6 +448,15 @@ mod tests {
                 config,
                 writes: Vec::new(),
             }
+        }
+    }
+
+    impl Snapshot for Probe {
+        fn save(&self) -> Vec<u8> {
+            self.config.save()
+        }
+        fn restore(&mut self, state: &[u8]) -> Result<(), StateError> {
+            self.config.restore(state)
         }
     }
 

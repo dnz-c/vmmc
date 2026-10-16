@@ -6,13 +6,17 @@
 use std::sync::atomic::{AtomicU8, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
 use virtio_queue::{Queue, QueueT};
 use vm_memory::GuestMemoryMmap;
 
-use super::{QueueInterrupt, VIRTIO_F_RING_EVENT_IDX, VIRTIO_F_VERSION_1, VirtioDevice};
+use super::{
+    QueueInterrupt, SavedQueue, VIRTIO_F_RING_EVENT_IDX, VIRTIO_F_VERSION_1, VirtioDevice,
+};
 use crate::irq::MsiSink;
-use crate::pci::msix::{self, MsixTable};
+use crate::pci::msix::{self, MsixState, MsixTable};
 use crate::pci::{BarKind, ConfigSpace, Identity, PciDevice};
+use crate::snapshot::{self, Snapshot, StateError};
 
 pub const VIRTIO_VENDOR_ID: u16 = 0x1af4;
 /// Modern device IDs are 0x1040 plus the virtio device type.
@@ -47,7 +51,7 @@ const STATUS_DRIVER_OK: u8 = 4;
 const STATUS_NEEDS_RESET: u8 = 64;
 
 /// A queue's registers, as the driver programs them.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct QueueConfig {
     max_size: u16,
     size: u16,
@@ -397,6 +401,11 @@ impl VirtioPci {
             .iter()
             .map(|queue| queue.build(event_idx))
             .collect::<Result<Vec<_>, _>>()?;
+        self.start(queues)
+    }
+
+    /// Starts the device on `queues`.
+    fn start(&mut self, queues: Vec<Queue>) -> Result<(), String> {
         let interrupt = Arc::new(Interrupt {
             msix: self.msix.clone(),
             vectors: self.vectors.clone(),
@@ -553,6 +562,99 @@ impl PciDevice for VirtioPci {
             }
             _ => {}
         }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct VirtioPciState {
+    config: Vec<u8>,
+    msix: MsixState,
+    isr: u8,
+    config_vector: u16,
+    queue_vectors: Vec<u16>,
+    device_feature_select: u32,
+    driver_feature_select: u32,
+    driver_features: u64,
+    status: u8,
+    queue_select: u16,
+    queues: Vec<QueueConfig>,
+    /// While the device runs: where it is in each queue.
+    running: Option<Vec<SavedQueue>>,
+}
+
+impl Snapshot for VirtioPci {
+    fn save(&self) -> Vec<u8> {
+        snapshot::encode(&VirtioPciState {
+            config: self.config.save(),
+            msix: self.msix.lock().unwrap().save(),
+            isr: self.isr.load(Ordering::SeqCst),
+            config_vector: self.vectors.config.load(Ordering::SeqCst),
+            queue_vectors: self
+                .vectors
+                .queues
+                .iter()
+                .map(|vector| vector.load(Ordering::SeqCst))
+                .collect(),
+            device_feature_select: self.device_feature_select,
+            driver_feature_select: self.driver_feature_select,
+            driver_features: self.driver_features,
+            status: self.status,
+            queue_select: self.queue_select,
+            queues: self.queues.clone(),
+            running: self.active.then(|| {
+                self.device
+                    .queue_states()
+                    .into_iter()
+                    .map(SavedQueue::from)
+                    .collect()
+            }),
+        })
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), StateError> {
+        let state: VirtioPciState = snapshot::decode(state)?;
+        if state.queues.len() != self.queues.len()
+            || state.queue_vectors.len() != self.vectors.queues.len()
+        {
+            return Err(StateError(format!(
+                "a virtio device with {} queues, not {}",
+                state.queues.len(),
+                self.queues.len()
+            )));
+        }
+        self.reset();
+        self.config.restore(&state.config)?;
+        self.msix.lock().unwrap().restore(state.msix)?;
+        self.isr.store(state.isr, Ordering::SeqCst);
+        self.vectors
+            .config
+            .store(state.config_vector, Ordering::SeqCst);
+        for (slot, vector) in self.vectors.queues.iter().zip(state.queue_vectors) {
+            slot.store(vector, Ordering::SeqCst);
+        }
+        self.device_feature_select = state.device_feature_select;
+        self.driver_feature_select = state.driver_feature_select;
+        self.driver_features = state.driver_features;
+        self.status = state.status;
+        self.queue_select = state.queue_select;
+        self.queues = state.queues;
+        if let Some(running) = state.running {
+            let queues = running
+                .iter()
+                .map(SavedQueue::queue)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(StateError)?;
+            self.start(queues).map_err(StateError)?;
+        }
+        Ok(())
+    }
+
+    fn quiesce(&mut self) {
+        self.device.quiesce();
+    }
+
+    fn resume(&mut self) {
+        self.device.resume();
     }
 }
 

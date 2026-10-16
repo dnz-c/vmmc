@@ -15,7 +15,7 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use net::{FrameSink, NetBackend, Waker};
-use virtio_queue::{Queue, QueueT};
+use virtio_queue::{Queue, QueueState, QueueT};
 use vm_memory::GuestMemoryMmap;
 
 use super::{
@@ -54,12 +54,14 @@ struct Shared {
     /// Wakes the backend, which found the NIC full, once there's room again.
     waker: Option<Waker>,
     backend_waiting: bool,
+    /// While a snapshot is taken: the backend waits, and frames are dropped.
+    paused: bool,
 }
 
 impl Shared {
     /// Tells the backend there's room again, if it was waiting for that.
     fn wake_backend(&mut self) {
-        if self.backend_waiting && self.backlog.len() < RX_ROOM {
+        if self.backend_waiting && self.backlog.len() < RX_ROOM && !self.paused {
             self.backend_waiting = false;
             if let Some(waker) = &self.waker {
                 waker();
@@ -86,6 +88,9 @@ pub struct Receiver(Arc<Mutex<Shared>>);
 impl FrameSink for Receiver {
     fn deliver(&self, frame: &[u8]) {
         let mut shared = lock(&self.0);
+        if shared.paused {
+            return;
+        }
         if shared.backlog.len() < RX_BACKLOG {
             shared.backlog.push_back(frame.to_vec());
         }
@@ -94,7 +99,7 @@ impl FrameSink for Receiver {
 
     fn has_room(&self) -> bool {
         let mut shared = lock(&self.0);
-        let room = shared.backlog.len() < RX_ROOM;
+        let room = shared.backlog.len() < RX_ROOM && !shared.paused;
         shared.backend_waiting |= !room;
         room
     }
@@ -273,6 +278,28 @@ impl VirtioDevice for VirtioNet {
         let mut shared = lock(&self.shared);
         shared.active = None;
         shared.backlog.clear();
+        shared.wake_backend();
+    }
+
+    fn queue_states(&self) -> Vec<QueueState> {
+        let shared = lock(&self.shared);
+        shared
+            .active
+            .iter()
+            .flat_map(|active| [active.rx.state(), active.tx.state()])
+            .collect()
+    }
+
+    /// Frames waiting for receive buffers are dropped: a snapshot doesn't keep them.
+    fn quiesce(&mut self) {
+        let mut shared = lock(&self.shared);
+        shared.paused = true;
+        shared.backlog.clear();
+    }
+
+    fn resume(&mut self) {
+        let mut shared = lock(&self.shared);
+        shared.paused = false;
         shared.wake_backend();
     }
 }

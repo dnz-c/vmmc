@@ -19,10 +19,12 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use net::{FrameSink, NetBackend, Waker};
+use serde::{Deserialize, Serialize};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 use crate::irq::{IrqLine, MsiMessage, MsiSink};
 use crate::pci::{BarKind, ConfigSpace, Identity, PciDevice, config, msi};
+use crate::snapshot::{self, Snapshot, StateError};
 
 pub const REGISTER_BAR: u8 = 0;
 pub const REGISTER_BAR_SIZE: u64 = 128 * 1024;
@@ -153,7 +155,7 @@ const TX_QUEUES: [TxRegisters; 2] = [
 
 /// A transmit queue's offload context, and the packet its data descriptors are
 /// gathering. Each queue has its own: the driver fills them independently.
-#[derive(Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct TxQueue {
     context: Context,
     packet: Vec<u8>,
@@ -162,7 +164,7 @@ struct TxQueue {
 }
 
 /// The offload context the last context descriptor set up.
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize)]
 struct Context {
     ipcss: usize,
     ipcso: usize,
@@ -186,6 +188,8 @@ struct State {
     /// Wakes the backend, which found the NIC full, once there's room again.
     waker: Option<Waker>,
     backend_waiting: bool,
+    /// While a snapshot is taken: the backend waits, and frames are dropped.
+    paused: bool,
     sink: Arc<dyn MsiSink>,
     msi: Option<MsiMessage>,
     intx: Option<IrqLine>,
@@ -537,7 +541,7 @@ impl State {
 
     /// Tells the backend there's room again, if it was waiting for that.
     fn wake_backend(&mut self) {
-        if self.backend_waiting && self.backlog.len() < RX_ROOM {
+        if self.backend_waiting && self.backlog.len() < RX_ROOM && !self.paused {
             self.backend_waiting = false;
             if let Some(waker) = &self.waker {
                 waker();
@@ -687,7 +691,7 @@ pub struct Receiver(Arc<Mutex<State>>);
 impl FrameSink for Receiver {
     fn deliver(&self, frame: &[u8]) {
         let mut state = lock(&self.0);
-        if frame.len() > MAX_FRAME || !state.accepts(frame) {
+        if state.paused || frame.len() > MAX_FRAME || !state.accepts(frame) {
             return;
         }
         if state.backlog.len() >= RX_BACKLOG {
@@ -707,7 +711,7 @@ impl FrameSink for Receiver {
 
     fn has_room(&self) -> bool {
         let mut state = lock(&self.0);
-        let room = state.backlog.len() < RX_ROOM;
+        let room = state.backlog.len() < RX_ROOM && !state.paused;
         state.backend_waiting |= !room;
         room
     }
@@ -760,6 +764,7 @@ impl E1000e {
             backlog: VecDeque::new(),
             waker: None,
             backend_waiting: false,
+            paused: false,
             sink,
             msi: None,
             intx,
@@ -885,6 +890,66 @@ impl E1000e {
             o if o < REGISTER_BAR_SIZE as usize => state.set(o, value),
             _ => {}
         }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct E1000eState {
+    config: Vec<u8>,
+    regs: Vec<u32>,
+    eeprom: Vec<u16>,
+    phy: Vec<u16>,
+    tx: [TxQueue; 2],
+}
+
+impl Snapshot for E1000e {
+    fn save(&self) -> Vec<u8> {
+        let state = lock(&self.state);
+        snapshot::encode(&E1000eState {
+            config: self.config.save(),
+            regs: state.regs.clone(),
+            eeprom: state.eeprom.to_vec(),
+            phy: state.phy.to_vec(),
+            tx: state.tx.clone(),
+        })
+    }
+
+    /// Frames waiting for receive descriptors aren't kept. The interrupt's level is in
+    /// the restored interrupt controllers already.
+    fn restore(&mut self, saved: &[u8]) -> Result<(), StateError> {
+        let saved: E1000eState = snapshot::decode(saved)?;
+        let mut state = lock(&self.state);
+        if saved.regs.len() != state.regs.len() {
+            return Err(StateError(
+                "the e1000e had a different register file".into(),
+            ));
+        }
+        self.config.restore(&saved.config)?;
+        state.regs = saved.regs;
+        state.eeprom = saved
+            .eeprom
+            .try_into()
+            .map_err(|_| StateError("the e1000e's EEPROM was a different size".into()))?;
+        state.phy = saved
+            .phy
+            .try_into()
+            .map_err(|_| StateError("the e1000e's PHY was a different size".into()))?;
+        state.tx = saved.tx;
+        state.backlog.clear();
+        state.msi = msi::message(&self.config, self.msi_capability);
+        Ok(())
+    }
+
+    fn quiesce(&mut self) {
+        let mut state = lock(&self.state);
+        state.paused = true;
+        state.backlog.clear();
+    }
+
+    fn resume(&mut self) {
+        let mut state = lock(&self.state);
+        state.paused = false;
+        state.wake_backend();
     }
 }
 

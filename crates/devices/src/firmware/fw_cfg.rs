@@ -51,7 +51,8 @@ pub struct FwCfg {
     /// File names, sorted, with their selector keys.
     files: BTreeMap<String, u16>,
     next_file_key: u16,
-    /// The selected item's bytes and the read offset into them.
+    /// The selected item, its bytes and the read offset into them.
+    selected: u16,
     current: Arc<[u8]>,
     offset: usize,
     dma_high: u32,
@@ -64,6 +65,7 @@ impl FwCfg {
             items: BTreeMap::new(),
             files: BTreeMap::new(),
             next_file_key: FIRST_FILE,
+            selected: 0,
             current: Arc::from([]),
             offset: 0,
             dma_high: 0,
@@ -126,6 +128,7 @@ impl FwCfg {
     }
 
     fn select(&mut self, key: u16) {
+        self.selected = key;
         self.offset = 0;
         self.current = if key == FILE_DIR {
             self.directory().into()
@@ -197,6 +200,32 @@ impl FwCfg {
         if self.memory.write_obj(result.to_be(), at).is_err() {
             tracing::warn!(address, "fw_cfg DMA: can't write the result back");
         }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FwCfgState {
+    selected: u16,
+    offset: usize,
+    dma_high: u32,
+}
+
+impl crate::snapshot::Snapshot for FwCfg {
+    fn save(&self) -> Vec<u8> {
+        crate::snapshot::encode(&FwCfgState {
+            selected: self.selected,
+            offset: self.offset,
+            dma_high: self.dma_high,
+        })
+    }
+
+    /// The items are the configuration's; a generated one is generated again.
+    fn restore(&mut self, state: &[u8]) -> Result<(), crate::snapshot::StateError> {
+        let state: FwCfgState = crate::snapshot::decode(state)?;
+        self.select(state.selected);
+        self.offset = state.offset;
+        self.dma_high = state.dma_high;
+        Ok(())
     }
 }
 

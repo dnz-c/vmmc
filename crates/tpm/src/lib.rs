@@ -87,6 +87,27 @@ impl Tpm {
         #[cfg(not(tpm_ref))]
         match self.never {}
     }
+
+    /// All of NV memory: the TPM's persistent state, and after TPM2_Shutdown(STATE)
+    /// its volatile state too.
+    pub fn nv(&self) -> Vec<u8> {
+        #[cfg(tpm_ref)]
+        return self.inner.nv();
+        #[cfg(not(tpm_ref))]
+        match self.never {}
+    }
+
+    /// Replaces NV memory, and the state file, with `nv`: the TPM is powered off and
+    /// on again with it, and a platform reset follows.
+    pub fn set_nv(&mut self, nv: &[u8]) -> Result<()> {
+        #[cfg(tpm_ref)]
+        return self.inner.set_nv(nv);
+        #[cfg(not(tpm_ref))]
+        {
+            let _ = nv;
+            match self.never {}
+        }
+    }
 }
 
 #[cfg(tpm_ref)]
@@ -244,6 +265,34 @@ mod imp {
             }
         }
 
+        pub fn nv(&self) -> Vec<u8> {
+            let mut image = vec![0u8; NV_SIZE];
+            // SAFETY: `image` is NV_SIZE bytes, all of NV memory.
+            unsafe {
+                ffi::_plat__NvMemoryRead(0, NV_SIZE as u32, image.as_mut_ptr().cast());
+            }
+            image
+        }
+
+        pub fn set_nv(&mut self, nv: &[u8]) -> Result<()> {
+            if nv.len() != NV_SIZE {
+                return Err(Error::BadState(self.path.clone()));
+            }
+            // SAFETY: OPEN makes this the only user of the library's globals. The image
+            // is NV_SIZE bytes, all of NV memory.
+            unsafe {
+                ffi::_plat__Signal_PowerOff();
+                ffi::_plat__NvMemoryWrite(0, NV_SIZE as u32, nv.as_ptr().cast_mut().cast());
+                ffi::_plat__SetNvAvail();
+                ffi::_plat__Signal_PowerOn();
+                ffi::_plat__Signal_Reset();
+            }
+            self.save().map_err(|source| Error::State {
+                path: self.path.clone(),
+                source,
+            })
+        }
+
         /// Writes NV memory to the state file if it changed, through a temporary file
         /// so a crash never leaves half of it.
         fn save(&mut self) -> std::io::Result<()> {
@@ -347,6 +396,17 @@ mod tests {
                 .any(|window| window == ek[0].as_slice()),
             "the certificate holds the EK's modulus"
         );
+
+        // Saved as a suspend saves it, and taken back, as a snapshot does: it resumes.
+        const SHUTDOWN_STATE: [u8; 12] = [0x80, 0x01, 0, 0, 0, 12, 0, 0, 0x01, 0x45, 0, 1];
+        const STARTUP_STATE: [u8; 12] = [0x80, 0x01, 0, 0, 0, 12, 0, 0, 0x01, 0x44, 0, 1];
+        assert_eq!(response_code(&tpm.execute(0, &SHUTDOWN_STATE)), 0);
+        let suspended = tpm.nv();
+        assert_eq!(suspended.len(), NV_SIZE);
+        tpm.set_nv(&suspended).unwrap();
+        assert_eq!(response_code(&tpm.execute(0, &STARTUP_STATE)), 0);
+        assert_eq!(response_code(&tpm.execute(0, &GET_RANDOM_8)), 0);
+        assert_eq!(std::fs::read(&path).unwrap().len(), NV_SIZE);
         drop(tpm);
 
         // The same TPM again, from its state file.

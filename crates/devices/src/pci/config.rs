@@ -153,6 +153,24 @@ impl ConfigSpace {
         self.u16_at(COMMAND)
     }
 
+    /// The registers' contents, for a snapshot. The layout (BARs, capabilities, what's
+    /// writable) is the device's own, from when it was built.
+    pub fn save(&self) -> Vec<u8> {
+        self.regs.to_vec()
+    }
+
+    /// Puts back what [`ConfigSpace::save`] saved.
+    pub fn restore(&mut self, regs: &[u8]) -> Result<(), crate::snapshot::StateError> {
+        if regs.len() != CONFIG_SIZE {
+            return Err(crate::snapshot::StateError(format!(
+                "{} bytes of PCI configuration space, not {CONFIG_SIZE}",
+                regs.len()
+            )));
+        }
+        self.regs.copy_from_slice(regs);
+        Ok(())
+    }
+
     /// Declares a BAR. `size` must be a power of two of at least 16 bytes.
     pub fn add_bar(&mut self, index: usize, kind: BarKind, size: u64, prefetchable: bool) {
         assert!(size.is_power_of_two() && size >= 16, "BAR size {size:#x}");

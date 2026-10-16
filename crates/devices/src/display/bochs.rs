@@ -22,10 +22,12 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use serde::{Deserialize, Serialize};
 use vm_core::{MemoryAccess, RamMapper, RamRegion};
 
 use super::edid::{EDID_SIZE, edid};
 use crate::pci::{BarKind, ConfigSpace, Identity, PciDevice};
+use crate::snapshot::{self, Snapshot, StateError};
 
 pub const FRAMEBUFFER_BAR: u8 = 0;
 pub const FRAMEBUFFER_SIZE: u64 = 32 << 20;
@@ -104,7 +106,7 @@ struct State {
 }
 
 /// The cursor registers, as the guest set them.
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct CursorRegisters {
     control: u32,
     size: u32,
@@ -459,6 +461,64 @@ impl BochsDisplay {
             Y_OFFSET => state.registers[Y_OFFSET] = value,
             _ => {}
         }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct BochsState {
+    config: Vec<u8>,
+    registers: [u16; REGISTERS],
+    getcaps: bool,
+    request: (u32, u32),
+    request_count: u32,
+    cursor: CursorRegisters,
+    /// The framebuffer, without its trailing zeroes.
+    framebuffer: Vec<u8>,
+}
+
+impl Snapshot for BochsDisplay {
+    fn save(&self) -> Vec<u8> {
+        let state = lock(&self.display.state);
+        let mut framebuffer = vec![0u8; FRAMEBUFFER_SIZE as usize];
+        self.display.framebuffer.read(0, &mut framebuffer);
+        let used = framebuffer
+            .iter()
+            .rposition(|&byte| byte != 0)
+            .map_or(0, |last| last + 1);
+        framebuffer.truncate(used);
+        snapshot::encode(&BochsState {
+            config: self.config.save(),
+            registers: state.registers,
+            getcaps: state.getcaps,
+            request: state.request,
+            request_count: state.request_count,
+            cursor: state.cursor,
+            framebuffer,
+        })
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), StateError> {
+        let saved: BochsState = snapshot::decode(state)?;
+        if saved.framebuffer.len() as u64 > FRAMEBUFFER_SIZE {
+            return Err(StateError("the framebuffer was bigger".into()));
+        }
+        self.config.restore(&saved.config)?;
+        {
+            let mut state = lock(&self.display.state);
+            state.registers = saved.registers;
+            state.getcaps = saved.getcaps;
+            state.request = saved.request;
+            state.request_count = saved.request_count;
+            state.edid = edid(saved.request.0, saved.request.1);
+            state.cursor = saved.cursor;
+        }
+        let zeroes = vec![0u8; FRAMEBUFFER_SIZE as usize - saved.framebuffer.len()];
+        self.display.framebuffer.write(0, &saved.framebuffer);
+        self.display
+            .framebuffer
+            .write(saved.framebuffer.len(), &zeroes);
+        self.sync_mapping();
+        Ok(())
     }
 }
 

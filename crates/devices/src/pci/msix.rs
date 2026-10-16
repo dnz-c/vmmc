@@ -2,8 +2,20 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use super::ConfigSpace;
 use crate::irq::{MsiMessage, MsiSink};
+use crate::snapshot::StateError;
+
+/// An [`MsixTable`]'s state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MsixState {
+    entries: Vec<[u32; 4]>,
+    pending: Vec<bool>,
+    enabled: bool,
+    function_masked: bool,
+}
 
 pub const CAPABILITY_ID: u8 = 0x11;
 /// Bytes per table entry: address low, address high, data, vector control.
@@ -68,6 +80,32 @@ impl MsixTable {
 
     pub fn len(&self) -> u16 {
         self.entries.len() as u16
+    }
+
+    pub fn save(&self) -> MsixState {
+        MsixState {
+            entries: self.entries.clone(),
+            pending: self.pending.clone(),
+            enabled: self.enabled,
+            function_masked: self.function_masked,
+        }
+    }
+
+    /// Puts back what [`MsixTable::save`] saved. Nothing is delivered: what was
+    /// pending stays pending until the guest unmasks it.
+    pub fn restore(&mut self, state: MsixState) -> Result<(), StateError> {
+        if state.entries.len() != self.entries.len() || state.pending.len() != self.pending.len() {
+            return Err(StateError(format!(
+                "{} MSI-X vectors, not {}",
+                state.entries.len(),
+                self.entries.len()
+            )));
+        }
+        self.entries = state.entries;
+        self.pending = state.pending;
+        self.enabled = state.enabled;
+        self.function_masked = state.function_masked;
+        Ok(())
     }
 
     pub fn is_empty(&self) -> bool {

@@ -20,7 +20,7 @@ pub const ILLEGAL_REQUEST: u8 = 0x05;
 pub const UNIT_ATTENTION: u8 = 0x06;
 
 /// Sense key, additional sense code and qualifier.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Sense {
     pub key: u8,
     pub asc: u8,
@@ -72,6 +72,15 @@ pub enum Outcome {
     Data(Vec<u8>),
     /// CHECK CONDITION; the sense data is kept for REQUEST SENSE.
     Error(Sense),
+}
+
+/// A [`Cdrom`]'s state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CdromState {
+    sense: Sense,
+    media_event: bool,
+    unit_attention: bool,
+    had_medium: bool,
 }
 
 /// An optical drive and its medium.
@@ -220,6 +229,28 @@ impl Cdrom {
                 self.sense = sense;
                 Outcome::Error(sense)
             }
+        }
+    }
+
+    /// The drive's state, for a snapshot.
+    pub fn save(&self) -> CdromState {
+        CdromState {
+            sense: self.sense,
+            media_event: self.media_event,
+            unit_attention: self.unit_attention,
+            had_medium: self.medium.is_some(),
+        }
+    }
+
+    /// Puts back what [`Cdrom::save`] saved. If the drive's disc isn't the one it had
+    /// (one where there was none, or the other way round), the guest hears it changed.
+    pub fn restore(&mut self, state: CdromState) {
+        self.sense = state.sense;
+        self.media_event = state.media_event;
+        self.unit_attention = state.unit_attention;
+        if state.had_medium != self.medium.is_some() {
+            self.media_event = self.medium.is_some();
+            self.unit_attention = true;
         }
     }
 

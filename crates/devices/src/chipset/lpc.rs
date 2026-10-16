@@ -10,6 +10,7 @@ use vm_core::{Bus, SharedDevice};
 
 use super::touches;
 use crate::pci::{ConfigSpace, Identity, PciDevice};
+use crate::snapshot::{self, Snapshot, StateError};
 
 pub const LPC_SLOT: u8 = 0x1f;
 pub const LPC_FUNCTION: u8 = 0;
@@ -93,6 +94,18 @@ impl Ich9Lpc {
                 Err(e) => tracing::warn!(base, %e, "can't place the ACPI PM block"),
             }
         }
+    }
+}
+
+impl Snapshot for Ich9Lpc {
+    fn save(&self) -> Vec<u8> {
+        snapshot::encode(&self.config.save())
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), StateError> {
+        self.config.restore(&snapshot::decode::<Vec<u8>>(state)?)?;
+        self.sync_pm();
+        Ok(())
     }
 }
 

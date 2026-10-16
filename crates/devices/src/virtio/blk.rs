@@ -5,8 +5,8 @@
 //! disk before any I/O happens.
 
 use std::io::{Read, Write};
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 
 use disk::BlockBackend;
@@ -15,7 +15,7 @@ use virtio_bindings::virtio_blk::{
     VIRTIO_BLK_ID_BYTES, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP,
     VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_GET_ID, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT,
 };
-use virtio_queue::{DescriptorChain, Queue, QueueT};
+use virtio_queue::{DescriptorChain, Queue, QueueState, QueueT};
 use vm_memory::GuestMemoryMmap;
 
 use super::{
@@ -33,12 +33,15 @@ const ID_BYTES: usize = VIRTIO_BLK_ID_BYTES as usize;
 
 enum Message {
     Notify,
+    /// Answered once everything before it is done.
+    Sync(Sender<()>),
     Stop,
 }
 
 struct Worker {
     messages: Sender<Message>,
     thread: JoinHandle<()>,
+    queue: Arc<Mutex<Queue>>,
 }
 
 pub struct VirtioBlk {
@@ -116,11 +119,24 @@ impl VirtioDevice for VirtioBlk {
         let (messages, inbox) = mpsc::channel();
         let backend = self.backend.clone();
         let serial = self.serial;
+        let queue = Arc::new(Mutex::new(queue));
         let thread = thread::Builder::new()
             .name("virtio-blk".into())
-            .spawn(move || run(inbox, memory, queue, interrupt, &*backend, &serial))
+            .spawn({
+                let queue = queue.clone();
+                move || run(inbox, memory, &queue, interrupt, &*backend, &serial)
+            })
             .map_err(|e| e.to_string())?;
-        self.worker = Some(Worker { messages, thread });
+        self.worker = Some(Worker {
+            messages,
+            thread,
+            queue,
+        });
+        // Requests made before a snapshot that saved this queue are served now.
+        let _ = self
+            .worker
+            .as_ref()
+            .map(|w| w.messages.send(Message::Notify));
         Ok(())
     }
 
@@ -136,6 +152,28 @@ impl VirtioDevice for VirtioBlk {
             let _ = worker.thread.join();
         }
     }
+
+    fn queue_states(&self) -> Vec<QueueState> {
+        self.worker
+            .iter()
+            .map(|worker| {
+                worker
+                    .queue
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .state()
+            })
+            .collect()
+    }
+
+    fn quiesce(&mut self) {
+        if let Some(worker) = &self.worker {
+            let (done, wait) = mpsc::channel();
+            if worker.messages.send(Message::Sync(done)).is_ok() {
+                let _ = wait.recv();
+            }
+        }
+    }
 }
 
 impl Drop for VirtioBlk {
@@ -147,20 +185,36 @@ impl Drop for VirtioBlk {
 fn run(
     inbox: Receiver<Message>,
     memory: GuestMemoryMmap,
-    mut queue: Queue,
+    queue: &Mutex<Queue>,
     interrupt: Arc<dyn QueueInterrupt>,
     backend: &dyn BlockBackend,
     serial: &[u8; ID_BYTES],
 ) {
-    while let Ok(Message::Notify) = inbox.recv() {
+    let mut broken = false;
+    loop {
+        let mut syncs = Vec::new();
+        match inbox.recv() {
+            Ok(Message::Notify) => {}
+            Ok(Message::Sync(done)) => {
+                let _ = done.send(());
+                continue;
+            }
+            Ok(Message::Stop) | Err(_) => return,
+        }
+        if broken {
+            continue;
+        }
+        let mut queue = queue.lock().unwrap_or_else(PoisonError::into_inner);
         if let Err(e) = process_queue(&memory, &mut queue, backend, serial) {
             tracing::error!(%e, "virtio-blk queue is broken; ignoring it until reset");
-            return;
+            broken = true;
+            continue;
         }
         // Coalesce notifications that arrived while we worked: one pass covered them.
         loop {
             match inbox.try_recv() {
                 Ok(Message::Notify) => continue,
+                Ok(Message::Sync(done)) => syncs.push(done),
                 Ok(Message::Stop) | Err(mpsc::TryRecvError::Disconnected) => return,
                 Err(mpsc::TryRecvError::Empty) => break,
             }
@@ -168,6 +222,10 @@ fn run(
         match queue.needs_notification(&memory) {
             Ok(false) => {}
             Ok(true) | Err(_) => interrupt.signal_queue(0),
+        }
+        drop(queue);
+        for done in syncs {
+            let _ = done.send(());
         }
     }
 }

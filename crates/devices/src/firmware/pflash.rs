@@ -37,7 +37,7 @@ const STATUS_PROGRAM_ERROR: u8 = 0x10;
 const MANUFACTURER_ID: u8 = 0x89;
 const DEVICE_ID: u8 = 0x18;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Mode {
     ReadArray,
     ReadStatus,
@@ -231,6 +231,56 @@ impl Pflash {
             0x30 => (BLOCK_SIZE >> 16) as u8,
             _ => 0,
         }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PflashState {
+    mode: Mode,
+    status: u8,
+    /// A writable flash's contents.
+    contents: Option<Vec<u8>>,
+}
+
+impl crate::snapshot::Snapshot for Pflash {
+    fn save(&self) -> Vec<u8> {
+        let contents = self.writable.then(|| {
+            let mut contents = vec![0u8; self.contents.len()];
+            self.contents.read(0, &mut contents);
+            contents
+        });
+        crate::snapshot::encode(&PflashState {
+            mode: self.mode,
+            status: self.status,
+            contents,
+        })
+    }
+
+    /// A writable flash's contents go back into its backing file too: reverting a VM
+    /// reverts its UEFI variables.
+    fn restore(&mut self, state: &[u8]) -> Result<(), crate::snapshot::StateError> {
+        let state: PflashState = crate::snapshot::decode(state)?;
+        if let Some(contents) = state.contents {
+            if !self.writable || contents.len() != self.contents.len() {
+                return Err(crate::snapshot::StateError(
+                    "the flash was a different size".into(),
+                ));
+            }
+            self.contents.write(0, &contents);
+            if let Some(file) = &mut self.backing {
+                use std::io::{Seek, SeekFrom, Write};
+                let written = file
+                    .seek(SeekFrom::Start(0))
+                    .and_then(|_| file.write_all(&contents))
+                    .and_then(|()| file.flush());
+                written.map_err(|e| {
+                    crate::snapshot::StateError(format!("can't write the UEFI variables: {e}"))
+                })?;
+            }
+        }
+        self.status = state.status;
+        self.set_mode(state.mode);
+        Ok(())
     }
 }
 

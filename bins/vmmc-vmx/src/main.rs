@@ -235,6 +235,14 @@ impl TpmBackend for VmTpm {
     fn reset(&mut self) {
         self.0.reset();
     }
+
+    fn nv(&self) -> Vec<u8> {
+        self.0.nv()
+    }
+
+    fn set_nv(&mut self, nv: &[u8]) -> Result<(), String> {
+        self.0.set_nv(nv).map_err(|e| e.to_string())
+    }
 }
 
 /// Who drives the VM.
