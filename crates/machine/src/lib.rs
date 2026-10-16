@@ -4,13 +4,15 @@
 //! [`Machine::new`] builds the VM and its devices. A machine either boots UEFI firmware
 //! ([`MachineConfig::firmware`]) or a kernel prepared with [`Machine::load_linux`].
 //! [`Machine::run`] runs one thread per vCPU until the guest powers off, resets, or
-//! fails.
+//! fails. [`Machine::snapshotter`] saves a running machine's whole state, and
+//! [`Machine::restore`] starts a new one from it (see [`snapshot`]).
 
 pub mod acpi;
 pub mod boot;
 pub mod layout;
 mod msi;
 pub mod smbios;
+pub mod snapshot;
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -21,7 +23,7 @@ use std::time::Duration;
 
 use devices::chipset::lpc::{Ich9Lpc, LPC_FUNCTION, LPC_SLOT};
 use devices::chipset::mch::{MCH_SLOT, Mch};
-use devices::clock::{Clock, HostClock};
+use devices::clock::{Clock, VmClock};
 use devices::display::bochs::{
     BochsDisplay, FRAMEBUFFER_BAR, FRAMEBUFFER_SIZE, MMIO_BAR, MMIO_SIZE,
 };
@@ -46,6 +48,7 @@ use devices::nic::e1000e::{
 };
 use devices::pci::root::{CONFIG_IO_BASE, CONFIG_IO_PORTS, PciConfigIo, PciEcam, PciRoot};
 use devices::pci::{PciDevice, SharedPciDevice};
+use devices::snapshot::Snapshot;
 pub use devices::storage::ahci::DiscDrive;
 use devices::storage::ahci::{
     ABAR, ABAR_SIZE, AHCI_FUNCTION, AHCI_SLOT, Ahci, Drive, PORTS as AHCI_PORTS,
@@ -74,6 +77,8 @@ use crate::layout::{
     MemoryLayout, Mmio32Allocator, RAM_ABOVE_4G_START, mmio32_window,
 };
 pub use crate::msi::HvMsiSink;
+use crate::snapshot::{Pause, SavedDevice};
+pub use crate::snapshot::{STATE_FORMAT, Snapshotter};
 
 /// Most vCPUs a machine can have (xAPIC physical destination IDs).
 pub const MAX_CPUS: u8 = 32;
@@ -114,6 +119,8 @@ pub enum Error {
     Display(io::Error),
     #[error("can't start a thread: {0}")]
     Thread(io::Error),
+    #[error("saved state: {0}")]
+    State(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -289,6 +296,19 @@ pub struct Machine<P: Partition> {
     boot: Option<BootEntry>,
     /// What went wrong, if a vCPU stopped the machine with an error.
     error: Arc<Mutex<Option<String>>>,
+    /// The devices' clock, which stands still while the machine is paused.
+    clock: Arc<VmClock>,
+    /// What a snapshot saves, by name.
+    saved_devices: Arc<Vec<SavedDevice>>,
+    pause: Arc<Pause>,
+    snapshotting: Arc<Mutex<()>>,
+    /// The vCPUs' states, after a restore: the run starts them from these.
+    restored: Mutex<Option<Vec<hv::VcpuState>>>,
+}
+
+/// `device`, as a snapshot saves it.
+fn saved<T: Snapshot + 'static>(name: &'static str, device: &Arc<Mutex<T>>) -> SavedDevice {
+    (name, device.clone() as Arc<Mutex<dyn Snapshot>>)
 }
 
 fn shared<T: BusDevice + 'static>(device: T) -> Arc<Mutex<T>> {
@@ -326,7 +346,9 @@ impl<P: Partition + 'static> Machine<P> {
             &layout.ram,
         )?;
 
-        let clock: Arc<dyn Clock> = Arc::new(HostClock::new());
+        let vm_clock = Arc::new(VmClock::new());
+        let clock: Arc<dyn Clock> = vm_clock.clone();
+        let mut saved_devices: Vec<SavedDevice> = Vec::new();
         let sink: Arc<dyn MsiSink> = Arc::new(HvMsiSink::new(vm.interrupts()));
         let stop = vm.stop_handle();
         let power: PowerHandler = Arc::new(move |event| {
@@ -338,11 +360,14 @@ impl<P: Partition + 'static> Machine<P> {
 
         let ioapic = shared(IoApic::new(acpi::IOAPIC_ID, sink.clone()));
         vm.mmio().insert(IOAPIC_BASE, IOAPIC_SIZE, ioapic.clone())?;
+        saved_devices.push(saved("ioapic", &ioapic));
         let tpm = config.tpm.take();
+        let mut crb = None;
         if let Some(tpm) = &tpm {
             tpm.lock().unwrap_or_else(PoisonError::into_inner).reset();
-            vm.mmio()
-                .insert(TPM_BASE, TPM_SIZE, shared(Crb::new(tpm.clone())))?;
+            let device = shared(Crb::new(tpm.clone()));
+            vm.mmio().insert(TPM_BASE, TPM_SIZE, device.clone())?;
+            crb = Some(device);
         }
         vm.set_eoi_handler({
             let ioapic = ioapic.clone();
@@ -360,19 +385,20 @@ impl<P: Partition + 'static> Machine<P> {
         let ticker = ThreadTicker::new("pit-irq0", move || irq0.pulse()).map_err(Error::Thread)?;
         let pit = shared(Pit::new(clock.clone(), Box::new(ticker)));
         pio.insert(PIT_BASE.into(), PIT_PORTS.into(), pit.clone())?;
-        pio.insert(PORT_61.into(), 1, shared(Port61(pit)))?;
+        pio.insert(PORT_61.into(), 1, shared(Port61(pit.clone())))?;
 
-        pio.insert(
-            MASTER_BASE.into(),
-            PIC_PORTS.into(),
-            shared(Pic8259::default()),
-        )?;
-        pio.insert(
-            SLAVE_BASE.into(),
-            PIC_PORTS.into(),
-            shared(Pic8259::default()),
-        )?;
-        pio.insert(ELCR_BASE.into(), ELCR_PORTS.into(), shared(Elcr::default()))?;
+        let master = shared(Pic8259::default());
+        pio.insert(MASTER_BASE.into(), PIC_PORTS.into(), master.clone())?;
+        let slave = shared(Pic8259::default());
+        pio.insert(SLAVE_BASE.into(), PIC_PORTS.into(), slave.clone())?;
+        let elcr = shared(Elcr::default());
+        pio.insert(ELCR_BASE.into(), ELCR_PORTS.into(), elcr.clone())?;
+        saved_devices.extend([
+            saved("pic-master", &master),
+            saved("pic-slave", &slave),
+            saved("elcr", &elcr),
+            saved("pit", &pit),
+        ]);
         let rtc_interrupt = RtcInterrupt::new(irq(RTC_IRQ));
         let rtc_ticker = ThreadTicker::new("rtc-irq8", {
             let interrupt = rtc_interrupt.clone();
@@ -388,21 +414,35 @@ impl<P: Partition + 'static> Machine<P> {
         let i8042 = shared(I8042::new(irq(KEYBOARD_IRQ), irq(MOUSE_IRQ), power.clone()));
         let ps2 = Ps2Input(i8042.clone());
         pio.insert(I8042_DATA.into(), 1, i8042.clone())?;
-        pio.insert(I8042_COMMAND.into(), 1, shared(I8042CommandPort(i8042)))?;
+        pio.insert(
+            I8042_COMMAND.into(),
+            1,
+            shared(I8042CommandPort(i8042.clone())),
+        )?;
 
         let serial = shared(Serial::new(irq(COM1_IRQ), config.serial_output));
         pio.insert(COM1_BASE.into(), SERIAL_PORTS.into(), serial.clone())?;
-        pio.insert(POST_PORT.into(), 1, shared(PostPort::default()))?;
+        let post = shared(PostPort::default());
+        pio.insert(POST_PORT.into(), 1, post.clone())?;
 
         let root = Arc::new(Mutex::new(PciRoot::new(vm.mmio().clone())));
         let display;
         let usb;
         let disc_drives;
+        let config_io = shared(PciConfigIo::new(root.clone(), power));
         pio.insert(
             CONFIG_IO_BASE.into(),
             CONFIG_IO_PORTS.into(),
-            shared(PciConfigIo::new(root.clone(), power)),
+            config_io.clone(),
         )?;
+        saved_devices.extend([
+            saved("rtc", &rtc),
+            saved("acpi-pm", &acpi_pm),
+            saved("i8042", &i8042),
+            saved("serial0", &serial),
+            saved("post", &post),
+            saved("pci-config", &config_io),
+        ]);
         // ECAM starts where firmware would put it; firmware may move it, and the PM
         // block too.
         let ecam = shared(PciEcam(Arc::downgrade(&root)));
@@ -590,6 +630,10 @@ impl<P: Partition + 'static> Machine<P> {
             }
         }
 
+        saved_devices.push(saved("pci", &root));
+        if let Some(crb) = &crb {
+            saved_devices.push(saved("tpm", crb));
+        }
         let platform = Arc::new(PlatformState {
             cpus: config.cpus,
             tpm: tpm.is_some(),
@@ -610,7 +654,7 @@ impl<P: Partition + 'static> Machine<P> {
                 Some(tables.rsdp)
             }
             Some(firmware) => {
-                add_firmware(&vm, &layout, &rtc, &platform, firmware)?;
+                saved_devices.extend(add_firmware(&vm, &layout, &rtc, &platform, firmware)?);
                 None
             }
         };
@@ -628,7 +672,50 @@ impl<P: Partition + 'static> Machine<P> {
             disc_drives,
             boot: None,
             error: Arc::default(),
+            clock: vm_clock,
+            saved_devices: Arc::new(saved_devices),
+            pause: Arc::default(),
+            snapshotting: Arc::default(),
+            restored: Mutex::new(None),
         })
+    }
+
+    /// RAM, as (guest-physical address, length) ranges.
+    fn ram(&self) -> Vec<(u64, u64)> {
+        self.layout
+            .ram
+            .iter()
+            .map(|&(address, size)| (address, size as u64))
+            .collect()
+    }
+
+    /// A handle that saves the machine's whole state while it runs, from any thread.
+    pub fn snapshotter(&self) -> Snapshotter {
+        Snapshotter {
+            pause: self.pause.clone(),
+            stop: self.vm.stop_handle(),
+            time: self.vm.time_control(),
+            clock: self.clock.clone(),
+            memory: self.vm.memory().clone(),
+            ram: self.ram(),
+            cpus: self.cpus,
+            devices: self.saved_devices.clone(),
+            saving: self.snapshotting.clone(),
+        }
+    }
+
+    /// Before [`Machine::run`]: puts back the state a [`Snapshotter`] saved to
+    /// `input`, from a machine built with the same configuration. The run then carries
+    /// on from it rather than booting.
+    pub fn restore(&mut self, input: &mut dyn Read) -> Result<()> {
+        let restored = snapshot::restore(input, &self.snapshotter(), |state| {
+            Ok(self.vm.restore_state(state)?)
+        })?;
+        // The devices' clock waits for the guest's, which the run resumes.
+        self.clock.pause();
+        self.boot = None;
+        *lock(&self.restored) = Some(restored.vcpus);
+        Ok(())
     }
 
     /// Prepares a direct boot of `kernel` (a bzImage) with `initrd` and `cmdline`.
@@ -693,10 +780,13 @@ impl<P: Partition + 'static> Machine<P> {
     /// Runs the guest until it powers off, resets or fails, or the host stops it.
     pub fn run(&self) -> Result<RunOutcome> {
         let stop = self.vm.stop_handle();
+        let restored = lock(&self.restored).take();
         let mut vcpus = Vec::with_capacity(self.cpus.into());
         for index in 0..u32::from(self.cpus) {
             let mut vcpu = self.vm.create_vcpu(index)?;
-            if index == 0 {
+            if let Some(states) = &restored {
+                vcpu.restore_state(&states[index as usize])?;
+            } else if index == 0 {
                 let (regs, sregs) = match &self.boot {
                     Some(entry) => boot::boot_cpu_registers(entry, &vcpu.sregs()?),
                     None => boot::reset_registers(),
@@ -708,15 +798,24 @@ impl<P: Partition + 'static> Machine<P> {
             }
             vcpus.push(vcpu);
         }
+        if restored.is_some() {
+            self.vm.resume_time()?;
+            self.clock.resume();
+        }
 
         thread::scope(|scope| -> Result<()> {
             let mut threads = Vec::with_capacity(vcpus.len());
             for vcpu in vcpus {
                 let vcpu_stop = stop.clone();
                 let error = self.error.clone();
+                let pause = self.pause.clone();
                 let thread = thread::Builder::new()
                     .name(format!("vcpu{}", vcpu.index()))
-                    .spawn_scoped(scope, move || run_vcpu(vcpu, &vcpu_stop, &error));
+                    .spawn_scoped(scope, move || {
+                        pause.enter();
+                        run_vcpu(vcpu, &vcpu_stop, &error, &pause);
+                        pause.leave();
+                    });
                 match thread {
                     Ok(thread) => threads.push(thread),
                     Err(e) => {
@@ -832,7 +931,7 @@ fn add_firmware<P: Partition + 'static>(
     rtc: &Mutex<Rtc>,
     platform: &Arc<PlatformState>,
     firmware: FirmwareConfig,
-) -> Result<()> {
+) -> Result<Vec<SavedDevice>> {
     let vars_error = |source| Error::FirmwareVars {
         path: firmware.vars.clone(),
         source,
@@ -866,13 +965,15 @@ fn add_firmware<P: Partition + 'static>(
     let code_base = RAM_ABOVE_4G_START - firmware.code.len() as u64;
     let vars_base = code_base - vars.len() as u64;
     let mapper = vm.ram_mapper();
-    let vars_flash =
-        Pflash::new(vars_base, &vars, mapper.clone(), Some(vars_file)).map_err(Error::Flash)?;
+    let vars_flash = shared(
+        Pflash::new(vars_base, &vars, mapper.clone(), Some(vars_file)).map_err(Error::Flash)?,
+    );
     vm.mmio()
-        .insert(vars_base, vars.len() as u64, shared(vars_flash))?;
-    let code_flash = Pflash::read_only(code_base, &firmware.code, mapper).map_err(Error::Flash)?;
+        .insert(vars_base, vars.len() as u64, vars_flash.clone())?;
+    let code_flash =
+        shared(Pflash::read_only(code_base, &firmware.code, mapper).map_err(Error::Flash)?);
     vm.mmio()
-        .insert(code_base, firmware.code.len() as u64, shared(code_flash))?;
+        .insert(code_base, firmware.code.len() as u64, code_flash.clone())?;
 
     if let Some(log) = firmware.debug_log {
         vm.pio()
@@ -947,9 +1048,14 @@ fn add_firmware<P: Partition + 'static>(
     fw_cfg.add_file(smbios::ANCHOR_FILE, smbios.anchor);
     fw_cfg.add_file(smbios::TABLES_FILE, smbios.tables);
 
+    let fw_cfg = shared(fw_cfg);
     vm.pio()
-        .insert(FW_CFG_BASE.into(), FW_CFG_PORTS.into(), shared(fw_cfg))?;
-    Ok(())
+        .insert(FW_CFG_BASE.into(), FW_CFG_PORTS.into(), fw_cfg.clone())?;
+    Ok(vec![
+        saved("flash-code", &code_flash),
+        saved("flash-vars", &vars_flash),
+        saved("fw-cfg", &fw_cfg),
+    ])
 }
 
 fn record_error(slot: &Mutex<Option<String>>, message: String) {
@@ -964,9 +1070,17 @@ fn run_vcpu<P: Partition>(
     mut vcpu: VmVcpu<'_, P>,
     stop: &StopHandle,
     error: &Mutex<Option<String>>,
+    pause: &Pause,
 ) {
     let index = vcpu.index();
-    match vcpu.run() {
+    let mut exit = vcpu.run();
+    // A pause (for a snapshot) parks the vCPU, then it runs on.
+    while let Ok(VmExit::Paused) = exit {
+        pause.park(&vcpu, stop);
+        exit = vcpu.run();
+    }
+    match exit {
+        Ok(VmExit::Paused) => unreachable!("handled above"),
         Ok(VmExit::Stopped(_)) => {
             // Where the guest was, for debugging hangs.
             if tracing::enabled!(tracing::Level::DEBUG)
@@ -985,9 +1099,16 @@ fn run_vcpu<P: Partition>(
         }
         Ok(VmExit::Halt) => {
             // Halted with interrupts off: only INIT or NMI could wake it, and nothing
-            // sends those. Wait for the rest of the machine to stop.
+            // sends those. Wait for the rest of the machine to stop (parking for a
+            // snapshot meanwhile).
             tracing::debug!(index, "vCPU halted with interrupts disabled");
-            while stop.wait(Duration::from_secs(1)).is_none() {}
+            while stop.reason().is_none() {
+                if stop.is_paused() {
+                    pause.park(&vcpu, stop);
+                } else {
+                    stop.wait(Duration::from_millis(100));
+                }
+            }
         }
         Ok(VmExit::Shutdown) => {
             tracing::warn!(index, "vCPU triple-faulted");

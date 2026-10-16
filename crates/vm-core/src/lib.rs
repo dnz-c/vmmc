@@ -11,7 +11,7 @@ mod vm;
 pub use bus::{Bus, BusDevice, SharedDevice};
 pub use hv::MemoryAccess;
 pub use ram::{RamMapper, RamRegion};
-pub use vm::{StopHandle, StopReason, Vm, VmExit, VmVcpu};
+pub use vm::{StopHandle, StopReason, TimeControl, Vm, VmExit, VmVcpu};
 pub use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
 
 pub type Result<T> = std::result::Result<T, Error>;

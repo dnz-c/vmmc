@@ -8,6 +8,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+lz4_flex.workspace = true
+postcard.workspace = true
+serde.workspace = true
 acpi_tables.workspace = true
 devices.workspace = true
 disk.workspace = true

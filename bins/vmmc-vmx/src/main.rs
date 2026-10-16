@@ -167,6 +167,14 @@ struct RunArgs {
     /// Memory in MiB [default: the VM's, or 1024].
     #[arg(long)]
     memory: Option<u64>,
+    /// Where Ctrl-A v saves the running VM's whole state (and lets it run on), and
+    /// Ctrl-A u saves it and stops the VM (a suspend).
+    #[arg(long, value_name = "FILE")]
+    save_state: Option<PathBuf>,
+    /// Start from a state Ctrl-A v or u saved, rather than booting. The VM must be
+    /// configured as it was then, with its disks as they were.
+    #[arg(long, value_name = "FILE")]
+    restore: Option<PathBuf>,
 }
 
 /// Where a build keeps the firmware: next to the program, or in `target\native` for
@@ -545,7 +553,7 @@ fn run(args: RunArgs, frontend: Frontend) -> Result<RunOutcome, Box<dyn Error>> 
         )),
         None => None,
     };
-    let targets = console::Targets::new(screenshots.clone());
+    let targets = console::Targets::new(screenshots.clone(), args.save_state.clone());
     let _raw = match frontend {
         Frontend::Console => {
             let raw = console::RawConsole::enable();
@@ -675,6 +683,18 @@ fn run_machines(
         {
             machine.load_linux(kernel, initrd.as_deref(), cmdline)?;
         }
+        // Only the first machine starts from a saved state; a reset boots afresh.
+        if let Some(path) = args.restore.take() {
+            let file =
+                fs::File::open(&path).map_err(|e| format!("can't open {}: {e}", path.display()))?;
+            machine
+                .restore(&mut std::io::BufReader::with_capacity(1 << 20, file))
+                .map_err(|e| format!("can't restore {}: {e}", path.display()))?;
+            eprint!(
+                "\r\nvmmc-vmx: restored the VM's state from {}\r\n",
+                path.display()
+            );
+        }
         targets.set(Some(console::Target {
             serial: machine.serial_input(),
             power: machine.power_button(),
@@ -684,6 +704,7 @@ fn run_machines(
             ps2: machine.ps2_input(),
             usb: machine.usb_input(),
             discs: machine.disc_drives(),
+            snapshot: machine.snapshotter(),
         }));
         let outcome = machine.run();
         targets.set(None);

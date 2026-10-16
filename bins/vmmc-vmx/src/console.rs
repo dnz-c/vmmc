@@ -9,6 +9,7 @@
 //! literal Ctrl-A.
 
 use std::io::{self, Read, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
@@ -35,6 +36,9 @@ pub enum Input {
     Screenshot,
     DumpState,
     SaveMemory,
+    /// Save the VM's whole state and let it run on (Ctrl-A v), or stop it (Ctrl-A u).
+    SaveState,
+    Suspend,
     /// Ask the guest for a screen this size.
     RequestSize(u32, u32),
     Quit,
@@ -107,6 +111,14 @@ impl EscapeFilter {
                         flush(&mut bytes, &mut out, self.typing);
                         out.push(Input::SaveMemory);
                     }
+                    b'v' | b'V' => {
+                        flush(&mut bytes, &mut out, self.typing);
+                        out.push(Input::SaveState);
+                    }
+                    b'u' | b'U' => {
+                        flush(&mut bytes, &mut out, self.typing);
+                        out.push(Input::Suspend);
+                    }
                     b'k' | b'K' => {
                         flush(&mut bytes, &mut out, self.typing);
                         self.typing = !self.typing;
@@ -138,6 +150,7 @@ pub struct Target {
     pub ps2: Ps2Input,
     pub usb: UsbInput,
     pub discs: Vec<machine::DiscDrive>,
+    pub snapshot: machine::Snapshotter,
 }
 
 /// Where console input goes. A guest reset rebuilds the machine, so the target changes
@@ -147,15 +160,52 @@ pub struct Targets {
     current: Arc<Mutex<Option<Target>>>,
     quit: Arc<AtomicBool>,
     screenshots: Option<Arc<Screenshots>>,
+    /// Where Ctrl-A v and u save the VM's state.
+    state_file: Option<PathBuf>,
 }
 
 impl Targets {
-    /// Targets that save Ctrl-A s screenshots with `screenshots`, if given.
-    pub fn new(screenshots: Option<Arc<Screenshots>>) -> Self {
+    /// Targets that save Ctrl-A s screenshots with `screenshots`, and Ctrl-A v and u
+    /// states to `state_file`, if given.
+    pub fn new(screenshots: Option<Arc<Screenshots>>, state_file: Option<PathBuf>) -> Self {
         Self {
             screenshots,
+            state_file,
             ..Self::default()
         }
+    }
+
+    /// Saves the running VM's state to the state file; with `stop`, then stops it.
+    pub fn save_state(&self, stop: bool) -> Result<String, String> {
+        let path = self
+            .state_file
+            .as_ref()
+            .ok_or("give --save-state FILE to say where the VM's state goes")?;
+        let target = self.get().ok_or("the VM isn't running")?;
+        let partial = path.with_extension("partial");
+        let paused = (|| {
+            let file = std::fs::File::create(&partial).map_err(|e| e.to_string())?;
+            let mut out = io::BufWriter::with_capacity(1 << 20, file);
+            let paused = target.snapshot.save(&mut out).map_err(|e| e.to_string())?;
+            out.into_inner()
+                .map_err(|e| e.to_string())?
+                .sync_all()
+                .map_err(|e| e.to_string())?;
+            std::fs::rename(&partial, path).map_err(|e| e.to_string())?;
+            Ok::<_, String>(paused)
+        })()
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&partial);
+        })?;
+        if stop {
+            self.quit.store(true, Ordering::Relaxed);
+            target.stop.request_stop(StopReason::Requested(QUIT_CODE));
+        }
+        Ok(format!(
+            "saved the VM's state to {} (paused for {} ms)",
+            path.display(),
+            paused.as_millis()
+        ))
     }
 
     /// The display of the machine running now.
@@ -254,6 +304,18 @@ pub fn spawn_input(targets: Targets) -> io::Result<()> {
                         Input::PowerButton => {
                             if let Some(target) = targets.get() {
                                 target.power.press();
+                            }
+                        }
+                        Input::SaveState | Input::Suspend => {
+                            let stop = input == Input::Suspend;
+                            match targets.save_state(stop) {
+                                Ok(done) => eprint!("\r\nvmmc-vmx: {done}\r\n"),
+                                Err(e) => {
+                                    eprint!("\r\nvmmc-vmx: can't save the VM's state: {e}\r\n")
+                                }
+                            }
+                            if stop {
+                                return;
                             }
                         }
                         Input::RequestSize(width, height) => {

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
@@ -39,6 +39,8 @@ struct StopState {
     kickers: Mutex<Vec<Kick>>,
     /// Counts state-dump requests; each vCPU reports once per new count.
     dumps: AtomicU32,
+    /// While set, vCPUs leave the guest ([`VmExit::Paused`]) instead of running it.
+    paused: AtomicBool,
     report: Mutex<Option<Report>>,
 }
 
@@ -79,6 +81,22 @@ impl StopHandle {
         *self.0.report.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(report));
         self.0.dumps.fetch_add(1, Ordering::AcqRel);
         self.kick_all();
+    }
+
+    /// Makes every vCPU's [`VmVcpu::run`] return [`VmExit::Paused`] until
+    /// [`StopHandle::unpause`]. Kick repeatedly until they have: a kick can land just
+    /// before a vCPU enters the guest.
+    pub fn pause(&self) {
+        self.0.paused.store(true, Ordering::Release);
+        self.kick_all();
+    }
+
+    pub fn unpause(&self) {
+        self.0.paused.store(false, Ordering::Release);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.0.paused.load(Ordering::Acquire)
     }
 
     fn dump_count(&self) -> u32 {
@@ -131,6 +149,8 @@ pub enum VmExit {
     Shutdown,
     /// The backend hit an exit it doesn't handle yet.
     Unhandled(String),
+    /// [`StopHandle::pause`] asked the vCPU out of the guest. Run it again to go on.
+    Paused,
 }
 
 type EoiHandler = Box<dyn Fn(u8) + Send + Sync>;
@@ -205,6 +225,15 @@ impl<P: Partition> Vm<P> {
         self.shared.partition.interrupts()
     }
 
+    /// A handle that suspends and resumes the guest's time, and saves the partition's
+    /// state, from any thread. It doesn't keep the VM alive.
+    pub fn time_control(&self) -> TimeControl
+    where
+        P: 'static,
+    {
+        TimeControl(Arc::downgrade(&self.shared) as Weak<dyn PartitionTime>)
+    }
+
     /// A handle devices use to map their own host memory into the guest at runtime.
     pub fn ram_mapper(&self) -> RamMapper
     where
@@ -253,6 +282,50 @@ impl<P: Partition> Vm<P> {
             vcpu,
             dumps_seen: self.stop.dump_count(),
         })
+    }
+}
+
+/// What a [`TimeControl`] reaches. Implemented by the VM.
+trait PartitionTime: Send + Sync {
+    fn suspend_time(&self) -> hv::Result<()>;
+    fn resume_time(&self) -> hv::Result<()>;
+    fn save_state(&self) -> hv::Result<PartitionState>;
+}
+
+impl<P: Partition> PartitionTime for Shared<P> {
+    fn suspend_time(&self) -> hv::Result<()> {
+        self.partition.suspend_time()
+    }
+
+    fn resume_time(&self) -> hv::Result<()> {
+        self.partition.resume_time()
+    }
+
+    fn save_state(&self) -> hv::Result<PartitionState> {
+        self.partition.save_state()
+    }
+}
+
+/// Suspends and resumes a VM's time from any thread (see [`Vm::time_control`]).
+#[derive(Clone)]
+pub struct TimeControl(Weak<dyn PartitionTime>);
+
+impl TimeControl {
+    fn get(&self) -> Result<Arc<dyn PartitionTime>> {
+        self.0.upgrade().ok_or(crate::Error::VmGone)
+    }
+
+    pub fn suspend_time(&self) -> Result<()> {
+        Ok(self.get()?.suspend_time()?)
+    }
+
+    pub fn resume_time(&self) -> Result<()> {
+        Ok(self.get()?.resume_time()?)
+    }
+
+    /// The partition's own state, with time suspended.
+    pub fn save_state(&self) -> Result<PartitionState> {
+        Ok(self.get()?.save_state()?)
     }
 }
 
@@ -327,6 +400,9 @@ impl<P: Partition> VmVcpu<'_, P> {
         loop {
             if let Some(reason) = self.vm.stop.reason() {
                 return Ok(VmExit::Stopped(reason));
+            }
+            if self.vm.stop.is_paused() {
+                return Ok(VmExit::Paused);
             }
             let dumps = self.vm.stop.dump_count();
             if dumps != self.dumps_seen {
