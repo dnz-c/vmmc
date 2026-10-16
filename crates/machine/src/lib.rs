@@ -293,6 +293,8 @@ pub struct Machine<P: Partition> {
     ps2: Ps2Input,
     usb: UsbInput,
     disc_drives: Vec<DiscDrive>,
+    /// The writable disks, in the configuration's order, whose images can switch.
+    disks: Vec<Arc<disk::Switchable>>,
     boot: Option<BootEntry>,
     /// What went wrong, if a vCPU stopped the machine with an error.
     error: Arc<Mutex<Option<String>>>,
@@ -429,6 +431,7 @@ impl<P: Partition + 'static> Machine<P> {
         let display;
         let usb;
         let disc_drives;
+        let mut switchable_disks;
         let config_io = shared(PciConfigIo::new(root.clone(), power));
         pio.insert(
             CONFIG_IO_BASE.into(),
@@ -477,6 +480,8 @@ impl<P: Partition + 'static> Machine<P> {
 
             let mut namespaces = Vec::new();
             let mut virtio_disks = Vec::new();
+            let mut first_nvme_id = None;
+            switchable_disks = Vec::new();
             let mut sata_drives = Vec::new();
             for disk in &config.disks {
                 let read_only = disk.read_only || disk.interface == DiskInterface::Cdrom;
@@ -493,7 +498,25 @@ impl<P: Partition + 'static> Machine<P> {
                         })?,
                     )
                 };
-                let id = disk_id(&disk.path);
+                // Named by the image the disk started as, which snapshots keep the
+                // same: the guest sees the same disk whatever delta it writes to now.
+                let base = backend
+                    .as_ref()
+                    .and_then(|backend| backend.base_image())
+                    .unwrap_or_else(|| disk.path.clone());
+                let id = disk_id(&base);
+                if disk.interface == DiskInterface::Nvme && first_nvme_id.is_none() {
+                    first_nvme_id = Some(id);
+                }
+                // A writable disk can switch to a new delta, for a snapshot.
+                let backend = backend.map(|backend| {
+                    if read_only {
+                        return backend;
+                    }
+                    let switchable = disk::Switchable::new(&disk.path, backend);
+                    switchable_disks.push(switchable.clone());
+                    switchable as Arc<dyn disk::BlockBackend>
+                });
                 let serial: String = id[..6].iter().map(|b| format!("{b:02X}")).collect();
                 let Some(backend) = backend else {
                     sata_drives.push(Drive::Cdrom(Cdrom::new(None, &format!("VMMC{serial}"))));
@@ -532,7 +555,7 @@ impl<P: Partition + 'static> Machine<P> {
                 .iter()
                 .find(|d| d.interface == DiskInterface::Nvme)
             {
-                let id = disk_id(&first.path);
+                let id = first_nvme_id.unwrap_or_else(|| disk_id(&first.path));
                 let serial: String = id[..8].iter().map(|b| format!("{b:02X}")).collect();
                 let mut nvme = Nvme::new(
                     namespaces,
@@ -670,6 +693,7 @@ impl<P: Partition + 'static> Machine<P> {
             ps2,
             usb,
             disc_drives,
+            disks: switchable_disks,
             boot: None,
             error: Arc::default(),
             clock: vm_clock,
@@ -687,6 +711,12 @@ impl<P: Partition + 'static> Machine<P> {
             .iter()
             .map(|&(address, size)| (address, size as u64))
             .collect()
+    }
+
+    /// The writable disks, in the configuration's order: a snapshot switches them to
+    /// new deltas while the machine is paused.
+    pub fn disks(&self) -> Vec<Arc<disk::Switchable>> {
+        self.disks.clone()
     }
 
     /// A handle that saves the machine's whole state while it runs, from any thread.

@@ -170,7 +170,9 @@ fn get_registers(
 }
 
 /// Sets each register to its saved value: all at once, or, if WHP refuses, one by one
-/// to say which it refused.
+/// to say which it refused. A refused register that has its saved value already is
+/// fine: some belong to the partition (the hypercall page, which the guest locks), and
+/// the first vCPU's restore set them for all.
 fn set_registers(vcpu: &WhpVcpu, registers: &[&(u32, u128)]) -> hv::Result<()> {
     let names: Vec<WHV_REGISTER_NAME> = registers
         .iter()
@@ -198,7 +200,11 @@ fn set_registers(vcpu: &WhpVcpu, registers: &[&(u32, u128)]) -> hv::Result<()> {
     }
     for (index, name) in names.iter().enumerate() {
         let hr = set(&names[index..=index], &values[index..=index]);
-        if hr.is_err() {
+        let already = || {
+            get_registers(vcpu, &names[index..=index])
+                .is_ok_and(|now| to_u128(now[0]) == to_u128(values[index].0))
+        };
+        if hr.is_err() && !already() {
             return Err(hv::Error::BadState(format!(
                 "this host won't take register {:#x}: {}",
                 name.0,

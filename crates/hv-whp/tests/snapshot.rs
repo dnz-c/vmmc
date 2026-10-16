@@ -88,6 +88,10 @@ const CONFIG: PartitionConfig = PartitionConfig {
 };
 const RAM: usize = 0x20_0000;
 
+/// Windows allows one partition with guest memory per process, and tests run on
+/// parallel threads: they take turns.
+static ONE_VM_AT_A_TIME: Mutex<()> = Mutex::new(());
+
 /// A VM with the clock port, and its readings.
 fn vm(whp: &hv_whp::Whp) -> (Vm<hv_whp::WhpPartition>, Arc<Mutex<Clocks>>) {
     let vm = Vm::new(whp, &CONFIG, &[(0, RAM)]).expect("VM");
@@ -117,6 +121,7 @@ fn pairs(clocks: &Mutex<Clocks>) -> Vec<(u32, u32)> {
 #[test]
 fn a_vcpu_restored_into_a_new_partition_carries_on() {
     let Some(whp) = whp() else { return };
+    let _turn = ONE_VM_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
 
     // The first VM runs a while, then is saved and deleted.
     let (state, partition_state, ram, before) = {
@@ -231,4 +236,88 @@ fn a_vcpu_restored_into_a_new_partition_carries_on() {
         .read_slice(&mut copy, GuestAddress(XMM_COPY))
         .unwrap();
     assert_eq!(copy, PATTERN, "XMM0 didn't come back");
+}
+
+/// Hand-assembled 16-bit code, `org 0x1000`: sets the guest OS ID and enables and locks
+/// the hypercall page at 0x5000, as Windows does, then stops the VM.
+const HYPERCALL_CODE: [u8; 0x26] = [
+    0xfa, //                               1000  cli
+    0x66, 0xb9, 0x00, 0x00, 0x00, 0x40, // 1001  mov  ecx, 0x40000000     ; guest OS ID
+    0x66, 0xb8, 0x61, 0x4a, 0x00, 0x00, // 1007  mov  eax, 0x00004a61
+    0x66, 0xba, 0x00, 0x0a, 0x01, 0x00, // 100d  mov  edx, 0x00010a00
+    0x0f, 0x30, //                         1013  wrmsr
+    0x66, 0xb9, 0x01, 0x00, 0x00, 0x40, // 1015  mov  ecx, 0x40000001     ; hypercall
+    0x66, 0xb8, 0x03, 0x50, 0x00, 0x00, // 101b  mov  eax, 0x5003         ; enable, lock
+    0x66, 0x31, 0xd2, //                   1021  xor  edx, edx
+    0x0f, 0x30, //                         1024  wrmsr
+];
+
+/// The hypercall page belongs to the partition, and every vCPU's state names it: a
+/// second vCPU's restore finds it set and locked already.
+#[test]
+fn a_locked_hypercall_page_is_restored_on_every_vcpu() {
+    let Some(whp) = whp() else { return };
+    let _turn = ONE_VM_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let config = PartitionConfig {
+        vcpu_count: 2,
+        ..CONFIG
+    };
+    let mut code = HYPERCALL_CODE.to_vec();
+    code.extend_from_slice(&[0xe6, 0xe0, 0xeb, 0xfc]); // out 0xe0, al; jmp back to it
+    let new_vm = || {
+        let vm = Vm::new(&whp, &config, &[(0, RAM)]).expect("VM");
+        let clocks = Arc::new(Mutex::new(Clocks {
+            readings: vec![0; READINGS * 2 - 1],
+            stop: vm.stop_handle(),
+        }));
+        vm.pio()
+            .insert(CLOCK_PORT.into(), 4, clocks.clone())
+            .unwrap();
+        vm
+    };
+    let (states, partition_state, ram) = {
+        let vm = new_vm();
+        vm.memory()
+            .write_slice(&code, GuestAddress(LOAD_ADDR))
+            .unwrap();
+        let mut bsp = vm.create_vcpu(0).unwrap();
+        let mut ap = vm.create_vcpu(1).unwrap();
+        ap.set_waiting_for_sipi().unwrap();
+        let mut sregs = bsp.sregs().unwrap();
+        for segment in [&mut sregs.ds, &mut sregs.es, &mut sregs.ss] {
+            *segment = Segment::real_mode_data(0);
+        }
+        sregs.cs = Segment::real_mode_code(0);
+        bsp.set_sregs(&sregs).unwrap();
+        bsp.set_regs(&StandardRegisters {
+            rip: LOAD_ADDR,
+            rsp: 0x8000,
+            rflags: 0x2,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            bsp.run().unwrap(),
+            VmExit::Stopped(StopReason::Requested(0))
+        );
+        vm.suspend_time().unwrap();
+        let states = [bsp.save_state().unwrap(), ap.save_state().unwrap()];
+        let mut ram = vec![0u8; RAM];
+        vm.memory().read_slice(&mut ram, GuestAddress(0)).unwrap();
+        (states, vm.save_state().unwrap(), ram)
+    };
+    assert_eq!(
+        states[1].register(0x5001),
+        Some(0x5003),
+        "the AP sees it too"
+    );
+    let vm = new_vm();
+    vm.memory().write_slice(&ram, GuestAddress(0)).unwrap();
+    let mut bsp = vm.create_vcpu(0).unwrap();
+    let mut ap = vm.create_vcpu(1).unwrap();
+    vm.suspend_time().unwrap();
+    vm.restore_state(&partition_state).unwrap();
+    bsp.restore_state(&states[0]).unwrap();
+    ap.restore_state(&states[1]).unwrap();
+    assert_eq!(ap.save_state().unwrap().register(0x5001), Some(0x5003));
 }

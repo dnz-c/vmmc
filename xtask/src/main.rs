@@ -13,6 +13,7 @@ mod snapshot;
 mod ubuntu;
 mod vmdk_compat;
 mod vmware_import;
+mod win_snapshot;
 mod windows;
 mod worker;
 
@@ -54,6 +55,7 @@ tasks:
                 sandboxed workers, as the app does (20-60 minutes)
   worker-test   start VMs in sandboxed workers, as vmmc-cli does, and control them
   snapshot-test save a running Linux guest's whole state, then resume it from it
+  win-snapshot-test  suspend the Windows win11-test installed, resume it, shut it down
                 through their pipes
   vmdk-compat-test
                 check vmmc's VMDKs against VMware's vmware-vdiskmanager, both ways
@@ -114,6 +116,7 @@ fn main() -> ExitCode {
         Some("vmdk-compat-test") => vmdk_compat::test(),
         Some("worker-test") => worker::test(),
         Some("snapshot-test") => snapshot::test(),
+        Some("win-snapshot-test") => win_snapshot::test(),
         Some("easy-install-test") => easy_install::test(env::args().nth(2).as_deref()),
         Some("vmware-import-test") => vmware_import::test(),
         Some("linux-shell") => linux_shell(),

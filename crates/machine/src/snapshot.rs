@@ -18,7 +18,9 @@
 //! [`Machine::run`]: crate::Machine::run
 //! [`Machine::restore`]: crate::Machine::restore
 
-use std::io::{self, Read, Write};
+use std::fs;
+use std::io::{self, BufWriter, Read, Write};
+use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -27,7 +29,7 @@ use devices::clock::VmClock;
 use devices::snapshot::Snapshot;
 use hv::{Partition, PartitionState, VcpuState};
 use serde::{Deserialize, Serialize};
-use vm_core::{StopHandle, TimeControl, VmVcpu};
+use vm_core::{StopHandle, StopReason, TimeControl, VmVcpu};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 use crate::{Error, Result};
@@ -146,11 +148,17 @@ struct Paused<'a> {
     snapshotter: &'a Snapshotter,
     time_suspended: bool,
     quiesced: bool,
+    /// Stop the machine rather than let the guest run on.
+    stop: Option<StopReason>,
 }
 
 impl Drop for Paused<'_> {
     fn drop(&mut self) {
         let s = self.snapshotter;
+        // Before the vCPUs are let go, so the guest runs no further.
+        if let Some(reason) = self.stop {
+            s.stop.request_stop(reason);
+        }
         if self.quiesced {
             for (_, device) in s.devices.iter() {
                 lock(device).resume();
@@ -176,15 +184,58 @@ fn state_error(message: impl Into<String>) -> Error {
 }
 
 impl Snapshotter {
-    /// Pauses the guest, writes its whole state to `out`, and lets it run on. Returns
-    /// how long the guest was paused.
-    pub fn save(&self, out: &mut dyn Write) -> Result<Duration> {
+    /// Pauses the guest, writes its whole state to `out`, and lets it run on, or with
+    /// `then_stop` (a suspend), stops the machine for that reason without it running any
+    /// further. A save that fails always lets the guest run on. Returns how long the
+    /// guest was paused.
+    pub fn save(&self, out: &mut dyn Write, then_stop: Option<StopReason>) -> Result<Duration> {
+        self.paused(then_stop, |state| state.write(out))
+    }
+
+    /// [`Snapshotter::save`] to a file at `path`, which is whole and in place (written
+    /// beside it, synced, then renamed) before the guest runs on or stops. Then, still
+    /// paused, `while_paused` runs: what has to change with the guest stopped, such as
+    /// its disks switching to new deltas. If that fails, the file is removed.
+    pub fn save_file(
+        &self,
+        path: &Path,
+        then_stop: Option<StopReason>,
+        while_paused: impl FnOnce() -> std::result::Result<(), String>,
+    ) -> Result<Duration> {
+        let partial = path.with_extension("partial");
+        let io = |e: io::Error| state_error(format!("can't write {}: {e}", path.display()));
+        let result = self.paused(then_stop, |state| {
+            let file = fs::File::create(&partial).map_err(io)?;
+            let mut out = BufWriter::with_capacity(1 << 20, file);
+            state.write(&mut out)?;
+            let file = out.into_inner().map_err(|e| io(e.into_error()))?;
+            file.sync_all().map_err(io)?;
+            drop(file);
+            fs::rename(&partial, path).map_err(io)?;
+            while_paused().map_err(|e| {
+                let _ = fs::remove_file(path);
+                state_error(e)
+            })
+        });
+        if result.is_err() {
+            let _ = fs::remove_file(&partial);
+        }
+        result
+    }
+
+    /// Pauses the guest, hands its state to `work`, and lets it run on (or stops it).
+    fn paused(
+        &self,
+        then_stop: Option<StopReason>,
+        work: impl FnOnce(&Saved<'_>) -> Result<()>,
+    ) -> Result<Duration> {
         let _one = lock(&self.saving);
         let started = Instant::now();
         let mut paused = Paused {
             snapshotter: self,
             time_suspended: false,
             quiesced: false,
+            stop: None,
         };
         self.park_vcpus()?;
         self.time.suspend_time()?;
@@ -208,19 +259,11 @@ impl Snapshotter {
                 .map(|(name, device)| ((*name).to_owned(), lock(device).save()))
                 .collect(),
         };
-        let io = |e: io::Error| state_error(format!("can't write the state: {e}"));
-        out.write_all(MAGIC).map_err(io)?;
-        out.write_all(&STATE_FORMAT.to_le_bytes()).map_err(io)?;
-        let header = postcard::to_allocvec(&header)
-            .map_err(|e| state_error(format!("can't encode the state: {e}")))?;
-        out.write_all(&(header.len() as u64).to_le_bytes())
-            .map_err(io)?;
-        let compressed = lz4_flex::block::compress(&header);
-        out.write_all(&(compressed.len() as u64).to_le_bytes())
-            .map_err(io)?;
-        out.write_all(&compressed).map_err(io)?;
-        write_ram(&self.memory, &self.ram, out).map_err(io)?;
-        out.flush().map_err(io)?;
+        work(&Saved {
+            header,
+            memory: &self.memory,
+        })?;
+        paused.stop = then_stop;
         drop(paused);
         Ok(started.elapsed())
     }
@@ -288,6 +331,30 @@ impl Snapshotter {
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
+    }
+}
+
+/// A paused machine's state, ready to write.
+struct Saved<'a> {
+    header: Header,
+    memory: &'a GuestMemoryMmap,
+}
+
+impl Saved<'_> {
+    fn write(&self, out: &mut dyn Write) -> Result<()> {
+        let io = |e: io::Error| state_error(format!("can't write the state: {e}"));
+        out.write_all(MAGIC).map_err(io)?;
+        out.write_all(&STATE_FORMAT.to_le_bytes()).map_err(io)?;
+        let header = postcard::to_allocvec(&self.header)
+            .map_err(|e| state_error(format!("can't encode the state: {e}")))?;
+        out.write_all(&(header.len() as u64).to_le_bytes())
+            .map_err(io)?;
+        let compressed = lz4_flex::block::compress(&header);
+        out.write_all(&(compressed.len() as u64).to_le_bytes())
+            .map_err(io)?;
+        out.write_all(&compressed).map_err(io)?;
+        write_ram(self.memory, &self.header.ram, out).map_err(io)?;
+        out.flush().map_err(io)
     }
 }
 

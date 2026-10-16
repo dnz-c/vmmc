@@ -477,6 +477,14 @@ impl BlockBackend for Vmdk {
         self.len
     }
 
+    fn base_image(&self) -> Option<PathBuf> {
+        let mut base = self.parent.as_deref()?;
+        while let Some(parent) = base.parent.as_deref() {
+            base = parent;
+        }
+        Some(base.path.clone())
+    }
+
     fn is_read_only(&self) -> bool {
         self.read_only
     }

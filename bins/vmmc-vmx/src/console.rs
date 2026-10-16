@@ -182,25 +182,16 @@ impl Targets {
             .as_ref()
             .ok_or("give --save-state FILE to say where the VM's state goes")?;
         let target = self.get().ok_or("the VM isn't running")?;
-        let partial = path.with_extension("partial");
-        let paused = (|| {
-            let file = std::fs::File::create(&partial).map_err(|e| e.to_string())?;
-            let mut out = io::BufWriter::with_capacity(1 << 20, file);
-            let paused = target.snapshot.save(&mut out).map_err(|e| e.to_string())?;
-            out.into_inner()
-                .map_err(|e| e.to_string())?
-                .sync_all()
-                .map_err(|e| e.to_string())?;
-            std::fs::rename(&partial, path).map_err(|e| e.to_string())?;
-            Ok::<_, String>(paused)
-        })()
-        .inspect_err(|_| {
-            let _ = std::fs::remove_file(&partial);
-        })?;
         if stop {
+            // Before the machine stops: this process ends then.
             self.quit.store(true, Ordering::Relaxed);
-            target.stop.request_stop(StopReason::Requested(QUIT_CODE));
         }
+        let then_stop = stop.then_some(StopReason::Requested(QUIT_CODE));
+        let paused = target
+            .snapshot
+            .save_file(path, then_stop, || Ok(()))
+            .inspect_err(|_| self.quit.store(false, Ordering::Relaxed))
+            .map_err(|e| e.to_string())?;
         Ok(format!(
             "saved the VM's state to {} (paused for {} ms)",
             path.display(),

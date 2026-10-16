@@ -4,6 +4,7 @@
 //! against [`BlockBackend::len`] before calling in, so backends only see valid ranges.
 //! Images are raw files ([`RawFile`]) or VMDKs ([`vmdk`]); [`open`] tells them apart.
 
+mod switchable;
 pub mod vmdk;
 
 use std::fs::{File, OpenOptions};
@@ -11,6 +12,7 @@ use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+pub use switchable::Switchable;
 pub use vmdk::{create_delta, create_sparse};
 
 /// Opens a disk image: a VMDK if its name ends in `.vmdk`, otherwise a raw image. The
@@ -58,6 +60,12 @@ pub trait BlockBackend: Send + Sync {
     /// are undefined afterwards. Backends may ignore this.
     fn discard(&self, _offset: u64, _len: u64) -> io::Result<()> {
         Ok(())
+    }
+
+    /// For a delta disk, the image at the bottom of its chain: the disk it started as,
+    /// which snapshots keep the same. `None` for an image that's no delta.
+    fn base_image(&self) -> Option<std::path::PathBuf> {
+        None
     }
 }
 
