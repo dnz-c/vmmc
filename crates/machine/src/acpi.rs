@@ -20,7 +20,7 @@ use devices::legacy::acpi_pm::{
 use devices::legacy::i8042::{I8042_COMMAND, I8042_DATA};
 use devices::legacy::ioapic::IOAPIC_BASE;
 use devices::legacy::rtc::RTC_BASE;
-use devices::legacy::serial::{COM1_BASE, COM1_IRQ};
+use devices::legacy::serial::{COM1_BASE, COM1_IRQ, COM2_BASE, COM2_IRQ};
 use devices::pci::root::{CONFIG_IO_BASE, NUM_SLOTS};
 use devices::tpm::{CONTROL_AREA, TPM_BASE, TPM_SIZE};
 
@@ -552,6 +552,20 @@ fn dsdt_aml(config: &AcpiConfig, sink: &mut Vec<u8>) {
         sink,
     );
 
+    let two = 2u32;
+    let com2_io = IO::new(COM2_BASE, COM2_BASE, 1, 8);
+    let com2_irq = Interrupt::new(true, true, false, false, COM2_IRQ.into());
+    device(
+        "\\_SB_.PCI0.ISA_.COM2",
+        &[
+            ("_HID", &EISAName::new("PNP0501")),
+            ("_UID", &two),
+            ("_CRS", &ResourceTemplate::new(vec![&com2_io, &com2_irq])),
+        ],
+        &[],
+        sink,
+    );
+
     // The 8042 keyboard controller.
     let kbd_data = IO::new(I8042_DATA, I8042_DATA, 1, 1);
     let kbd_command = IO::new(I8042_COMMAND, I8042_COMMAND, 1, 1);
@@ -1045,6 +1059,7 @@ mod tests {
             b"ISA_",
             b"MBRS",
             b"COM1",
+            b"COM2",
             b"KBD_",
             b"PS2M",
             b"RTC_",

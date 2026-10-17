@@ -12,6 +12,7 @@
 //! `--no-reboot`, 3 on a triple fault, 1 on any error. Ctrl-A p presses the ACPI power
 //! button, Ctrl-A r prints each vCPU's registers, and Ctrl-A m saves guest RAM.
 
+mod clipboard;
 mod console;
 #[cfg(windows)]
 mod install;
@@ -555,15 +556,28 @@ fn run(args: RunArgs, frontend: Frontend) -> Result<RunOutcome, Box<dyn Error>> 
     };
     let targets = console::Targets::new(screenshots.clone(), args.save_state.clone());
     targets.set_vm(args.loaded.clone());
+    // Shared with vmmc's agent in the guest, through whichever machine runs.
+    let clipboard = clipboard::Clipboard::start(
+        {
+            let targets = targets.clone();
+            move || targets.get().map(|target| target.agent)
+        },
+        frontend == Frontend::Console,
+    )?;
     let _raw = match frontend {
         Frontend::Console => {
             let raw = console::RawConsole::enable();
-            console::spawn_input(targets.clone())?;
+            console::spawn_input(targets.clone(), clipboard.clone())?;
             Some(raw)
         }
         Frontend::Pipe => {
             let vm = args.loaded.as_ref().ok_or("serve needs --vm")?;
-            serve::start(targets.clone(), &vm.config.name, &vm.config.uuid)?;
+            serve::start(
+                targets.clone(),
+                clipboard.clone(),
+                &vm.config.name,
+                &vm.config.uuid,
+            )?;
             None
         }
     };
@@ -612,6 +626,7 @@ fn run(args: RunArgs, frontend: Frontend) -> Result<RunOutcome, Box<dyn Error>> 
             &nics,
             tpm.as_ref(),
             &vm_targets,
+            &clipboard,
             vm_screenshots.as_deref(),
         )
         .map_err(|e| e.to_string())
@@ -647,6 +662,7 @@ fn run_machines(
     nics: &[NicConfig],
     tpm: Option<&SharedTpm>,
     targets: &console::Targets,
+    clipboard: &Arc<clipboard::Clipboard>,
     screenshots: Option<&screenshot::Screenshots>,
 ) -> Result<RunOutcome, Box<dyn Error>> {
     use machine::{Machine, MachineConfig};
@@ -685,6 +701,7 @@ fn run_machines(
                     Some(installer) => installer.tap(Box::new(console::ConsoleOutput)),
                     None => Box::new(console::ConsoleOutput),
                 },
+                agent_output: clipboard.sink(),
                 firmware: boot.firmware_config()?,
                 tpm: tpm.cloned(),
                 enlightenments: !args.no_enlightenments,
@@ -741,6 +758,7 @@ fn run_machines(
             discs: machine.disc_drives(),
             snapshot: machine.snapshotter(),
             disks: machine.disks(),
+            agent: machine.agent_input(),
         }));
         let outcome = machine.run();
         targets.set(None);

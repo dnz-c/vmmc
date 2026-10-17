@@ -120,6 +120,10 @@ target\release\vmmc.exe
   tablet, so it moves freely in and out. With **Fit guest to window**, a Windows guest
   with vmmc's display driver takes the window's size. **Full screen**, **Ctrl+Alt+Del**,
   shut down (the power button), power off and reset are on the toolbar.
+- **The clipboard** (text) is shared with a Windows guest whose console is open, once
+  **Install vmmc Tools** has put vmmc's agent in it: what you copy on the host can be
+  pasted in the guest, and the other way round. The agent needs no driver, so it works
+  with Secure Boot on.
 - VMs keep running when the app closes; open it again to get back to them.
 - The library is `%APPDATA%\vmmc\library.toml`; `VMMC_LIBRARY` names another.
 

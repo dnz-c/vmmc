@@ -15,6 +15,9 @@ type Uart = vm_superio::Serial<IrqTrigger, vm_superio::serial::NoEvents, Box<dyn
 /// COM1's I/O base and IRQ.
 pub const COM1_BASE: u16 = 0x3f8;
 pub const COM1_IRQ: u8 = 4;
+/// COM2's: the channel to vmmc's agent in the guest.
+pub const COM2_BASE: u16 = 0x2f8;
+pub const COM2_IRQ: u8 = 3;
 pub const SERIAL_PORTS: u16 = 8;
 
 /// Pulses the UART's (edge-triggered) ISA interrupt line.

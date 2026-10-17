@@ -42,7 +42,7 @@ use devices::legacy::pic::{
 use devices::legacy::pit::{PIT_BASE, PIT_PORTS, PORT_61, Pit, Port61};
 use devices::legacy::port80::{POST_PORT, PostPort};
 use devices::legacy::rtc::{RTC_BASE, RTC_IRQ, RTC_PORTS, Rtc, RtcInterrupt};
-use devices::legacy::serial::{COM1_BASE, COM1_IRQ, SERIAL_PORTS, Serial};
+use devices::legacy::serial::{COM1_BASE, COM1_IRQ, COM2_BASE, COM2_IRQ, SERIAL_PORTS, Serial};
 use devices::nic::e1000e::{
     E1000e, REGISTER_BAR as E1000E_BAR, REGISTER_BAR_SIZE as E1000E_BAR_SIZE,
 };
@@ -189,6 +189,9 @@ pub struct MachineConfig {
     pub nics: Vec<NicConfig>,
     /// Where the guest's serial console output goes.
     pub serial_output: Box<dyn Write + Send>,
+    /// Where the guest's second serial port (COM2) writes: vmmc's agent in the guest
+    /// talks to the host there.
+    pub agent_output: Box<dyn Write + Send>,
     /// Boot this firmware. Without it, load a kernel with [`Machine::load_linux`].
     pub firmware: Option<FirmwareConfig>,
     /// A TPM 2.0, behind a CRB. It outlives the machine: each new machine resets it,
@@ -288,6 +291,7 @@ pub struct Machine<P: Partition> {
     /// installs them itself.
     rsdp: Option<u64>,
     serial: Arc<Mutex<Serial>>,
+    com2: Arc<Mutex<Serial>>,
     acpi_pm: Arc<Mutex<AcpiPm>>,
     display: Display,
     ps2: Ps2Input,
@@ -424,6 +428,8 @@ impl<P: Partition + 'static> Machine<P> {
 
         let serial = shared(Serial::new(irq(COM1_IRQ), config.serial_output));
         pio.insert(COM1_BASE.into(), SERIAL_PORTS.into(), serial.clone())?;
+        let com2 = shared(Serial::new(irq(COM2_IRQ), config.agent_output));
+        pio.insert(COM2_BASE.into(), SERIAL_PORTS.into(), com2.clone())?;
         let post = shared(PostPort::default());
         pio.insert(POST_PORT.into(), 1, post.clone())?;
 
@@ -443,6 +449,7 @@ impl<P: Partition + 'static> Machine<P> {
             saved("acpi-pm", &acpi_pm),
             saved("i8042", &i8042),
             saved("serial0", &serial),
+            saved("serial1", &com2),
             saved("post", &post),
             saved("pci-config", &config_io),
         ]);
@@ -694,6 +701,7 @@ impl<P: Partition + 'static> Machine<P> {
             cpus: config.cpus,
             rsdp,
             serial,
+            com2,
             acpi_pm,
             display,
             ps2,
@@ -785,6 +793,11 @@ impl<P: Partition + 'static> Machine<P> {
 
     pub fn serial_input(&self) -> SerialInput {
         SerialInput(self.serial.clone())
+    }
+
+    /// Feeds the guest's second serial port (COM2), where vmmc's agent listens.
+    pub fn agent_input(&self) -> SerialInput {
+        SerialInput(self.com2.clone())
     }
 
     /// A handle that presses the guest's ACPI power button from any thread.

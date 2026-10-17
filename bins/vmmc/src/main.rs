@@ -6,6 +6,8 @@
 // No console window for the app.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+#[cfg(windows)]
+mod clipboard;
 mod console;
 mod dialogs;
 #[cfg(test)]
@@ -89,6 +91,8 @@ struct App {
     capture: Arc<AtomicBool>,
     /// Set by the hook when Ctrl+Alt releases the keyboard.
     released: Arc<AtomicBool>,
+    /// The host clipboard's sequence number the console's guest has (or set itself).
+    clipboard_seen: Option<u32>,
 }
 
 type Shared = Rc<RefCell<App>>;
@@ -121,6 +125,7 @@ fn run() -> Result<(), String> {
         keys: Arc::new(Mutex::new(None)),
         capture: Arc::new(AtomicBool::new(false)),
         released: Arc::new(AtomicBool::new(false)),
+        clipboard_seen: None,
     }));
     window.set_os_labels(strings(PRESETS.iter().map(|p| p.label)));
     window.set_editions(strings(media_editions()));
@@ -470,6 +475,7 @@ fn group_by_folder(rows: &mut [VmRow], folders: &[String]) {
 
 fn close_console(state: &mut App, window: &AppWindow) {
     state.console = None;
+    state.clipboard_seen = None;
     state.console_size = None;
     *state.keys.lock().unwrap_or_else(PoisonError::into_inner) = None;
     state.capture.store(false, Ordering::Relaxed);
@@ -522,6 +528,8 @@ fn frame(app: &Shared) {
     let fit = window.get_fit_guest();
     let scale = window.window().scale_factor();
     let console_size = state.console_size;
+    // Its fields, borrowed apart.
+    let state = &mut *state;
     let Some(session) = state.console.as_mut() else {
         return;
     };
@@ -535,6 +543,8 @@ fn frame(app: &Shared) {
         window.set_frame_height(picture.height as i32);
         window.set_screen(Image::from_rgb8(pixels));
     }
+    #[cfg(windows)]
+    share_clipboard(session, &mut state.clipboard_seen);
     if let Some(cursor) = session.cursor() {
         if cursor.width > 0 && cursor.height > 0 {
             let pixels = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
@@ -565,6 +575,32 @@ fn frame(app: &Shared) {
                 height: size.1,
             });
         }
+    }
+}
+
+/// Shares the clipboard with the console's guest: what the host copies goes to the
+/// guest (the clipboard as it is when the console opens, too), and what the guest
+/// copies comes to the host.
+#[cfg(windows)]
+fn share_clipboard(session: &mut console::Session, seen: &mut Option<u32>) {
+    if let Some(text) = session.guest_copied()
+        && clipboard::set_text(&text)
+    {
+        *seen = Some(clipboard::sequence());
+    }
+    let sequence = clipboard::sequence();
+    if *seen == Some(sequence) {
+        return;
+    }
+    *seen = Some(sequence);
+    if let Some(mut text) = clipboard::text() {
+        // At a character's end, within what the guest's agent takes.
+        let mut end = text.len().min(ipc::clipboard::MAX_TEXT);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        session.send(Request::SetGuestClipboard { text });
     }
 }
 

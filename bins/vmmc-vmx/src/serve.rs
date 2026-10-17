@@ -25,6 +25,7 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 struct Shared {
     targets: Targets,
+    clipboard: Arc<crate::clipboard::Clipboard>,
     section: Section,
     name: String,
     uuid: String,
@@ -35,11 +36,17 @@ struct Shared {
 
 /// Starts serving the VM `name` (`uuid` names its pipe). Fails if the pipe exists:
 /// another worker has the VM.
-pub fn start(targets: Targets, name: &str, uuid: &str) -> io::Result<()> {
+pub fn start(
+    targets: Targets,
+    clipboard: Arc<crate::clipboard::Clipboard>,
+    name: &str,
+    uuid: &str,
+) -> io::Result<()> {
     let section = Section::create()?;
     section.view().init();
     let shared = Arc::new(Shared {
         targets,
+        clipboard,
         section,
         name: name.to_owned(),
         uuid: uuid.to_owned(),
@@ -149,6 +156,14 @@ fn handle(shared: &Shared, request: Request) -> Response {
     let targets = &shared.targets;
     match request {
         Request::Hello { .. } => Response::Error("already said hello".into()),
+        Request::SetGuestClipboard { text } => {
+            shared.clipboard.put_in_guest(&text);
+            Response::Done
+        }
+        Request::GuestClipboard { since } => {
+            let (seq, text) = shared.clipboard.guest_copied(since);
+            Response::GuestClipboard { seq, text }
+        }
         // Before taking the machine's handles: a revert waits for the machine to stop,
         // and its disks must close then.
         Request::Snapshot { name, description } => {
@@ -244,7 +259,9 @@ fn handle(shared: &Shared, request: Request) -> Response {
                 | Request::Screen
                 | Request::Snapshot { .. }
                 | Request::Revert { .. }
-                | Request::Suspend => {
+                | Request::Suspend
+                | Request::SetGuestClipboard { .. }
+                | Request::GuestClipboard { .. } => {
                     unreachable!("handled above")
                 }
             }

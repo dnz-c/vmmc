@@ -8,6 +8,12 @@
 Without it, Windows draws through the firmware's framebuffer and keeps the resolution
 the VM started with (`vmmc-vmx run --resolution`).
 
+The vmmc Tools disc also has **the agent** (`agent/vmmcagent.exe`), an ordinary program
+with no driver: setup installs it in `Program Filesmmc Tools` and starts it at each
+logon. It shares the clipboard's text with the host over the VM's second serial port
+(COM2), in frames the `ipc` crate's `clipboard` module describes: what the user copies
+goes to the host, and what the host sends goes on the clipboard.
+
 ## Building
 
 ```powershell

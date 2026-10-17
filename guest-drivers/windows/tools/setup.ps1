@@ -1,13 +1,17 @@
-# vmmc Tools for Windows: installs vmmc's display driver (resolutions, the desktop
-# following vmmc's window, a hardware cursor) from the vmmc Tools disc.
+# vmmc Tools for Windows, from the vmmc Tools disc:
 #
-# The driver is test-signed for now. Windows loads test-signed drivers only with test
-# signing on, which Secure Boot doesn't allow: with Secure Boot on, this says so and
-# changes nothing. Otherwise it turns test signing on, trusts the disc's test
-# certificate, installs the driver, and offers to restart (which test signing needs).
+# - The agent (vmmcagent.exe), which shares the clipboard with the host: installed in
+#   Program Files and started at each logon. It needs no driver, so it's installed
+#   whatever the Secure Boot setting.
+# - vmmc's display driver (resolutions, the desktop following vmmc's window, a hardware
+#   cursor). It's test-signed for now, and Windows loads test-signed drivers only with
+#   test signing on, which Secure Boot doesn't allow: with Secure Boot on, this says so.
+#   Otherwise it turns test signing on, trusts the disc's test certificate, installs
+#   the driver, and offers to restart (which test signing needs).
 #
 # -Quiet: no dialogs and no restart; what happens goes to the output, and the exit code
-# says how it went (0 installed, 1 failed, 2 Secure Boot is on, 3010 restart needed).
+# says how it went (0 installed, 1 failed, 2 only the agent: Secure Boot is on, 3010
+# restart needed).
 
 param([switch] $Quiet)
 
@@ -50,12 +54,29 @@ if (-not $identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrat
 
 $disc = Split-Path -Parent $PSCommandPath
 try {
+    # The agent: in Program Files, started at each logon, and now.
+    $programs = Join-Path $env:ProgramFiles 'vmmc Tools'
+    New-Item -ItemType Directory -Force $programs | Out-Null
+    Get-Process vmmcagent -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 300
+    $agent = Join-Path $programs 'vmmcagent.exe'
+    Copy-Item (Join-Path $disc 'vmmcagent.exe') $agent -Force
+    Set-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' 'vmmc agent' "`"$agent`""
+    if ($Quiet) {
+        Start-Process $agent
+    } else {
+        # As the user, not elevated as this is: Explorer starts it.
+        Start-Process explorer.exe -ArgumentList "`"$agent`""
+    }
+
     $secureBoot = $false
     try { $secureBoot = Confirm-SecureBootUEFI } catch { }
     if ($secureBoot) {
-        Say ("Secure Boot is on in this VM, and vmmc's display driver isn't signed by Microsoft yet, " +
-             "so Windows won't load it.`n`nTo use it now: shut this VM down, turn Secure Boot off in " +
-             "vmmc's settings for it, start it, and run vmmc Tools again.") 'Warning'
+        Say ("Clipboard sharing with vmmc is installed.`n`nSecure Boot is on in this VM, and " +
+             "vmmc's display driver isn't signed by Microsoft yet, so Windows won't load it. To " +
+             "use it too: shut this VM down, turn Secure Boot off in vmmc's settings for it, " +
+             "start it, and run vmmc Tools again.") 'Warning'
         exit 2
     }
 
@@ -86,7 +107,7 @@ try {
             'vmmc Tools', 'YesNo', 'Question')
         if ($answer -eq 'Yes') { Restart-Computer -Force }
     } else {
-        Say 'vmmc Tools are installed: Windows now follows the size of vmmc''s window.'
+        Say 'vmmc Tools are installed: Windows now follows the size of vmmc''s window, and shares its clipboard with the host.'
     }
 } catch {
     Say "vmmc Tools couldn't be installed:`n`n$($_.Exception.Message)" 'Error'

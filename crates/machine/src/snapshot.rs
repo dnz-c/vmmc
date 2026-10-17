@@ -36,7 +36,7 @@ use crate::{Error, Result};
 
 const MAGIC: &[u8; 8] = b"VMMCSTAT";
 /// The state file's format. Goes up with any change to it, device states included.
-pub const STATE_FORMAT: u32 = 1;
+pub const STATE_FORMAT: u32 = 2;
 const PAGE: usize = 4096;
 const CHUNK: usize = 1 << 20;
 const BITMAP: usize = CHUNK / PAGE / 8;

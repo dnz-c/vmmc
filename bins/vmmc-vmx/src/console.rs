@@ -45,6 +45,8 @@ pub enum Input {
     Suspend,
     /// Ask the guest for a screen this size.
     RequestSize(u32, u32),
+    /// Put this text on the guest's clipboard (Ctrl-A c, then a line).
+    Clipboard(String),
     Quit,
 }
 
@@ -63,6 +65,8 @@ pub struct EscapeFilter {
     typing: bool,
     /// The size typed after Ctrl-A z so far, until Enter.
     size: Option<Vec<u8>>,
+    /// The text typed after Ctrl-A c so far, until Enter.
+    clipboard: Option<Vec<u8>>,
 }
 
 impl EscapeFilter {
@@ -80,6 +84,16 @@ impl EscapeFilter {
             }
         };
         for &byte in input {
+            if let Some(text) = &mut self.clipboard {
+                if byte == b'\r' || byte == b'\n' {
+                    flush(&mut bytes, &mut out, self.typing);
+                    out.push(Input::Clipboard(String::from_utf8_lossy(text).into_owned()));
+                    self.clipboard = None;
+                } else {
+                    text.push(byte);
+                }
+                continue;
+            }
             if let Some(size) = &mut self.size {
                 if byte == b'\r' || byte == b'\n' {
                     if let Some((width, height)) = parse_size(size) {
@@ -128,6 +142,7 @@ impl EscapeFilter {
                         self.typing = !self.typing;
                     }
                     b'z' | b'Z' => self.size = Some(Vec::new()),
+                    b'c' | b'C' => self.clipboard = Some(Vec::new()),
                     CTRL_A => bytes.push(CTRL_A),
                     // Unknown escapes are swallowed, like QEMU's.
                     _ => {}
@@ -157,6 +172,8 @@ pub struct Target {
     pub snapshot: machine::Snapshotter,
     /// The writable disks, in the VM file's order.
     pub disks: Vec<Arc<disk::Switchable>>,
+    /// COM2, where vmmc's agent in the guest listens.
+    pub agent: SerialInput,
 }
 
 /// What the run loop does once the machine has stopped.
@@ -389,7 +406,10 @@ fn input_source() -> InputSource {
 
 /// Forwards stdin to the current machine on a background thread until the user quits
 /// or stdin closes. The thread is never joined: a blocked read can't be interrupted.
-pub fn spawn_input(targets: Targets) -> io::Result<()> {
+pub fn spawn_input(
+    targets: Targets,
+    clipboard: Arc<crate::clipboard::Clipboard>,
+) -> io::Result<()> {
     thread::Builder::new()
         .name("console-input".into())
         .spawn(move || {
@@ -436,6 +456,13 @@ pub fn spawn_input(targets: Targets) -> io::Result<()> {
                             if let Some(target) = targets.get() {
                                 target.power.press();
                             }
+                        }
+                        Input::Clipboard(text) => {
+                            clipboard.put_in_guest(&text);
+                            eprint!(
+                                "\r\nvmmc-vmx: put {} characters on the guest's clipboard\r\n",
+                                text.chars().count()
+                            );
                         }
                         Input::SaveState | Input::Suspend => {
                             let stop = input == Input::Suspend;

@@ -28,10 +28,13 @@ const CERTIFICATE_SUBJECT: &str = "CN=vmmc test driver signing";
 const KITS: &str = r"C:\Program Files (x86)\Windows Kits\10";
 const DISPLAY_TEST: &str = include_str!("../guest/display-test.ps1");
 /// What the display test's first logon reports, in order.
-const DISPLAY_MARKERS: [&str; 11] = [
+const DISPLAY_MARKERS: [&str; 14] = [
     "VMMC-DISP: booted",
     "VMMC-DISP: testsigning=True",
     "VMMC-DISP: setup=ok",
+    "VMMC-DISP: agent=True",
+    "VMMC-DISP: clipboard-copied",
+    "VMMC-DISP: clipboard=vmmc clipboard from the host",
     "VMMC-DISP: driver=vmmcdisp status=OK",
     "VMMC-DISP: set=0 now=1600x900",
     "VMMC-DISP: mode-set",
@@ -67,6 +70,8 @@ const PACKAGE: [&str; 4] = [
 pub struct Drivers {
     /// The display driver's package: `vmmcdisp.inf`, `.sys` and `.cat`.
     pub display: PathBuf,
+    /// The agent that shares the clipboard (`vmmcagent.exe`), which needs no driver.
+    pub agent: PathBuf,
     pub certificate: PathBuf,
 }
 
@@ -271,6 +276,24 @@ pub fn build(trace: bool) -> Result<Drivers, String> {
         .arg(format!("/LIBPATH:{}", msvc_root.join(r"lib\x64").display()))
         .arg(format!("/LIBPATH:{}", libs.join(r"um\x64").display()))
         .arg(format!("/LIBPATH:{}", libs.join(r"ucrt\x64").display())))?;
+    // The agent, a user-mode program too, built the same way.
+    let agent = out.join("windows").join("agent").join("vmmcagent.exe");
+    fs::create_dir_all(agent.parent().unwrap())
+        .map_err(|e| format!("can't create {}: {e}", agent.display()))?;
+    run(Command::new(tools.msvc.join("cl.exe"))
+        .args(["/nologo", "/O2", "/W4", "/WX", "/MT", "/EHsc", "/std:c++17"])
+        .args(["/DUNICODE", "/D_UNICODE", "/D_WIN32_WINNT=0x0A00"])
+        .arg(format!("/I{}", msvc_root.join("include").display()))
+        .arg(format!("/I{}", include.join("ucrt").display()))
+        .arg(format!("/I{}", include.join("um").display()))
+        .arg(format!("/I{}", include.join("shared").display()))
+        .arg(format!("/Fo{}", obj.join("vmmcagent.obj").display()))
+        .arg(format!("/Fe{}", agent.display()))
+        .arg(source.with_file_name("agent").join("vmmcagent.cpp"))
+        .args(["/link", "/SUBSYSTEM:WINDOWS", "user32.lib", "kernel32.lib"])
+        .arg(format!("/LIBPATH:{}", msvc_root.join(r"lib\x64").display()))
+        .arg(format!("/LIBPATH:{}", libs.join(r"um\x64").display()))
+        .arg(format!("/LIBPATH:{}", libs.join(r"ucrt\x64").display())))?;
     let inf = display.join("vmmcdisp.inf");
     fs::copy(source.join("vmmcdisp.inf"), &inf).map_err(|e| format!("can't copy the INF: {e}"))?;
     run(Command::new(tools.tool("x64", "stampinf.exe"))
@@ -293,17 +316,19 @@ pub fn build(trace: bool) -> Result<Drivers, String> {
         .args(["sign", "/fd", "sha256", "/s", "My", "/sha1", &thumbprint])
         .arg(display.join("vmmcdisp.sys"))
         .arg(display.join("vmmcdisplay.exe"))
-        .arg(display.join("vmmcdisp.cat")))?;
+        .arg(display.join("vmmcdisp.cat"))
+        .arg(&agent))?;
     eprintln!(
         "xtask: drivers in {}, test-signed with {}",
         display.display(),
         certificate.display()
     );
     let tools = out.join(TOOLS_ISO);
-    write_tools_iso(&display, &certificate, &tools)?;
+    write_tools_iso(&display, &agent, &certificate, &tools)?;
     eprintln!("xtask: vmmc Tools disc in {}", tools.display());
     Ok(Drivers {
         display,
+        agent,
         certificate,
     })
 }
@@ -354,6 +379,7 @@ pub fn display_test() -> Result<(), String> {
         files.push((file.to_owned(), read(&drivers.display.join(file))?));
     }
     files.push(("setup.ps1".to_owned(), tools_file("setup.ps1")?));
+    files.push(("vmmcagent.exe".to_owned(), read(&drivers.agent)?));
     let mut modes = String::new();
     windows::install(
         &Install {
@@ -371,6 +397,16 @@ pub fn display_test() -> Result<(), String> {
             markers: &DISPLAY_MARKERS,
         },
         |marker, vm, dir| {
+            if marker == "VMMC-DISP: clipboard-copied" {
+                // The guest's copy reached the host (its length, as vmmc-vmx reports
+                // it); the host answers.
+                vm.expect(
+                    "vmmc-vmx: the guest copied 29 characters",
+                    0,
+                    Duration::from_secs(30),
+                )?;
+                vm.send("\x01cvmmc clipboard from the host\r")?;
+            }
             if marker == "VMMC-DISP: mode-set" {
                 modes = vm.text(0, vm.len());
                 check_screen(vm, dir, TEST_MODE)?;
@@ -442,7 +478,12 @@ pub fn display_test() -> Result<(), String> {
 
 /// The vmmc Tools disc: setup (with Windows line ends), the driver package and the
 /// certificate it's signed with, all in the root.
-fn write_tools_iso(package: &Path, certificate: &Path, iso: &Path) -> Result<(), String> {
+fn write_tools_iso(
+    package: &Path,
+    agent: &Path,
+    certificate: &Path,
+    iso: &Path,
+) -> Result<(), String> {
     let mut files = Vec::new();
     for name in ["setup.cmd", "setup.ps1", "autorun.inf"] {
         files.push((name.to_owned(), tools_file(name)?));
@@ -450,6 +491,7 @@ fn write_tools_iso(package: &Path, certificate: &Path, iso: &Path) -> Result<(),
     for name in PACKAGE {
         files.push((name.to_owned(), read(&package.join(name))?));
     }
+    files.push(("vmmcagent.exe".to_owned(), read(agent)?));
     files.push(("vmmc-test-signing.cer".to_owned(), read(certificate)?));
     let files: Vec<(&str, &[u8])> = files
         .iter()

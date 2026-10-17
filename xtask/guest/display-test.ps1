@@ -18,6 +18,27 @@ try {
     Mark "setup: $LASTEXITCODE $($output -replace '\s+', ' ')"
     Mark "setup=$(if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq 3010) { 'ok' } else { 'failed' })"
 
+    # The clipboard, shared through the agent setup started: what's copied here goes to
+    # the host, which answers with text of its own.
+    Start-Sleep -Seconds 2
+    Mark "agent=$([bool](Get-Process vmmcagent -ErrorAction SilentlyContinue))"
+    # As programs do, again if someone else has the clipboard open just then.
+    for ($try = 0; $try -lt 10; $try++) {
+        try {
+            Set-Clipboard -Value 'vmmc clipboard from the guest'
+            break
+        } catch {
+            Start-Sleep -Milliseconds 200
+        }
+    }
+    Mark 'clipboard-copied'
+    $deadline = (Get-Date).AddSeconds(30)
+    do {
+        Start-Sleep -Milliseconds 250
+        $text = Get-Clipboard -Raw
+    } while ($text -ne 'vmmc clipboard from the host' -and (Get-Date) -lt $deadline)
+    Mark "clipboard=$text"
+
     # The adapter restarts with the driver.
     $deadline = (Get-Date).AddSeconds(60)
     do {

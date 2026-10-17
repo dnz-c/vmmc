@@ -1,20 +1,26 @@
 //! A running VM's console in the app: its shared screen, and a thread that sends input
-//! and commands down its pipe, so a slow worker never stalls the window.
+//! and commands down its pipe, so a slow worker never stalls the window. The thread
+//! also asks now and then what the guest copied to its clipboard.
 
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use ipc::Request;
 use ipc::pipe::Section;
 use ipc::screen::{Cursor, Picture};
+use ipc::{Request, Response};
 use vmconfig::Vm;
+
+/// How often the guest's clipboard is asked for.
+const CLIPBOARD_POLL: Duration = Duration::from_millis(500);
 
 pub struct Session {
     /// The VM's file.
     pub path: PathBuf,
     requests: Sender<Request>,
+    /// What the guest copies, from the request thread.
+    copied: Receiver<String>,
     section: Section,
     frame_seq: u32,
     cursor_seq: u32,
@@ -30,13 +36,43 @@ impl Session {
         let mut connection = vmmc_client::connect(vm, Duration::from_millis(500))?;
         let section = connection.screen()?;
         let (requests, queued) = mpsc::channel::<Request>();
+        let (copies, copied) = mpsc::channel::<String>();
         thread::Builder::new()
             .name("console-requests".into())
             .spawn(move || {
-                for request in queued {
-                    if let Err(e) = connection.call(&request) {
-                        tracing::debug!(%e, "the VM's worker went away");
-                        return;
+                // What the guest had copied before the console opened stays there.
+                let mut since = u64::MAX;
+                let mut polled = Instant::now() - CLIPBOARD_POLL;
+                loop {
+                    match queued.recv_timeout(CLIPBOARD_POLL) {
+                        Ok(request) => {
+                            if let Err(e) = connection.call(&request) {
+                                tracing::debug!(%e, "the VM's worker went away");
+                                return;
+                            }
+                        }
+                        Err(RecvTimeoutError::Timeout) => {}
+                        Err(RecvTimeoutError::Disconnected) => return,
+                    }
+                    if polled.elapsed() < CLIPBOARD_POLL {
+                        continue;
+                    }
+                    polled = Instant::now();
+                    match connection.call(&Request::GuestClipboard { since }) {
+                        Ok(Response::GuestClipboard { seq, text }) => {
+                            if let Some(text) = text
+                                && since != u64::MAX
+                                && copies.send(text).is_err()
+                            {
+                                return;
+                            }
+                            since = seq;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::debug!(%e, "the VM's worker went away");
+                            return;
+                        }
                     }
                 }
             })
@@ -44,6 +80,7 @@ impl Session {
         Ok(Self {
             path: vm.path.clone(),
             requests,
+            copied,
             section,
             frame_seq: 0,
             cursor_seq: 0,
@@ -55,6 +92,11 @@ impl Session {
     /// Sends a request; false once the worker is gone.
     pub fn send(&self, request: Request) -> bool {
         self.requests.send(request).is_ok()
+    }
+
+    /// The text the guest copied last, if it copied something since this was asked.
+    pub fn guest_copied(&self) -> Option<String> {
+        self.copied.try_iter().last()
     }
 
     /// Where keys go, for the keyboard hook.

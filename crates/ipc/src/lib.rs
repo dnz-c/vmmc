@@ -7,6 +7,7 @@
 //!   cursor ([`screen`]); a client gets it with [`Request::Screen`].
 
 #[cfg(windows)]
+pub mod clipboard;
 pub mod pipe;
 pub mod screen;
 
@@ -16,7 +17,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// The protocol version; both ends must speak the same one.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 /// No message is larger.
 pub const MAX_MESSAGE: usize = 1 << 20;
 
@@ -73,6 +74,15 @@ pub enum Request {
     },
     /// Saves the VM's state and stops it; starting it again resumes it. The worker exits.
     Suspend,
+    /// Puts text on the guest's clipboard, through vmmc's agent in the guest.
+    SetGuestClipboard {
+        text: String,
+    },
+    /// The guest's clipboard, if its agent sent a newer one than `since` (0 for any):
+    /// answered with [`Response::GuestClipboard`].
+    GuestClipboard {
+        since: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +106,12 @@ pub enum Response {
     Snapshot {
         id: String,
         paused_ms: u64,
+    },
+    /// The guest's clipboard: how many times it changed, and its text if that's newer
+    /// than asked for.
+    GuestClipboard {
+        seq: u64,
+        text: Option<String>,
     },
     Error(String),
 }
