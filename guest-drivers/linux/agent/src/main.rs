@@ -27,6 +27,9 @@ use agent_proto::{Frame, Message, Parser, features};
 use crate::files::Config;
 use crate::serial::Line;
 
+/// How often the agent says hello.
+const HELLO_INTERVAL: Duration = Duration::from_secs(30);
+
 /// What the desktop's thread acts on, besides the display's events.
 pub enum Input {
     /// The host's clipboard.
@@ -165,10 +168,20 @@ fn main() {
     let config = Arc::new(Mutex::new(None));
     let waker = Waker::new().expect("a pipe");
     let (inputs, received) = mpsc::channel();
-    hello(&line);
     {
         let (line, config, waker) = (line.clone(), config.clone(), waker.clone());
         thread::spawn(move || read_line(&line, &config, &inputs, &waker));
+    }
+    // Hello now and then: the worker sends nothing until it has heard one (the firmware
+    // reads the port as a keyboard), and a worker started anew, as a resume does, hasn't.
+    {
+        let line = line.clone();
+        thread::spawn(move || {
+            loop {
+                hello(&line);
+                thread::sleep(HELLO_INTERVAL);
+            }
+        });
     }
     let mut said = false;
     loop {

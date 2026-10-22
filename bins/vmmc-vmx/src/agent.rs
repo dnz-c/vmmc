@@ -34,8 +34,6 @@ const DATA_PORT: u16 = 5640;
 const GATEWAY: [u8; 4] = [10, 0, 2, 2];
 /// How long a frame for the guest waits for the agent to read it.
 const FEED_TIMEOUT: Duration = Duration::from_secs(5);
-/// How often the worker asks for a hello while the agent hasn't said one.
-const PING_INTERVAL: Duration = Duration::from_secs(3);
 /// How long the agent gets to ready a drag from the host.
 const ARM_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long a probe looks for a drag in the guest.
@@ -75,11 +73,15 @@ pub struct Agent {
     clipboard: Mutex<(u64, String)>,
     /// Say on the console when the guest copies something.
     announce: bool,
-    /// Frames for the agent.
+    /// Frames for the agent. Nothing goes until it has said hello: until the guest's
+    /// OS runs, the firmware and boot loaders read COM2 as a keyboard, and an escape
+    /// opens their menus.
     outbox: Mutex<Sender<Vec<u8>>>,
     events: Mutex<Sender<Event>>,
-    /// The agent's hello, once it has said one.
+    /// The agent's hello, once it has said one (in the machine that runs now).
     info: Mutex<Option<ipc::Agent>>,
+    /// The host's clipboard while there's no agent to take it, for when there is.
+    waiting_text: Mutex<Option<String>>,
     /// What a data connection must show.
     token: [u8; 16],
     transfers: Mutex<HashMap<u32, Arc<Transfer>>>,
@@ -104,6 +106,7 @@ impl Agent {
             outbox: Mutex::new(outbox),
             events: Mutex::new(events),
             info: Mutex::new(None),
+            waiting_text: Mutex::new(None),
             token: random_token(),
             transfers: Mutex::default(),
         });
@@ -113,7 +116,6 @@ impl Agent {
             next_id: 1,
             host: None,
             probe: None,
-            pinged: None,
             generation: 0,
         };
         thread::Builder::new()
@@ -122,8 +124,11 @@ impl Agent {
         Ok(agent)
     }
 
+    /// Sends a message to the agent, if it has said hello.
     fn send(&self, message: &Message) {
-        let _ = lock(&self.outbox).send(message.frame());
+        if lock(&self.info).is_some() {
+            let _ = lock(&self.outbox).send(message.frame());
+        }
     }
 
     /// A line for the log: on the console's output, with the guest's, if there's a
@@ -142,9 +147,13 @@ impl Agent {
         let _ = lock(&self.events).send(event);
     }
 
-    /// Puts `text` on the guest's clipboard.
+    /// Puts `text` on the guest's clipboard, now or once the agent says hello.
     pub fn put_in_guest(&self, text: &str) {
-        let _ = lock(&self.outbox).send(agent_proto::clipboard::frame(text));
+        if lock(&self.info).is_some() {
+            let _ = lock(&self.outbox).send(agent_proto::clipboard::frame(text));
+        } else {
+            *lock(&self.waiting_text) = Some(text.to_owned());
+        }
     }
 
     /// How many times the guest has copied something, and what it copied last if
@@ -605,8 +614,6 @@ struct Drags {
     next_id: u32,
     host: Option<HostDrag>,
     probe: Option<Probe>,
-    /// When the worker last asked for a hello.
-    pinged: Option<Instant>,
     /// The machine the agent said hello in.
     generation: u64,
 }
@@ -717,6 +724,10 @@ impl Drags {
                         port: DATA_PORT,
                         token: agent.token,
                     });
+                    // What the host copied while there was no agent.
+                    if let Some(text) = lock(&agent.waiting_text).take() {
+                        agent.put_in_guest(&text);
+                    }
                 });
                 self.generation = self.targets.generation();
             }
@@ -959,19 +970,13 @@ impl Drags {
     /// Timers: hellos, the agent's time to arm, nudges, and probes that found nothing.
     fn tick(&mut self) {
         let now = Instant::now();
-        // A new machine (a guest reset) has an agent that hasn't said hello yet.
+        // A new machine (a guest reset) has an agent that hasn't said hello yet, and
+        // won't hear anything until it does. (Agents say hello now and then, so one
+        // that ran on before this worker started, a resumed guest's, is heard of too.)
         let generation = self.targets.generation();
         if generation != self.generation {
             self.with_agent(|agent| *lock(&agent.info) = None);
             self.generation = generation;
-        }
-        let has_agent = self.agent.upgrade().is_some_and(|a| a.info().is_some());
-        if !has_agent
-            && self.targets.get().is_some()
-            && self.pinged.is_none_or(|at| now - at > PING_INTERVAL)
-        {
-            self.pinged = Some(now);
-            self.send(Message::Ping);
         }
 
         if let Some(host) = self.host.as_mut() {

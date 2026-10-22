@@ -378,12 +378,18 @@ void Hello() {
     Send(w);
 }
 
+// How often the agent says hello: the worker sends nothing until it has heard one (the
+// firmware reads COM2 as a keyboard), and a worker started anew, as a resume does,
+// hasn't.
+constexpr ULONGLONG HELLO_INTERVAL_MS = 30000;
+
 // Reads frames from the host and hands them to the window, opening the port when it can.
 DWORD WINAPI PortReader(void*) {
     OVERLAPPED overlapped = {};
     overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     Parser parser;
     char buffer[4096];
+    ULONGLONG said_hello = 0;
     for (;;) {
         if (g_port == INVALID_HANDLE_VALUE) {
             HANDLE port = OpenPort();
@@ -392,7 +398,11 @@ DWORD WINAPI PortReader(void*) {
                 continue;
             }
             g_port = port;
+            said_hello = 0;
+        }
+        if (said_hello == 0 || GetTickCount64() - said_hello > HELLO_INTERVAL_MS) {
             Hello();
+            said_hello = GetTickCount64();
         }
         ResetEvent(overlapped.hEvent);
         DWORD read = 0;

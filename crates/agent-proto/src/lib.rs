@@ -3,7 +3,11 @@
 //!
 //! - **The control line:** the guest's second serial port (COM2, `/dev/ttyS1`). The
 //!   clipboard's text goes in [`clipboard`] frames, as the first agents had it; everything
-//!   else is a [`Message`] in a frame of its own ([`MAGIC`], a length, the message).
+//!   else is a [`Message`] in a frame of its own ([`MAGIC`], a length, the message). The
+//!   worker sends nothing until the agent has said [`Message::Hello`]: before the
+//!   guest's OS runs, its firmware and boot loader read the port as a keyboard, and a
+//!   frame's escape opens their menus. So agents say hello as they start and every half
+//!   minute after, for a worker started anew (a resumed guest's).
 //! - **Data connections:** file contents would crawl down a UART, so a drag's files go
 //!   over TCP instead: the agent connects to the address the worker names in
 //!   [`Message::Config`], which the VM's NAT answers itself, inside the worker. Each
@@ -103,7 +107,7 @@ impl Chunk {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
     // From the agent.
-    /// The agent started, or the worker asked ([`Message::Ping`]).
+    /// The agent started, or a while passed, or the worker asked ([`Message::Ping`]).
     Hello {
         version: u32,
         /// `windows` or `linux`.
@@ -123,7 +127,8 @@ pub enum Message {
     NoGuestDrag { probe: u32 },
 
     // From the worker.
-    /// Asks for a [`Message::Hello`].
+    /// Asks for a [`Message::Hello`] (of an agent that has said one already: before,
+    /// the worker sends nothing).
     Ping,
     /// Where data connections go, and the token they show.
     Config {
