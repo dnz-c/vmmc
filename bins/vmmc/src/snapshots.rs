@@ -10,7 +10,7 @@ use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferTyp
 use slint::platform::{Platform, PlatformError, WindowAdapter};
 use slint::{ComponentHandle, Image, ModelRc, Rgb8Pixel, SharedPixelBuffer, VecModel};
 
-use super::{AppWindow, TabRow, VmRow};
+use super::{AppWindow, SnapshotRow, TabRow, VmRow};
 
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 820;
@@ -57,6 +57,7 @@ fn vm(name: &str, running: bool) -> VmRow {
         heading: "".into(),
         os: "Windows 11".into(),
         running,
+        suspended: false,
         summary: "4 vCPU, 8.0 GiB, Nvme".into(),
         details: "4 processors, 8.0 GiB memory\nNVMe disk: Windows 11.vmdk\nDVD drive: empty\nNetwork: e1000e on NAT, 52:54:00:4e:5f:60\nUEFI firmware, Secure Boot on, TPM 2.0 on".into(),
         notes: "My test machine.".into(),
@@ -93,6 +94,46 @@ fn every_state_draws() {
     app.set_current_tab(0);
     app.set_current(rows[0].clone());
     snapshot(&window, "vm-page");
+
+    // Its snapshots: a tree, the current one marked, one picked.
+    let snapshot_row = |id: &str, name: &str, detail: &str, depth, current| SnapshotRow {
+        id: id.into(),
+        name: name.into(),
+        detail: detail.into(),
+        depth,
+        current,
+    };
+    app.set_snapshots(ModelRc::new(VecModel::from(vec![
+        snapshot_row("a", "Installed", "Taken 2026-10-15 09:40", 0, false),
+        snapshot_row(
+            "b",
+            "Before the update",
+            "Taken 2026-10-16 19:30, with the VM's memory · KB5031356",
+            1,
+            true,
+        ),
+        snapshot_row("c", "Trying a driver", "Taken 2026-10-17 08:05", 1, false),
+    ])));
+    app.set_selected_snapshot("c".into());
+    let mut suspended = rows[0].clone();
+    suspended.suspended = true;
+    app.set_current(suspended);
+    // The buttons that a pick enables fade in.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    slint::platform::update_timers_and_animations();
+    snapshot(&window, "vm-page-snapshots");
+    app.set_snapshot_name("Before the update".into());
+    app.set_snapshot_open(true);
+    snapshot(&window, "take-snapshot");
+    app.set_snapshot_open(false);
+    app.set_confirm_title("Revert to “Trying a driver”?".into());
+    app.set_confirm_text("What Windows 11 did since “Trying a driver” is lost, unless a snapshot taken since keeps it.".into());
+    app.set_confirm_action("Revert".into());
+    app.set_confirm_open(true);
+    snapshot(&window, "confirm");
+    app.set_confirm_open(false);
+    app.set_snapshots(ModelRc::new(VecModel::from(Vec::<SnapshotRow>::new())));
+    app.set_current(rows[0].clone());
 
     app.set_current_tab(1);
     app.set_current(rows[1].clone());

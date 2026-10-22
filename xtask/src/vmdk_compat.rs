@@ -265,7 +265,10 @@ pub fn test() -> Result<(), String> {
     fs::remove_file(&middle).map_err(|e| e.to_string())?;
     let text = vd(&tool, &["-e", &top.display().to_string()])?;
     if !text.contains("consistent") || text.contains("not consistent") {
-        return Err(format!("VMware's check of the merged chain: {}", text.trim()));
+        return Err(format!(
+            "VMware's check of the merged chain: {}",
+            text.trim()
+        ));
     }
     consistent(&tool, &ours)?;
     let mut all = our_writes.clone();

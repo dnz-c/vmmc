@@ -64,6 +64,7 @@ use slint::{
 use vmconfig::create::{EasyInstall, NewVm, create_vm};
 use vmconfig::library::{self, Library};
 use vmconfig::presets::{self, PRESETS};
+use vmconfig::snapshots::Tree;
 use vmconfig::{Bus, Vm};
 
 slint::include_modules!();
@@ -108,9 +109,27 @@ struct App {
     /// Drags' transfers, for the status bar.
     #[cfg(windows)]
     transfers: Vec<dnd::Shown>,
+    /// The current VM's snapshots, as the window shows them.
+    snapshot_rows: Vec<SnapshotRow>,
+    /// What the question on screen does if the user says yes.
+    confirm: Option<Confirm>,
 }
 
 type Shared = Rc<RefCell<App>>;
+
+/// A snapshot operation that waits for the user to say yes.
+enum Confirm {
+    Revert {
+        vm: PathBuf,
+        id: String,
+        name: String,
+    },
+    Delete {
+        vm: PathBuf,
+        id: String,
+        name: String,
+    },
+}
 
 fn main() {
     tracing_subscriber::fmt()
@@ -150,6 +169,8 @@ fn run() -> Result<(), String> {
         outgoing: dnd::Outgoing::Idle,
         #[cfg(windows)]
         transfers: Vec::new(),
+        snapshot_rows: Vec::new(),
+        confirm: None,
     }));
     #[cfg(windows)]
     dnd::clean_staging();
@@ -363,6 +384,7 @@ fn row(vm: &Vm, folder: Option<&str>, running: bool) -> VmRow {
             os_label(&config.os).into()
         },
         running,
+        suspended: !running && vmmc_client::is_suspended(vm),
         summary: summary.into(),
         details: details.join("\n").into(),
         notes: config.notes.clone().into(),
@@ -461,6 +483,19 @@ fn refresh(app: &Shared) {
             window.set_current(row(vm, entry, state.running[index]));
         }
     }
+    let snapshots = (current >= 0)
+        .then(|| vm_at(&state, &state.tabs[current as usize]))
+        .flatten()
+        .map(|(_, vm)| snapshot_rows(vm))
+        .unwrap_or_default();
+    if snapshots != state.snapshot_rows {
+        let selected = window.get_selected_snapshot();
+        if !snapshots.iter().any(|row| row.id == selected) {
+            window.set_selected_snapshot("".into());
+        }
+        window.set_snapshots(ModelRc::new(VecModel::from(snapshots.clone())));
+        state.snapshot_rows = snapshots;
+    }
     // Drop a console whose VM stopped, or that isn't the current tab's.
     let current_path = (current >= 0).then(|| state.tabs[current as usize].clone());
     let console_running = state
@@ -475,6 +510,79 @@ fn refresh(app: &Shared) {
     }
     window.set_vms(ModelRc::new(VecModel::from(rows)));
     window.set_tabs(ModelRc::new(VecModel::from(tabs)));
+}
+
+/// `vm`'s snapshots as the window lists them: each under the one it was taken from.
+fn snapshot_rows(vm: &Vm) -> Vec<SnapshotRow> {
+    fn add(tree: &Tree, parent: Option<&str>, depth: i32, rows: &mut Vec<SnapshotRow>) {
+        for snapshot in tree.children(parent) {
+            // "2026-10-16T19:30:00Z" as "2026-10-16 19:30".
+            let taken: String = snapshot
+                .created
+                .replacen('T', " ", 1)
+                .chars()
+                .take(16)
+                .collect();
+            let mut detail = format!("Taken {taken}");
+            if snapshot.running {
+                detail += ", with the VM's memory";
+            }
+            if !snapshot.description.is_empty() {
+                detail += " · ";
+                detail += &snapshot.description;
+            }
+            rows.push(SnapshotRow {
+                id: snapshot.id.as_str().into(),
+                name: snapshot.name.as_str().into(),
+                detail: detail.into(),
+                depth,
+                current: tree.current.as_deref() == Some(snapshot.id.as_str()),
+            });
+            add(tree, Some(&snapshot.id), depth + 1, rows);
+        }
+    }
+    let mut rows = Vec::new();
+    if let Ok(tree) = Tree::load(vm) {
+        add(&tree, None, 0, &mut rows);
+    }
+    rows
+}
+
+/// Runs `job` off the window's thread (a snapshot pauses the VM; a merge takes a while
+/// for a big disk), saying `doing` meanwhile; then what it did, or its error under the
+/// title `failed`.
+fn in_background(
+    window: &AppWindow,
+    doing: String,
+    failed: &'static str,
+    job: impl FnOnce() -> Result<String, String> + Send + 'static,
+) {
+    window.set_status_text(doing.into());
+    let weak = window.as_weak();
+    std::thread::spawn(move || {
+        let result = job();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            match result {
+                Ok(done) => window.set_status_text(capitalized(&done).into()),
+                Err(e) => {
+                    window.set_status_text("".into());
+                    message(&window, failed, &e);
+                }
+            }
+        });
+    });
+}
+
+/// `text` with its first letter upper case, for the status line.
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
 }
 
 /// Sorts the library's rows into its folders (in the library's order, then the VMs
@@ -669,6 +777,14 @@ fn message(window: &AppWindow, title: &str, text: &str) {
     window.set_message_open(true);
 }
 
+/// Asks the user a question; its answer comes as `confirmed`.
+fn ask(window: &AppWindow, title: &str, text: &str, action: &str) {
+    window.set_confirm_title(title.into());
+    window.set_confirm_text(text.into());
+    window.set_confirm_action(action.into());
+    window.set_confirm_open(true);
+}
+
 /// The current tab's VM, loaded.
 fn current_vm(app: &Shared, window: &AppWindow) -> Option<Vm> {
     let state = app.borrow();
@@ -838,6 +954,125 @@ fn wire(window: &AppWindow, app: &Shared) {
         match vmmc_client::insert_tools(&vm) {
             Ok(text) => message(&window, "vmmc Tools", &text),
             Err(e) => message(&window, "Couldn't insert vmmc Tools", &e),
+        }
+    }));
+    window.on_suspend_vm(with!(app, window, {
+        let Some(vm) = current_vm(&app, &window) else {
+            return;
+        };
+        #[cfg(windows)]
+        in_background(
+            &window,
+            format!("Suspending {}…", vm.config.name),
+            "Couldn't suspend",
+            move || {
+                vmmc_client::suspend(&vm)
+                    .map(|()| format!("suspended {}: starting it resumes it", vm.config.name))
+            },
+        );
+    }));
+    window.on_take_snapshot(with!(app, window, {
+        let mut vm = match current_vm_on_disk(&app, &window) {
+            Some(Ok(vm)) => vm,
+            Some(Err(e)) => return message(&window, "Couldn't take the snapshot", &e),
+            None => return,
+        };
+        let name = window.get_snapshot_name().trim().to_owned();
+        let description = window.get_snapshot_description().trim().to_owned();
+        window.set_snapshot_open(false);
+        #[cfg(windows)]
+        in_background(
+            &window,
+            format!("Taking snapshot {name:?} of {}…", vm.config.name),
+            "Couldn't take the snapshot",
+            move || vmmc_client::take_snapshot(&mut vm, &name, &description),
+        );
+    }));
+    window.on_revert_snapshot(with!(app, window, {
+        let Some(vm) = current_vm(&app, &window) else {
+            return;
+        };
+        let id = window.get_selected_snapshot().to_string();
+        let Some(snapshot) = Tree::load(&vm).ok().and_then(|tree| tree.get(&id).cloned()) else {
+            return;
+        };
+        let then = if window.get_current().running {
+            " The VM goes on from the snapshot at once."
+        } else if snapshot.running {
+            " It resumes from the snapshot when you start it."
+        } else {
+            ""
+        };
+        let text = format!(
+            "What {} did since “{}” is lost, unless a snapshot taken since keeps it.{then}",
+            vm.config.name, snapshot.name
+        );
+        app.borrow_mut().confirm = Some(Confirm::Revert {
+            vm: vm.path.clone(),
+            id,
+            name: snapshot.name.clone(),
+        });
+        ask(
+            &window,
+            &format!("Revert to “{}”?", snapshot.name),
+            &text,
+            "Revert",
+        );
+    }));
+    window.on_delete_snapshot(with!(app, window, {
+        let Some(vm) = current_vm(&app, &window) else {
+            return;
+        };
+        let id = window.get_selected_snapshot().to_string();
+        let Some(snapshot) = Tree::load(&vm).ok().and_then(|tree| tree.get(&id).cloned()) else {
+            return;
+        };
+        let when = if window.get_current().running {
+            " once the VM stops"
+        } else {
+            ""
+        };
+        let text = format!(
+            "{} stays as it is: only the way back to “{}” goes. Its disk changes merge into the disks beneath{when}, which can take a while for a big disk.",
+            vm.config.name, snapshot.name
+        );
+        app.borrow_mut().confirm = Some(Confirm::Delete {
+            vm: vm.path.clone(),
+            id,
+            name: snapshot.name.clone(),
+        });
+        ask(&window, &format!("Delete “{}”?", snapshot.name), &text, "Delete");
+    }));
+    window.on_confirmed(with!(app, window, {
+        let Some(confirm) = app.borrow_mut().confirm.take() else {
+            return;
+        };
+        let (path, id, name, failed) = match &confirm {
+            Confirm::Revert { vm, id, name } => (vm, id.clone(), name.clone(), "Couldn't revert"),
+            Confirm::Delete { vm, id, name } => {
+                (vm, id.clone(), name.clone(), "Couldn't delete the snapshot")
+            }
+        };
+        let mut vm = match Vm::load(path) {
+            Ok(vm) => vm,
+            Err(e) => return message(&window, failed, &e.to_string()),
+        };
+        match confirm {
+            Confirm::Revert { .. } => {
+                #[cfg(windows)]
+                in_background(
+                    &window,
+                    format!("Reverting {} to {name:?}…", vm.config.name),
+                    failed,
+                    move || vmmc_client::revert(&mut vm, &id),
+                );
+            }
+            Confirm::Delete { .. } => in_background(
+                &window,
+                format!("Deleting snapshot {name:?}…"),
+                failed,
+                move || vmmc_client::delete_snapshot(&mut vm, &id),
+            ),
         }
     }));
     {

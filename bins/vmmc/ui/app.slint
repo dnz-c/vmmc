@@ -13,6 +13,8 @@ export struct VmRow {
     heading: string,
     os: string,
     running: bool,
+    // Its state was saved: starting it resumes it.
+    suspended: bool,
     // One line: "4 vCPUs, 8 GiB, NVMe 64 GiB".
     summary: string,
     // The hardware, a line per device.
@@ -22,6 +24,17 @@ export struct VmRow {
     started: string,
     // Where an imported VM came from, or empty.
     origin: string,
+}
+
+export struct SnapshotRow {
+    id: string,
+    name: string,
+    // When it was taken, whether with the VM's memory, and its description.
+    detail: string,
+    // How deep in the tree: one taken from another is one deeper.
+    depth: int,
+    // The VM goes on from it.
+    current: bool,
 }
 
 export struct TabRow {
@@ -127,6 +140,25 @@ export component AppWindow inherits Window {
     callback open-settings();
     callback new-vm();
     callback import-vm();
+    callback suspend-vm();
+
+    // The current VM's snapshots, as a tree, and the one picked (its ID).
+    in property <[SnapshotRow]> snapshots;
+    in-out property <string> selected-snapshot;
+    callback revert-snapshot();
+    callback delete-snapshot();
+    // Taking a snapshot.
+    in-out property <bool> snapshot-open;
+    in-out property <string> snapshot-name;
+    in-out property <string> snapshot-description;
+    callback take-snapshot();
+
+    // A question: Cancel, or its action.
+    in-out property <bool> confirm-open;
+    in property <string> confirm-title;
+    in property <string> confirm-text;
+    in property <string> confirm-action;
+    callback confirmed();
 
     // The New VM wizard.
     in-out property <bool> wizard-open;
@@ -330,7 +362,7 @@ export component AppWindow inherits Window {
                                 padding: 7px;
                                 spacing: 6px;
                                 if !root.current.running: ToolButton {
-                                    text: "▶ Start";
+                                    text: root.current.suspended ? "▶ Resume" : "▶ Start";
                                     primary: true;
                                     clicked => { root.start-vm(); }
                                 }
@@ -349,6 +381,10 @@ export component AppWindow inherits Window {
                                 if root.current.running: ToolButton {
                                     text: "Ctrl+Alt+Del";
                                     clicked => { root.ctrl-alt-del(); }
+                                }
+                                if root.current.running: ToolButton {
+                                    text: "Suspend";
+                                    clicked => { root.suspend-vm(); }
                                 }
                                 if root.current.running && root.current.tools: ToolButton {
                                     text: "Install vmmc Tools";
@@ -445,7 +481,7 @@ export component AppWindow inherits Window {
                                     color: white;
                                 }
                                 Text {
-                                    text: root.current.os + (root.current.running ? " · running" : " · powered off");
+                                    text: root.current.os + (root.current.running ? " · running" : root.current.suspended ? " · suspended" : " · powered off");
                                     color: root.current.running ? #3fb950 : #9a9a9a;
                                 }
                                 if root.current.origin != "": Text {
@@ -502,6 +538,74 @@ export component AppWindow inherits Window {
                                 Text {
                                     text: "Created " + root.current.created + (root.current.started == "" ? "; never started" : "; last started " + root.current.started);
                                     color: #8a8a8a;
+                                }
+                                Text {
+                                    text: "Snapshots";
+                                    font-weight: 700;
+                                    color: white;
+                                }
+                                if root.snapshots.length == 0: Text {
+                                    text: "None yet. A snapshot keeps the VM as it is (with its memory, while it runs), to go back to later.";
+                                    color: #8a8a8a;
+                                    wrap: word-wrap;
+                                }
+                                if root.snapshots.length > 0: VerticalLayout {
+                                    spacing: 2px;
+                                for snapshot in root.snapshots: Rectangle {
+                                    height: 44px;
+                                    background: snapshot.id == root.selected-snapshot ? #2f4a6b : snapshot-area.has-hover ? #2f2f33 : transparent;
+                                    border-radius: 4px;
+                                    snapshot-area := TouchArea {
+                                        clicked => { root.selected-snapshot = snapshot.id; }
+                                    }
+                                    HorizontalLayout {
+                                        padding: 5px;
+                                        padding-left: 8px + snapshot.depth * 20px;
+                                        spacing: 8px;
+                                        Rectangle {
+                                            width: 10px;
+                                            height: 10px;
+                                            y: (parent.height - self.height) / 2;
+                                            border-radius: 5px;
+                                            background: snapshot.current ? #3fb950 : #5a5a5a;
+                                        }
+                                        VerticalLayout {
+                                            Text {
+                                                text: snapshot.name + (snapshot.current ? "  ·  the VM goes on from here" : "");
+                                                color: white;
+                                                overflow: elide;
+                                            }
+                                            Text {
+                                                text: snapshot.detail;
+                                                color: #9a9a9a;
+                                                font-size: 11px;
+                                                overflow: elide;
+                                            }
+                                        }
+                                    }
+                                }
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: start;
+                                    Button {
+                                        text: "Take snapshot…";
+                                        clicked => {
+                                            root.snapshot-name = "";
+                                            root.snapshot-description = "";
+                                            root.snapshot-open = true;
+                                        }
+                                    }
+                                    Button {
+                                        text: "Revert to it";
+                                        enabled: root.selected-snapshot != "";
+                                        clicked => { root.revert-snapshot(); }
+                                    }
+                                    Button {
+                                        text: "Delete";
+                                        enabled: root.selected-snapshot != "";
+                                        clicked => { root.delete-snapshot(); }
+                                    }
                                 }
                                 Text {
                                     text: "Notes";
@@ -754,6 +858,76 @@ export component AppWindow inherits Window {
                 text: "Save";
                 primary: true;
                 clicked => { root.save-settings(); }
+            }
+        }
+    }
+
+    // Taking a snapshot of the current VM.
+    if root.snapshot-open: Sheet {
+        width: root.width;
+        height: root.height;
+        heading: "Take a snapshot";
+        Text {
+            text: root.current.running ? "The VM keeps running: it pauses for a moment while its memory is saved." : "The VM is off: the snapshot keeps its disks and settings.";
+            color: #b0b0b0;
+            wrap: word-wrap;
+        }
+        Field {
+            label: "Name";
+            LineEdit {
+                text <=> root.snapshot-name;
+                placeholder-text: "Before the update";
+            }
+        }
+        Field {
+            label: "Description";
+            LineEdit {
+                text <=> root.snapshot-description;
+                placeholder-text: "optional";
+            }
+        }
+        Rectangle { }
+        HorizontalLayout {
+            alignment: end;
+            spacing: 8px;
+            Button {
+                text: "Cancel";
+                clicked => { root.snapshot-open = false; }
+            }
+            Button {
+                text: "Take snapshot";
+                primary: true;
+                enabled: root.snapshot-name != "";
+                clicked => { root.take-snapshot(); }
+            }
+        }
+    }
+
+    // A question.
+    if root.confirm-open: Sheet {
+        width: root.width;
+        height: root.height;
+        heading: root.confirm-title;
+        Text {
+            text: root.confirm-text;
+            color: #d0d0d0;
+            wrap: word-wrap;
+        }
+        Rectangle { }
+        HorizontalLayout {
+            alignment: end;
+            spacing: 8px;
+            Button {
+                text: "Cancel";
+                clicked => { root.confirm-open = false; }
+            }
+            Button {
+                text: root.confirm-action;
+                primary: true;
+                clicked => {
+                    root.confirm-open = false;
+                    root.confirmed();
+                }
             }
         }
     }
