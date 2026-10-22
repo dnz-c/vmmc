@@ -11,6 +11,11 @@ ignore = [
     # Unmaintained, not vulnerable; it parses the title-bar font of winit's Wayland
     # decorations (sctk-adwaita), which vmmc's Windows builds don't contain.
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser: unmaintained, Linux Wayland decorations only" },
+    # Unmaintained, not vulnerable: D-Bus for Slint's winit backend on Linux (zbus),
+    # which vmmc's Windows builds don't contain.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant: unmaintained, Linux D-Bus only" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names: unmaintained, Linux D-Bus only" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: unmaintained, Linux D-Bus only" },
 ]
 
 [licenses]
