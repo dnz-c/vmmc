@@ -152,14 +152,8 @@ fn snapshot_command(command: SnapshotCommand) -> Result<(), String> {
             println!("{}", snapshot_tree(&tree));
         }
         SnapshotCommand::Delete { vm, snapshot } => {
-            let vm = find_vm(&vm)?;
-            let tree = vmconfig::snapshots::Tree::load(&vm).map_err(|e| e.to_string())?;
-            let found = tree
-                .find(&snapshot)
-                .ok_or_else(|| format!("{} has no snapshot {snapshot:?}", vm.config.name))?;
-            let name = found.name.clone();
-            vmconfig::snapshots::delete(&vm, &found.id.clone())?;
-            println!("deleted snapshot {name:?}");
+            let mut vm = find_vm(&vm)?;
+            println!("{}", vmmc_client::delete_snapshot(&mut vm, &snapshot)?);
         }
         #[cfg(windows)]
         SnapshotCommand::Create {

@@ -14,7 +14,8 @@
 //!   held what came since. A snapshot of a running VM then starts the VM from its
 //!   state.
 //! - **Deleting** one ([`delete`]) forgets it and its files. Its disk images stay, at
-//!   the bottom of the chains above them.
+//!   the bottom of the chains above them, until [`consolidate`] merges into each
+//!   image the one delta on top of it, with the VM off.
 //!
 //! ```toml
 //! current = "3f2a9c1e-..."   # the snapshot the VM goes on from
@@ -26,8 +27,9 @@
 //! running = true
 //! ```
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -200,10 +202,7 @@ pub fn begin(vm: &Vm, name: &str, description: &str) -> Result<Pending, String> 
     let mut deltas = Vec::new();
     for disk in vm.config.disks.iter().filter(|disk| !disk.read_only) {
         let path = vm.resolve(&disk.path);
-        if !path
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("vmdk"))
-        {
+        if !is_vmdk(&path) {
             return Err(format!(
                 "{} isn't a VMDK: snapshots need VMDK disks (vmmc-cli disk convert makes one)",
                 path.display()
@@ -402,7 +401,8 @@ fn is_delta_name(path: &Path) -> bool {
 }
 
 /// Deletes snapshot `id`: forgets it and removes its files. The snapshots taken from it
-/// hang from its parent instead. Its disk images stay: the disks above them need them.
+/// hang from its parent instead. Its disk images stay, for the disks above them, until
+/// [`consolidate`] merges them.
 pub fn delete(vm: &Vm, id: &str) -> Result<(), String> {
     let mut tree = Tree::load(vm).map_err(|e| e.to_string())?;
     let snapshot = tree
@@ -428,6 +428,179 @@ pub fn delete(vm: &Vm, id: &str) -> Result<(), String> {
         let _ = fs::remove_file(path);
     }
     Ok(())
+}
+
+/// A merge [`consolidate`] makes: `child`'s data goes into `image`, which takes its
+/// place, and the deltas on `child` (`above`) move onto `image`.
+struct Merge {
+    image: PathBuf,
+    child: PathBuf,
+    above: Vec<PathBuf>,
+}
+
+/// A path to compare with others: absolute, without `.` and `..`.
+fn normal(path: &Path) -> PathBuf {
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            part => out.push(part.as_os_str()),
+        }
+    }
+    out
+}
+
+fn is_vmdk(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("vmdk"))
+}
+
+/// The images `config`'s writable disks read and write.
+fn writable_images(vm: &Vm, config: &VmConfig) -> Vec<PathBuf> {
+    config
+        .disks
+        .iter()
+        .filter(|disk| !disk.read_only)
+        .map(|disk| normal(&vm.resolve(&disk.path)))
+        .collect()
+}
+
+/// The next merge, if there is one: an image in the VM's folder that neither the VM nor
+/// a snapshot uses (and isn't a VMware VM's own disk), with just one disk on top, a
+/// delta of vmmc's.
+fn next_merge(vm: &Vm, tree: &Tree) -> Result<Option<Merge>, String> {
+    let mut used = writable_images(vm, &vm.config);
+    for snapshot in &tree.snapshots {
+        let config = snapshot_config(vm, &snapshot.id).map_err(|e| e.to_string())?;
+        used.extend(writable_images(vm, &config));
+    }
+    // Each image's parent, down every chain. An image that can't be read stops it all:
+    // one with a disk on top left out could look like it has just one.
+    let mut parents: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+    let mut seen = BTreeSet::new();
+    let mut queue = used.clone();
+    while let Some(image) = queue.pop() {
+        if !is_vmdk(&image) || !seen.insert(image.clone()) {
+            continue;
+        }
+        let parent = disk::parent_of(&image).map_err(|e| format!("{}: {e}", image.display()))?;
+        if let Some(parent) = parent {
+            let parent = normal(&parent);
+            parents.insert(image, parent.clone());
+            queue.push(parent);
+        }
+    }
+    let vm_dir = normal(vm.dir());
+    let vmware: Vec<PathBuf> = vm
+        .config
+        .vmware
+        .iter()
+        .flat_map(|origin| &origin.base_disks)
+        .map(|disk| normal(&vm.resolve(disk)))
+        .collect();
+    let on = |image: &PathBuf| -> Vec<PathBuf> {
+        parents
+            .iter()
+            .filter(|(_, parent)| *parent == image)
+            .map(|(child, _)| child.clone())
+            .collect()
+    };
+    for image in &seen {
+        if used.contains(image) || !image.starts_with(&vm_dir) || vmware.contains(image) {
+            continue;
+        }
+        let [child] = &on(image)[..] else {
+            continue;
+        };
+        if child.starts_with(&vm_dir) && is_delta_name(child) {
+            return Ok(Some(Merge {
+                image: image.clone(),
+                above: on(child),
+                child: child.clone(),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// Writes a snapshot's config back.
+fn save_snapshot_config(vm: &Vm, id: &str, config: &VmConfig) -> Result<(), String> {
+    let path = config_file(vm, id);
+    let text = toml::to_string(config).map_err(|e| e.to_string())?;
+    let partial = path.with_extension("vmmc-partial");
+    fs::write(&partial, text).map_err(|e| format!("can't write {}: {e}", partial.display()))?;
+    fs::rename(&partial, &path).map_err(|e| format!("can't write {}: {e}", path.display()))
+}
+
+/// Merges disk images no snapshot needs any more, in a VM that isn't running: an image
+/// in the VM's folder that neither the VM nor a snapshot uses, with just one delta on
+/// top of it, takes the delta's data and its place (as deleting a snapshot in VMware
+/// does). Images that more than one disk is on stay, and a VMware VM's own disks are
+/// never written. Returns what was merged, for the user.
+pub fn consolidate(vm: &mut Vm) -> Result<Vec<String>, String> {
+    let mut merged = Vec::new();
+    loop {
+        let tree = Tree::load(vm).map_err(|e| e.to_string())?;
+        let Some(merge) = next_merge(vm, &tree)? else {
+            return Ok(merged);
+        };
+        disk::merge_into_parent(&merge.child).map_err(|e| {
+            format!(
+                "can't merge {} into {}: {e}",
+                merge.child.display(),
+                merge.image.display()
+            )
+        })?;
+        for above in &merge.above {
+            disk::reparent(above, &merge.image).map_err(|e| {
+                format!(
+                    "can't move {} onto {}: {e}",
+                    above.display(),
+                    merge.image.display()
+                )
+            })?;
+        }
+        // Whatever named the delta names the image now.
+        let image = config_path(&normal(vm.dir()), &merge.image);
+        let renamed = |config: &mut VmConfig| {
+            let mut changed = false;
+            for disk in config.disks.iter_mut().filter(|disk| !disk.read_only) {
+                if normal(&vm.resolve(&disk.path)) == merge.child {
+                    disk.path = image.clone();
+                    changed = true;
+                }
+            }
+            changed
+        };
+        for snapshot in &tree.snapshots {
+            let mut config = snapshot_config(vm, &snapshot.id).map_err(|e| e.to_string())?;
+            if renamed(&mut config) {
+                save_snapshot_config(vm, &snapshot.id, &config)?;
+            }
+        }
+        let mut config = vm.config.clone();
+        if renamed(&mut config) {
+            vm.config = config;
+            vm.save().map_err(|e| e.to_string())?;
+        }
+        fs::remove_file(&merge.child)
+            .map_err(|e| format!("can't remove {}: {e}", merge.child.display()))?;
+        let name = |path: &Path| {
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        };
+        merged.push(format!(
+            "{} into {}",
+            name(&merge.child),
+            name(&merge.image)
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -520,6 +693,65 @@ mod tests {
             "it hangs from the first's parent"
         );
         assert_eq!(read(&vm), b"two..", "the disks are untouched");
+    }
+
+    #[test]
+    fn deleting_snapshots_merges_the_deltas_nothing_else_needs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vm = vm(dir.path());
+        write(&vm, b"one..");
+        let first = take(&mut vm, "First", "").unwrap();
+        write(&vm, b"two..");
+        let second = take(&mut vm, "Second", "").unwrap();
+        write(&vm, b"three");
+        // disk.vmdk (First's) <- disk-000001 (Second's) <- disk-000002 (the VM's).
+        assert_eq!(
+            consolidate(&mut vm).unwrap(),
+            Vec::<String>::new(),
+            "all in use"
+        );
+
+        delete(&vm, &first.id).unwrap();
+        assert_eq!(
+            consolidate(&mut vm).unwrap(),
+            ["disk-000001.vmdk into disk.vmdk"]
+        );
+        assert!(!dir.path().join("disk-000001.vmdk").exists());
+        assert_eq!(
+            snapshot_config(&vm, &second.id).unwrap().disks[0].path,
+            "disk.vmdk",
+            "the second snapshot's image is the merged one"
+        );
+        assert_eq!(read(&vm), b"three", "the VM's delta moved onto it");
+        revert(&mut vm, &second.id).unwrap();
+        assert_eq!(read(&vm), b"two..");
+
+        // The last snapshot: its delta, the VM's, merges too.
+        delete(&vm, &second.id).unwrap();
+        assert_eq!(consolidate(&mut vm).unwrap().len(), 1);
+        assert_eq!(vm.config.disks[0].path, "disk.vmdk");
+        assert_eq!(read(&vm), b"two..");
+        let left: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".vmdk"))
+            .collect();
+        assert_eq!(left, ["disk.vmdk"]);
+    }
+
+    #[test]
+    fn an_image_two_disks_are_on_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vm = vm(dir.path());
+        let first = take(&mut vm, "First", "").unwrap();
+        write(&vm, b"left.");
+        take(&mut vm, "Left", "").unwrap();
+        revert(&mut vm, &first.id).unwrap();
+        write(&vm, b"right");
+        delete(&vm, &first.id).unwrap();
+        // disk.vmdk has Left's image and the VM's disk on it.
+        assert_eq!(consolidate(&mut vm).unwrap(), Vec::<String>::new());
+        assert_eq!(read(&vm), b"right");
     }
 
     #[test]

@@ -201,6 +201,35 @@ pub fn revert(vm: &mut Vm, snapshot: &str) -> Result<String, String> {
     }
 }
 
+/// Deletes a snapshot of `vm`, by ID or name. With the VM off, the disk images it
+/// leaves that nothing needs merge at once; a running VM's worker merges them when it
+/// stops. Returns what happened, to tell the user.
+pub fn delete_snapshot(vm: &mut Vm, snapshot: &str) -> Result<String, String> {
+    let tree = vmconfig::snapshots::Tree::load(vm).map_err(|e| e.to_string())?;
+    let found = tree
+        .find(snapshot)
+        .ok_or_else(|| format!("{} has no snapshot {snapshot:?}", vm.config.name))?
+        .clone();
+    vmconfig::snapshots::delete(vm, &found.id)?;
+    #[cfg(windows)]
+    if is_running(vm) {
+        return Ok(format!(
+            "deleted snapshot {:?}; its disk changes merge into the disks beneath when the VM stops",
+            found.name
+        ));
+    }
+    let merged = vmconfig::snapshots::consolidate(vm)?;
+    Ok(if merged.is_empty() {
+        format!("deleted snapshot {:?}", found.name)
+    } else {
+        format!(
+            "deleted snapshot {:?}, and merged {}",
+            found.name,
+            merged.join(", ")
+        )
+    })
+}
+
 /// Suspends the running `vm`: its state is saved, and its next start resumes it.
 #[cfg(windows)]
 pub fn suspend(vm: &Vm) -> Result<(), String> {

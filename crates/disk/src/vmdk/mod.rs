@@ -160,44 +160,7 @@ impl Vmdk {
             return Err(invalid("chain of delta disks too long (a loop?)"));
         }
         let first = open_file(path, read_only)?;
-        let (descriptor, home) = match detect(&first)? {
-            Kind::Sparse => {
-                let mut bytes = [0u8; 512];
-                file_read(&first, &mut bytes, 0)?;
-                let header = sparse::Header::parse(&bytes)?;
-                if header.descriptor_offset == 0 || header.descriptor_sectors == 0 {
-                    return Err(invalid(
-                        "this is one extent of a split disk: open its descriptor .vmdk",
-                    ));
-                }
-                let len = header.descriptor_sectors * SECTOR;
-                if len > descriptor::MAX_LEN as u64 {
-                    return Err(invalid("embedded descriptor too large"));
-                }
-                let mut text = vec![0u8; len as usize];
-                file_read(&first, &mut text, header.descriptor_offset * SECTOR)?;
-                (
-                    Descriptor::parse(&text).map_err(|e| invalid(&e))?,
-                    DescriptorHome::Embedded {
-                        sector: header.descriptor_offset,
-                        sectors: header.descriptor_sectors,
-                    },
-                )
-            }
-            Kind::Descriptor => {
-                let len = first.metadata()?.len();
-                if len > descriptor::MAX_LEN as u64 {
-                    return Err(invalid("descriptor file too large"));
-                }
-                let mut text = vec![0u8; len as usize];
-                file_read(&first, &mut text, 0)?;
-                (
-                    Descriptor::parse(&text).map_err(|e| invalid(&e))?,
-                    DescriptorHome::File(path.to_owned()),
-                )
-            }
-            Kind::Raw => return Err(invalid("not a VMDK")),
-        };
+        let (descriptor, home) = read_descriptor(path, &first)?;
         let dir = path.parent().unwrap_or(Path::new("."));
         let mut first = Some(first);
         let mut extents = Vec::new();
@@ -320,26 +283,14 @@ impl Vmdk {
     }
 
     fn write_descriptor(&self, descriptor: &Descriptor) -> io::Result<()> {
-        let text = descriptor.to_text();
-        match &self.home {
-            DescriptorHome::File(path) => {
-                let partial = path.with_extension("vmdk-partial");
-                fs::write(&partial, text.as_bytes())?;
-                fs::rename(&partial, path)
-            }
-            DescriptorHome::Embedded { sector, sectors } => {
-                let room = (sectors * SECTOR) as usize;
-                if text.len() > room {
-                    return Err(invalid("descriptor doesn't fit in its extent"));
-                }
-                let mut bytes = text.into_bytes();
-                bytes.resize(room, 0);
-                let ExtentData::Sparse(extent) = &self.extents[0].data else {
-                    unreachable!("an embedded descriptor is in a sparse extent");
-                };
-                file_write(extent.file(), &bytes, sector * SECTOR)
-            }
-        }
+        let file = match &self.home {
+            DescriptorHome::Embedded { .. } => match self.extents.first().map(|e| &e.data) {
+                Some(ExtentData::Sparse(extent)) => Some(extent.file()),
+                _ => unreachable!("an embedded descriptor is in a sparse extent"),
+            },
+            DescriptorHome::File(_) => None,
+        };
+        store_descriptor(&self.home, file, descriptor)
     }
 
     /// Calls `f(extent, offset within the extent, bytes, offset within buf)` for the
@@ -631,6 +582,168 @@ pub fn create_delta(path: &Path, parent: &Path) -> io::Result<()> {
         ddb,
     };
     write_sparse_file(path, base.len(), descriptor)
+}
+
+/// A VMDK's own descriptor and where it lives, read from its first file (`path`, open
+/// as `first`); its extents and parents aren't opened.
+fn read_descriptor(path: &Path, first: &File) -> io::Result<(Descriptor, DescriptorHome)> {
+    match detect(first)? {
+        Kind::Sparse => {
+            let mut bytes = [0u8; 512];
+            file_read(first, &mut bytes, 0)?;
+            let header = sparse::Header::parse(&bytes)?;
+            if header.descriptor_offset == 0 || header.descriptor_sectors == 0 {
+                return Err(invalid(
+                    "this is one extent of a split disk: open its descriptor .vmdk",
+                ));
+            }
+            let len = header.descriptor_sectors * SECTOR;
+            if len > descriptor::MAX_LEN as u64 {
+                return Err(invalid("embedded descriptor too large"));
+            }
+            let mut text = vec![0u8; len as usize];
+            file_read(first, &mut text, header.descriptor_offset * SECTOR)?;
+            Ok((
+                Descriptor::parse(&text).map_err(|e| invalid(&e))?,
+                DescriptorHome::Embedded {
+                    sector: header.descriptor_offset,
+                    sectors: header.descriptor_sectors,
+                },
+            ))
+        }
+        Kind::Descriptor => {
+            let len = first.metadata()?.len();
+            if len > descriptor::MAX_LEN as u64 {
+                return Err(invalid("descriptor file too large"));
+            }
+            let mut text = vec![0u8; len as usize];
+            file_read(first, &mut text, 0)?;
+            Ok((
+                Descriptor::parse(&text).map_err(|e| invalid(&e))?,
+                DescriptorHome::File(path.to_owned()),
+            ))
+        }
+        Kind::Raw => Err(invalid("not a VMDK")),
+    }
+}
+
+/// Writes `descriptor` back to `home`: its own file, or the sparse extent `embedded_in`.
+fn store_descriptor(
+    home: &DescriptorHome,
+    embedded_in: Option<&File>,
+    descriptor: &Descriptor,
+) -> io::Result<()> {
+    let text = descriptor.to_text();
+    match home {
+        DescriptorHome::File(path) => {
+            let partial = path.with_extension("vmdk-partial");
+            fs::write(&partial, text.as_bytes())?;
+            fs::rename(&partial, path)
+        }
+        DescriptorHome::Embedded { sector, sectors } => {
+            let room = (sectors * SECTOR) as usize;
+            if text.len() > room {
+                return Err(invalid("descriptor doesn't fit in its extent"));
+            }
+            let mut bytes = text.into_bytes();
+            bytes.resize(room, 0);
+            let file = embedded_in.ok_or_else(|| invalid("no extent for the descriptor"))?;
+            file_write(file, &bytes, sector * SECTOR)
+        }
+    }
+}
+
+/// The disk a delta disk is on, from its descriptor alone (the parent isn't opened), or
+/// `None` for a disk that isn't a delta.
+pub fn parent_of(path: &Path) -> io::Result<Option<PathBuf>> {
+    let file = open_file(path, true)?;
+    let (descriptor, _) = read_descriptor(path, &file)?;
+    if descriptor.parent_cid == NO_PARENT {
+        return Ok(None);
+    }
+    let hint = descriptor
+        .parent_hint
+        .ok_or_else(|| invalid("delta disk without parentFileNameHint"))?;
+    Ok(Some(path.parent().unwrap_or(Path::new(".")).join(hint)))
+}
+
+/// Writes the delta disk `child`'s own data into its parent, which from then on reads
+/// as the delta did, and returns the parent's path. The parent gets a new CID, so the
+/// delta no longer opens: delete it, and [`reparent`] the deltas on top of it onto the
+/// parent. Only for a monolithic sparse delta, as [`create_delta`] makes; nothing else
+/// may have the delta or its parent open.
+pub fn merge_into_parent(child: &Path) -> io::Result<PathBuf> {
+    let file = open_file(child, true)?;
+    let (descriptor, home) = read_descriptor(child, &file)?;
+    if descriptor.parent_cid == NO_PARENT {
+        return Err(invalid(&format!("{} isn't a delta disk", child.display())));
+    }
+    let monolithic = matches!(home, DescriptorHome::Embedded { .. })
+        && descriptor.extents.len() == 1
+        && descriptor.extents[0].kind == ExtentType::Sparse;
+    if !monolithic {
+        return Err(invalid(&format!(
+            "{} isn't a monolithic sparse delta, which is all that can be merged",
+            child.display()
+        )));
+    }
+    let hint = descriptor
+        .parent_hint
+        .as_deref()
+        .ok_or_else(|| invalid("delta disk without parentFileNameHint"))?;
+    let parent_path = child.parent().unwrap_or(Path::new(".")).join(hint);
+    let extent = SparseExtent::open(file, true)?;
+    if extent.header().compressed() {
+        return Err(invalid("a stream-optimized delta can't be merged"));
+    }
+    let parent = Vmdk::open(&parent_path, false)?;
+    if parent.descriptor().cid != descriptor.parent_cid {
+        return Err(invalid(&format!(
+            "{} changed after the delta disk {} was made on it",
+            parent_path.display(),
+            child.display()
+        )));
+    }
+    let len = extent.header().capacity * SECTOR;
+    if len != parent.len() {
+        return Err(invalid(&format!(
+            "{} and its parent {} aren't the same size",
+            child.display(),
+            parent_path.display()
+        )));
+    }
+    let grain = extent.header().grain_bytes();
+    let mut data = vec![0u8; grain as usize];
+    for index in 0..len.div_ceil(grain) {
+        let offset = index * grain;
+        let piece = grain.min(len - offset) as usize;
+        match extent.lookup(index)? {
+            Grain::At(at) => {
+                extent.read_grain(at, 0, &mut data[..piece])?;
+                parent.write_at(&data[..piece], offset)?;
+            }
+            Grain::Zero => parent.write_zeroes(offset, piece as u64)?,
+            Grain::Unallocated => {}
+        }
+    }
+    parent.flush()?;
+    Ok(parent_path)
+}
+
+/// Makes the delta disk at `path` a delta of `parent` instead of the disk it's on now,
+/// which `parent` must read as (as after [`merge_into_parent`] of that disk): the delta
+/// names `parent` and its CID. Nothing else may have the delta open.
+pub fn reparent(path: &Path, parent: &Path) -> io::Result<()> {
+    let parent_cid = Vmdk::open(parent, true)?.descriptor().cid;
+    let file = open_file(path, false)?;
+    let (mut descriptor, home) = read_descriptor(path, &file)?;
+    if descriptor.parent_cid == NO_PARENT {
+        return Err(invalid(&format!("{} isn't a delta disk", path.display())));
+    }
+    let dir = path.parent().unwrap_or(Path::new("."));
+    descriptor.parent_hint = Some(relative_path(dir, parent));
+    descriptor.parent_cid = parent_cid;
+    store_descriptor(&home, Some(&file), &descriptor)
 }
 
 /// `target` as seen from `dir`: relative when both are absolute on one drive (or

@@ -169,6 +169,55 @@ fn a_delta_reads_through_to_its_parent_and_keeps_it_unchanged() {
 }
 
 #[test]
+fn a_delta_merges_into_its_parent_and_the_one_above_moves_onto_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.vmdk");
+    let middle = dir.path().join("base-000001.vmdk");
+    let top = dir.path().join("base-000002.vmdk");
+    create_sparse(&base, 10 * MIB).unwrap();
+    Vmdk::open(&base, false)
+        .unwrap()
+        .write_at(&pattern(4 * GRAIN as usize, 1), 0)
+        .unwrap();
+    create_delta(&middle, &base).unwrap();
+    {
+        let disk = Vmdk::open(&middle, false).unwrap();
+        disk.write_at(&pattern(GRAIN as usize / 2, 2), GRAIN)
+            .unwrap();
+        disk.write_zeroes(2 * GRAIN, 100).unwrap();
+        // The last grain too.
+        disk.write_at(&pattern(512, 3), 10 * MIB - 512).unwrap();
+    }
+    create_delta(&top, &middle).unwrap();
+    Vmdk::open(&top, false)
+        .unwrap()
+        .write_at(&pattern(1000, 4), 3 * GRAIN)
+        .unwrap();
+    let whole = |path: &Path| read(&Vmdk::open(path, true).unwrap(), 0, 10 * MIB as usize);
+    let (middle_view, top_view) = (whole(&middle), whole(&top));
+    assert_eq!(
+        parent_of(&top).unwrap(),
+        Some(dir.path().join("base-000001.vmdk"))
+    );
+    assert_eq!(parent_of(&base).unwrap(), None);
+
+    assert_eq!(
+        merge_into_parent(&middle).unwrap(),
+        dir.path().join("base.vmdk")
+    );
+    assert_eq!(whole(&base), middle_view, "the base reads as the delta did");
+    assert!(
+        Vmdk::open(&top, true).is_err(),
+        "its parent's parent changed"
+    );
+    reparent(&top, &base).unwrap();
+    fs::remove_file(&middle).unwrap();
+    assert_eq!(whole(&top), top_view, "the top reads as before");
+    assert_eq!(parent_of(&top).unwrap(), Some(dir.path().join("base.vmdk")));
+    assert!(merge_into_parent(&base).is_err(), "not a delta");
+}
+
+#[test]
 fn a_delta_on_a_changed_parent_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().join("base.vmdk");

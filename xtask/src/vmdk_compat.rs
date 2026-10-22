@@ -250,6 +250,34 @@ pub fn test() -> Result<(), String> {
     )?;
     eprintln!("xtask: vmmc reads VMware's stream-optimized disk");
 
+    // 5. A chain of vmmc's deltas after a snapshot's deletion merged one: the middle
+    //    delta goes into vmmc's disk, and the top one moves onto it.
+    let middle = dir.join("vmmc-000001.vmdk");
+    let top = dir.join("vmmc-000002.vmdk");
+    disk::create_delta(&middle, &ours).map_err(|e| e.to_string())?;
+    let middle_writes = writes(small, 11);
+    write_all(&middle, &middle_writes[..3])?;
+    disk::create_delta(&top, &middle).map_err(|e| e.to_string())?;
+    let top_writes = writes(small, 12);
+    write_all(&top, &top_writes[2..])?;
+    disk::merge_into_parent(&middle).map_err(|e| e.to_string())?;
+    disk::reparent(&top, &ours).map_err(|e| e.to_string())?;
+    fs::remove_file(&middle).map_err(|e| e.to_string())?;
+    let text = vd(&tool, &["-e", &top.display().to_string()])?;
+    if !text.contains("consistent") || text.contains("not consistent") {
+        return Err(format!("VMware's check of the merged chain: {}", text.trim()));
+    }
+    consistent(&tool, &ours)?;
+    let mut all = our_writes.clone();
+    all.extend_from_slice(&middle_writes[..3]);
+    all.extend_from_slice(&top_writes[2..]);
+    check(
+        &vmware_copy(&tool, &top, "2", "check-merged.vmdk")?,
+        &all,
+        "VMware's copy of the merged chain",
+    )?;
+    eprintln!("xtask: VMware reads a chain vmmc merged");
+
     // Every disk is closed by now (each was opened for one check).
     fs::remove_dir_all(&dir).map_err(|e| format!("can't remove {}: {e}", dir.display()))?;
     eprintln!("vmdk-compat-test passed");

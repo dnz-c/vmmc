@@ -857,15 +857,35 @@ fn main() -> ExitCode {
         Command::Serve(args) => (args, Frontend::Pipe),
         Command::CreateDisk(args) => return create_disk_command(&args),
     };
+    let vm = args.vm.clone();
     match run(*args, frontend) {
         Ok(outcome) => {
             eprintln!("\r\nvmmc-vmx: {}", describe(&outcome));
+            if let Some(vm) = vm {
+                consolidate(&vm);
+            }
             ExitCode::from(exit_code(&outcome))
         }
         Err(e) => {
             eprintln!("vmmc-vmx: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Merges the disk images that snapshots deleted while the VM ran no longer need, now
+/// that nothing has them open.
+fn consolidate(path: &Path) {
+    let merged = vmconfig::Vm::load(path)
+        .map_err(|e| e.to_string())
+        .and_then(|mut vm| vmconfig::snapshots::consolidate(&mut vm));
+    match merged {
+        Ok(merged) if !merged.is_empty() => eprintln!(
+            "vmmc-vmx: merged the disks no snapshot needs any more: {}",
+            merged.join(", ")
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("vmmc-vmx: can't merge the disks no snapshot needs any more: {e}"),
     }
 }
 
