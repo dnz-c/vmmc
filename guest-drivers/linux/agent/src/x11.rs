@@ -4,7 +4,8 @@
 //! - **The clipboard:** XFixes says when the CLIPBOARD selection changes hands; its text
 //!   goes to the host. The host's text makes the agent the owner, serving it.
 //! - **Drags from the host:** an invisible window over the screen takes the worker's
-//!   button press; the agent then is an XDND source of the staged files' `text/uri-list`.
+//!   button press; the agent then is an XDND source of the staged files' `text/uri-list`
+//!   (to Wayland programs through mutter's windows for that: see [`Desktop::stand_in`]).
 //! - **Drags out to the host:** another invisible window over the screen, which says it
 //!   takes drops (XdndAware), catches the guest's drag when the worker nudges the
 //!   pointer; the agent reads its `text/uri-list` and refuses the drop.
@@ -20,12 +21,14 @@ use std::time::{Duration, Instant, SystemTime};
 use agent_proto::{Item, Message, path};
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
+use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
-    AtomEnum, ButtonPressEvent, ClientMessageEvent, ColormapAlloc, ConfigureWindowAux,
-    ConnectionExt as _, CreateWindowAux, EventMask, GrabMode, MotionNotifyEvent, PropMode,
-    Property, PropertyNotifyEvent, SELECTION_NOTIFY_EVENT, SelectionNotifyEvent,
-    SelectionRequestEvent, StackMode, Timestamp, VisualClass, Window, WindowClass,
+    AtomEnum, ButtonPressEvent, ClientMessageEvent, ClipOrdering, ColormapAlloc,
+    ConfigureWindowAux, ConnectionExt as _, CreateWindowAux, EventMask, GrabMode,
+    MotionNotifyEvent, PropMode, Property, PropertyNotifyEvent, SELECTION_NOTIFY_EVENT,
+    SelectionNotifyEvent, SelectionRequestEvent, StackMode, Timestamp, VisualClass, Window,
+    WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
@@ -43,10 +46,16 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(700);
 const CATCH_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long a host drag's window waits for the worker's button press.
 const ARM_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long after a host drag's window shows the worker hears it's ready.
+const ARM_SETTLE: Duration = Duration::from_millis(150);
+/// How long the agent waits for that window to say it showed before going on anyway.
+const EXPOSE_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long a drop target gets to say it's done.
 const FINISH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Data longer than this is served in pieces (INCR).
 const INCR_CHUNK: usize = 256 << 10;
+/// When the agent claims the clipboard a second time (see where it does).
+const RECLAIM_DELAY: Duration = Duration::from_millis(300);
 
 macro_rules! atoms {
     ($($field:ident = $name:expr),* $(,)?) => {
@@ -81,8 +90,20 @@ atoms! {
     xdnd_finished = b"XdndFinished",
     xdnd_type_list = b"XdndTypeList",
     xdnd_action_copy = b"XdndActionCopy",
+    wm_check = b"_NET_SUPPORTING_WM_CHECK",
     clip_property = b"VMMC_CLIPBOARD",
     drag_property = b"VMMC_DRAG",
+}
+
+/// Where a drag from the host is: a window that takes drops.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Target {
+    window: Window,
+    /// Where messages for it go (its proxy), and the XDND version it speaks.
+    to: Window,
+    version: u32,
+    /// Not under the pointer: mutter's window, standing in for a Wayland program's.
+    stand_in: bool,
 }
 
 /// A drag from the host.
@@ -92,17 +113,24 @@ struct HostDrag {
     items: Vec<PathBuf>,
     /// The window the worker's button press lands on.
     window: Window,
+    /// When the window went up, when it said it showed, and whether the worker heard
+    /// it's ready.
     armed_at: Instant,
+    exposed_at: Option<Instant>,
+    armed: bool,
     started: bool,
-    /// The XDND target under the pointer: its window, where messages for it go (its
-    /// proxy), and its version.
-    target: Option<(Window, Window, u32)>,
+    /// The XDND target under the pointer, whether it answered since it heard of the drag,
+    /// and whether it takes the drop.
+    target: Option<Target>,
+    answered: bool,
     accepted: bool,
     /// A position sent and not yet answered, and the latest one since.
     awaiting_status: bool,
     next_position: Option<(i16, i16, Timestamp)>,
     /// Dropped, and waiting for the target to finish, since then.
     dropped_at: Option<Instant>,
+    /// Called off, and waiting for the button to go up, since then.
+    cancelled_at: Option<Instant>,
     /// The data connection, shut if the drag is called off.
     connection: Option<std::net::TcpStream>,
 }
@@ -148,8 +176,12 @@ pub struct Desktop {
     host_drag: Option<HostDrag>,
     probe: Probe,
     catcher: Option<Window>,
+    /// Mutter's hidden XDND window, once looked for (see `stand_in`).
+    bridge: Option<Option<Window>>,
     /// The last time the server reported.
     time: Timestamp,
+    /// When to claim the clipboard again.
+    reclaim_at: Option<Instant>,
 }
 
 impl Desktop {
@@ -217,7 +249,9 @@ impl Desktop {
             host_drag: None,
             probe: Probe::default(),
             catcher: None,
+            bridge: None,
             time: CURRENT_TIME,
+            reclaim_at: None,
         })
     }
 
@@ -264,15 +298,23 @@ impl Desktop {
                 let data = text.into_bytes();
                 self.sent = Some(data.clone());
                 self.ours = Some(Arc::new(data));
+                // The server's time now, not that of the last event the agent saw: an
+                // owner set at an older time is easily taken for a stale one.
                 self.conn
-                    .set_selection_owner(self.window, self.atoms.clipboard, self.time)
+                    .set_selection_owner(self.window, self.atoms.clipboard, CURRENT_TIME)
                     .map_err(|e| e.to_string())?;
+                // And again in a moment. A Wayland program that owned the clipboard can
+                // hear of its new owner (mutter's offer of the agent's text) before it
+                // hears it no longer owns it, and GTK ignores an offer then: so the
+                // program would see an empty clipboard. The second claim brings another
+                // offer, which it takes.
+                self.reclaim_at = Some(Instant::now() + RECLAIM_DELAY);
             }
             Input::Message(message) => match message {
                 Message::HostDrag { drag, items, .. } => self.start_host_drag(drag, &items)?,
                 Message::CancelDrag { drag } => {
                     if self.host_drag.as_ref().is_some_and(|d| d.drag == drag) {
-                        self.end_host_drag(false)?;
+                        self.cancel_host_drag()?;
                     }
                 }
                 Message::Probe { probe } => self.start_probe(probe)?,
@@ -318,18 +360,6 @@ impl Desktop {
         match event {
             Event::XfixesSelectionNotify(e) => {
                 self.time = e.timestamp;
-                if e.selection == self.atoms.clipboard {
-                    log(
-                        &self.line,
-                        &format!(
-                            "the clipboard's owner is now {:#x}{} (time {}, set at {})",
-                            e.owner,
-                            if e.owner == self.window { ", the agent" } else { "" },
-                            e.timestamp,
-                            e.selection_timestamp
-                        ),
-                    );
-                }
                 if e.selection == self.atoms.clipboard && e.owner != self.window && e.owner != NONE
                 {
                     self.conn
@@ -362,11 +392,18 @@ impl Desktop {
             Event::SelectionRequest(e) => self.serve(&e)?,
             Event::SelectionClear(e) => {
                 if e.selection == self.atoms.clipboard {
-                    log(&self.line, "the agent lost the clipboard");
                     self.ours = None;
                 }
             }
             Event::ButtonPress(e) => self.pressed(&e)?,
+            Event::Expose(e) => {
+                if let Some(drag) = self.host_drag.as_mut()
+                    && drag.window == e.window
+                    && drag.exposed_at.is_none()
+                {
+                    drag.exposed_at = Some(Instant::now());
+                }
+            }
             Event::MotionNotify(e) => {
                 self.time = e.time;
                 self.moved(&e)?;
@@ -533,22 +570,6 @@ impl Desktop {
             }
             _ => NONE,
         };
-        if e.selection == a.clipboard {
-            let name = self
-                .conn
-                .get_atom_name(e.target)
-                .ok()
-                .and_then(|cookie| cookie.reply().ok())
-                .map(|reply| String::from_utf8_lossy(&reply.name).into_owned())
-                .unwrap_or_default();
-            log(
-                &self.line,
-                &format!(
-                    "clipboard asked for {name}: {}",
-                    if answered == NONE { "refused" } else { "given" }
-                ),
-            );
-        }
         let notify = SelectionNotifyEvent {
             response_type: SELECTION_NOTIFY_EVENT,
             sequence: 0,
@@ -689,26 +710,53 @@ impl Desktop {
             });
         }
         let window = self.invisible_window(
-            EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
+            EventMask::BUTTON_PRESS
+                | EventMask::BUTTON_RELEASE
+                | EventMask::POINTER_MOTION
+                | EventMask::EXPOSURE,
         )?;
         self.show(window)?;
+        // Armed once the window shows (its first Expose) and the compositor has had a
+        // moment to put it on the screen: a press before then lands on what's under it.
         self.host_drag = Some(HostDrag {
             drag,
             staging,
             items: paths,
             window,
             armed_at: Instant::now(),
+            exposed_at: None,
+            armed: false,
             started: false,
             target: None,
+            answered: false,
             accepted: false,
             awaiting_status: false,
             next_position: None,
             dropped_at: None,
+            cancelled_at: None,
             connection: keep,
         });
         self.conn.flush().map_err(|e| e.to_string())?;
-        self.line.send(&Message::DragArmed { drag }.frame());
         Ok(())
+    }
+
+    /// Where the pointer is and what's under it, for the log.
+    fn pointer_report(&self) -> String {
+        match self
+            .conn
+            .query_pointer(self.root)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+        {
+            Some(reply) => format!(
+                "pointer {},{}, over {:#x}, buttons {:#x}",
+                reply.root_x,
+                reply.root_y,
+                reply.child,
+                u16::from(reply.mask)
+            ),
+            None => "pointer unknown".into(),
+        }
     }
 
     /// The worker's button press: the drag starts.
@@ -722,10 +770,39 @@ impl Desktop {
         }
         drag.started = true;
         let window = drag.window;
+        // At the server's time, not the press's: XWayland stamps input with the
+        // compositor's clock, which can be behind the server's, and a claim older than
+        // the selection's last change (the previous drag letting it go) is ignored.
         self.conn
-            .set_selection_owner(window, self.atoms.xdnd_selection, e.time)
+            .set_selection_owner(window, self.atoms.xdnd_selection, CURRENT_TIME)
             .map_err(|e| e.to_string())?;
-        // Out of the way of the targets under it, but still holding the pointer.
+        let owner = self
+            .conn
+            .get_selection_owner(self.atoms.xdnd_selection)
+            .map_err(|e| e.to_string())?
+            .reply()
+            .map_err(|e| e.to_string())?
+            .owner;
+        if owner != window {
+            log(
+                &self.line,
+                &format!("the drag's selection went to {owner:#x}, not the agent"),
+            );
+        }
+        // Out of the way of the targets under it, but still holding the pointer: no input
+        // shape (so a compositor's picking looks through it at once, whatever it makes of
+        // its size meanwhile), and small.
+        self.conn
+            .shape_rectangles(
+                shape::SO::SET,
+                shape::SK::INPUT,
+                ClipOrdering::UNSORTED,
+                window,
+                0,
+                0,
+                &[],
+            )
+            .map_err(|e| e.to_string())?;
         self.conn
             .configure_window(
                 window,
@@ -756,21 +833,15 @@ impl Desktop {
         if self
             .host_drag
             .as_ref()
-            .is_some_and(|d| d.started && d.dropped_at.is_none())
+            .is_some_and(|d| d.started && d.dropped_at.is_none() && d.cancelled_at.is_none())
         {
             self.drag_to(e.root_x, e.root_y, e.time)?;
         }
         Ok(())
     }
 
-    /// The XDND target at `(x, y)`: the deepest window there that says it takes drops,
-    /// where messages for it go, and its version.
-    fn target_at(
-        &self,
-        x: i16,
-        y: i16,
-        skip: Window,
-    ) -> Result<Option<(Window, Window, u32)>, String> {
+    /// The XDND target at `(x, y)`: the deepest window there that says it takes drops.
+    fn target_at(&self, x: i16, y: i16, skip: Window) -> Result<Option<Target>, String> {
         let mut window = self.root;
         let mut found = None;
         for _ in 0..32 {
@@ -801,10 +872,90 @@ impl Desktop {
                     .and_then(|mut v| v.next())
                     .filter(|&proxy| proxy != NONE)
                     .unwrap_or(window);
-                found = Some((window, proxy, version.min(XDND_VERSION)));
+                found = Some(Target {
+                    window,
+                    to: proxy,
+                    version: version.min(XDND_VERSION),
+                    stand_in: false,
+                });
             }
         }
         Ok(found)
+    }
+
+    /// Mutter's window standing in for the Wayland program under the pointer, when the
+    /// agent sees nothing there that takes drops.
+    ///
+    /// X11 programs see nothing of Wayland ones. In a drag from an X11 program, mutter puts
+    /// one of two XdndAware windows of its own over the Wayland window under the pointer
+    /// and passes on what's sent there. But it shows it only when that's another window
+    /// than it last picked, which it remembers from the last drag; and the agent's window,
+    /// where the drag starts, it doesn't pick (it's override-redirect). So from the second
+    /// drag on, over the same window as before, mutter shows nothing. It takes messages
+    /// for the window it picked at either of its windows, shown or not, though.
+    fn stand_in(&mut self) -> Result<Option<Target>, String> {
+        if self.bridge.is_none() {
+            self.bridge = Some(self.find_bridge()?);
+        }
+        Ok(self.bridge.flatten().map(|window| Target {
+            window,
+            to: window,
+            version: XDND_VERSION,
+            stand_in: true,
+        }))
+    }
+
+    /// Mutter's hidden XDND windows: the window manager's own, XdndAware, and put away
+    /// (1x1 at -1,-1).
+    fn find_bridge(&self) -> Result<Option<Window>, String> {
+        let wm = self
+            .conn
+            .get_property(
+                false,
+                self.root,
+                self.atoms.wm_check,
+                AtomEnum::WINDOW,
+                0,
+                1,
+            )
+            .map_err(|e| e.to_string())?
+            .reply()
+            .map_err(|e| e.to_string())?
+            .value32()
+            .and_then(|mut v| v.next());
+        let Some(wm) = wm else {
+            return Ok(None);
+        };
+        // A client's windows share the bits outside the mask.
+        let client = wm & !self.conn.setup().resource_id_mask;
+        let children = self
+            .conn
+            .query_tree(self.root)
+            .map_err(|e| e.to_string())?
+            .reply()
+            .map_err(|e| e.to_string())?
+            .children;
+        for window in children {
+            if window & !self.conn.setup().resource_id_mask != client || window == wm {
+                continue;
+            }
+            let Ok(Ok(geometry)) = self.conn.get_geometry(window).map(|c| c.reply()) else {
+                continue;
+            };
+            if (geometry.x, geometry.y, geometry.width, geometry.height) != (-1, -1, 1, 1) {
+                continue;
+            }
+            let aware = self
+                .conn
+                .get_property(false, window, self.atoms.xdnd_aware, AtomEnum::ATOM, 0, 1)
+                .map_err(|e| e.to_string())?
+                .reply()
+                .map_err(|e| e.to_string())?;
+            if aware.value32().and_then(|mut v| v.next()).is_some() {
+                return Ok(Some(window));
+            }
+        }
+        Ok(None)
     }
 
     fn xdnd(&self, to: Window, window: Window, kind: u32, data: [u32; 5]) -> Result<(), String> {
@@ -815,55 +966,97 @@ impl Desktop {
         Ok(())
     }
 
+    fn enter(&self, target: Target, source: Window) -> Result<(), String> {
+        let a = &self.atoms;
+        self.xdnd(
+            target.to,
+            target.window,
+            a.xdnd_enter,
+            [
+                source,
+                target.version << 24,
+                a.uri_list,
+                a.text_plain_utf8,
+                a.utf8,
+            ],
+        )
+    }
+
     /// The host's drag is at `(x, y)` in the guest: XDND messages to what's there.
     fn drag_to(&mut self, x: i16, y: i16, time: Timestamp) -> Result<(), String> {
         let Some(drag) = self.host_drag.as_ref() else {
             return Ok(());
         };
         let source = drag.window;
-        let target = self.target_at(x, y, source)?;
         let previous = drag.target;
-        if previous.map(|t| t.0) != target.map(|t| t.0) {
-            if let Some((window, to, _)) = previous {
-                self.xdnd(to, window, self.atoms.xdnd_leave, [source, 0, 0, 0, 0])?;
-            }
-            if let Some((window, to, version)) = target {
-                let types = [
-                    self.atoms.uri_list,
-                    self.atoms.text_plain_utf8,
-                    self.atoms.utf8,
-                ];
+        let target = match self.target_at(x, y, source)? {
+            Some(target) => Some(target),
+            None => self.stand_in()?,
+        };
+        if previous != target {
+            log(
+                &self.line,
+                &match target {
+                    Some(Target {
+                        window,
+                        stand_in: true,
+                        ..
+                    }) => format!(
+                        "the drag is over a Wayland window (through {window:#x}) at {x},{y}"
+                    ),
+                    Some(Target {
+                        window,
+                        to,
+                        version,
+                        ..
+                    }) => format!(
+                        "the drag is over {window:#x} (messages to {to:#x}, XDND {version}) at {x},{y}"
+                    ),
+                    None => format!("the drag is over nothing that takes drops at {x},{y}"),
+                },
+            );
+            if let Some(previous) = previous {
                 self.xdnd(
-                    to,
-                    window,
-                    self.atoms.xdnd_enter,
-                    [source, version << 24, types[0], types[1], types[2]],
+                    previous.to,
+                    previous.window,
+                    self.atoms.xdnd_leave,
+                    [source, 0, 0, 0, 0],
                 )?;
+            }
+            if let Some(target) = target {
+                self.enter(target, source)?;
             }
             let drag = self.host_drag.as_mut().expect("checked above");
             drag.target = target;
+            drag.answered = false;
             drag.accepted = false;
             drag.awaiting_status = false;
         }
         let drag = self.host_drag.as_mut().expect("checked above");
-        let Some((window, to, _)) = drag.target else {
+        let Some(target) = drag.target else {
             return Ok(());
         };
         if drag.awaiting_status {
-            drag.next_position = Some((x, y, time));
-            return Ok(());
+            if !target.stand_in || drag.answered {
+                drag.next_position = Some((x, y, time));
+                return Ok(());
+            }
+            // Mutter doesn't answer when it hadn't picked a window when it heard of the
+            // drag (or hadn't heard of the drag yet): it hears of it again.
+            self.enter(target, source)?;
         }
+        let drag = self.host_drag.as_mut().expect("checked above");
         drag.awaiting_status = true;
         let position = (u32::from(x as u16) << 16) | u32::from(y as u16);
         self.xdnd(
-            to,
-            window,
+            target.to,
+            target.window,
             self.atoms.xdnd_position,
             [source, 0, position, time, self.atoms.xdnd_action_copy],
         )
     }
 
-    /// The worker let the button go: the drop.
+    /// The worker let the button go: the drop, or the end of a drag called off.
     fn released(&mut self, time: Timestamp) -> Result<(), String> {
         let Some(drag) = self.host_drag.as_mut() else {
             return Ok(());
@@ -872,11 +1065,21 @@ impl Desktop {
             return Ok(());
         }
         self.conn.ungrab_pointer(time).map_err(|e| e.to_string())?;
+        if drag.cancelled_at.is_some() {
+            let drag = self.host_drag.take().expect("checked above");
+            self.tidy(&drag, false);
+            return Ok(());
+        }
         match drag.target {
-            Some((window, to, _)) if drag.accepted => {
+            Some(target) if drag.accepted => {
                 drag.dropped_at = Some(Instant::now());
                 let source = drag.window;
-                self.xdnd(to, window, self.atoms.xdnd_drop, [source, 0, time, 0, 0])
+                self.xdnd(
+                    target.to,
+                    target.window,
+                    self.atoms.xdnd_drop,
+                    [source, 0, time, 0, 0],
+                )
             }
             _ => {
                 log(&self.line, "the drag ended where nothing takes files");
@@ -885,15 +1088,50 @@ impl Desktop {
         }
     }
 
-    fn end_host_drag(&mut self, dropped: bool) -> Result<(), String> {
-        let Some(drag) = self.host_drag.take() else {
+    /// Calls the host's drag off. One under way ends as a drag let go over nothing does:
+    /// the target hears it's left at once, and so does the worker, which then lets the
+    /// button go; the agent tidies up on that release (XWayland's bridge ends the Wayland
+    /// drag it runs for the agent's then, and might not otherwise).
+    fn cancel_host_drag(&mut self) -> Result<(), String> {
+        let Some(drag) = self.host_drag.as_mut() else {
             return Ok(());
         };
-        if drag.started && drag.dropped_at.is_none() {
-            if let Some((window, to, _)) = drag.target {
-                self.xdnd(to, window, self.atoms.xdnd_leave, [drag.window, 0, 0, 0, 0])?;
+        if !drag.started || drag.dropped_at.is_some() {
+            return self.end_host_drag(false);
+        }
+        if drag.cancelled_at.is_some() {
+            return Ok(());
+        }
+        drag.cancelled_at = Some(Instant::now());
+        let (id, source, target) = (drag.drag, drag.window, drag.target.take());
+        if let Some(target) = target {
+            self.xdnd(
+                target.to,
+                target.window,
+                self.atoms.xdnd_leave,
+                [source, 0, 0, 0, 0],
+            )?;
+        }
+        log(&self.line, "the drag ended: called off");
+        self.line.send(
+            &Message::DragFinished {
+                drag: id,
+                dropped: false,
             }
-            let _ = self.conn.ungrab_pointer(self.time);
+            .frame(),
+        );
+        Ok(())
+    }
+
+    /// What's left of a drag that's over: its window, its selection, and (unless it
+    /// dropped) its staging folder and connection.
+    fn tidy(&mut self, drag: &HostDrag, dropped: bool) {
+        if drag.started {
+            // The drag is over for XWayland's bridge too: without its selection's owner,
+            // mutter ends the Wayland drag it runs for the agent's.
+            let _ = self
+                .conn
+                .set_selection_owner(NONE, self.atoms.xdnd_selection, CURRENT_TIME);
         }
         let _ = self.conn.destroy_window(drag.window);
         if !dropped {
@@ -901,6 +1139,28 @@ impl Desktop {
                 let _ = connection.shutdown(std::net::Shutdown::Both);
             }
             let _ = fs::remove_dir_all(&drag.staging);
+        }
+    }
+
+    fn end_host_drag(&mut self, dropped: bool) -> Result<(), String> {
+        let Some(drag) = self.host_drag.take() else {
+            return Ok(());
+        };
+        if drag.started && drag.dropped_at.is_none() {
+            if let Some(target) = drag.target {
+                self.xdnd(
+                    target.to,
+                    target.window,
+                    self.atoms.xdnd_leave,
+                    [drag.window, 0, 0, 0, 0],
+                )?;
+            }
+            let _ = self.conn.ungrab_pointer(self.time);
+        }
+        self.tidy(&drag, dropped);
+        if drag.cancelled_at.is_some() {
+            // The worker heard already.
+            return Ok(());
         }
         log(
             &self.line,
@@ -1065,13 +1325,25 @@ impl Desktop {
             return Ok(());
         }
         if e.type_ == a.xdnd_status {
-            drag.accepted = data[1] & 1 != 0;
+            let accepted = data[1] & 1 != 0;
+            if accepted != drag.accepted {
+                log(
+                    &self.line,
+                    &format!(
+                        "the target {} the drop",
+                        if accepted { "takes" } else { "refuses" }
+                    ),
+                );
+            }
+            let drag = self.host_drag.as_mut().expect("checked above");
+            drag.answered = true;
+            drag.accepted = accepted;
             drag.awaiting_status = false;
             if let Some((x, y, time)) = drag.next_position.take() {
                 self.drag_to(x, y, time)?;
             }
         } else if e.type_ == a.xdnd_finished {
-            let version = drag.target.map_or(XDND_VERSION, |t| t.2);
+            let version = drag.target.map_or(XDND_VERSION, |t| t.version);
             let dropped = version < 5 || data[1] & 1 != 0;
             self.end_host_drag(dropped)?;
         }
@@ -1080,22 +1352,53 @@ impl Desktop {
 
     fn timers(&mut self) {
         let now = Instant::now();
+        if self.reclaim_at.is_some_and(|at| now >= at) {
+            self.reclaim_at = None;
+            if self.ours.is_some() {
+                let _ =
+                    self.conn
+                        .set_selection_owner(self.window, self.atoms.clipboard, CURRENT_TIME);
+            }
+        }
         if let Some(at) = self.probe.hide_at
             && now >= at
         {
             self.no_guest_drag();
             self.hide_catcher();
         }
+        // A host drag's window is up: armed (or anyway, if it never says it showed).
+        if let Some(drag) = self.host_drag.as_mut()
+            && !drag.armed
+            && (drag.exposed_at.is_some_and(|at| now - at > ARM_SETTLE)
+                || now - drag.armed_at > EXPOSE_TIMEOUT)
+        {
+            drag.armed = true;
+            let id = drag.drag;
+            self.line.send(&Message::DragArmed { drag: id }.frame());
+        }
+        if self
+            .host_drag
+            .as_ref()
+            .is_some_and(|drag| !drag.started && now - drag.armed_at > ARM_TIMEOUT)
+        {
+            log(
+                &self.line,
+                &format!("no press came: {}", self.pointer_report()),
+            );
+        }
         let expired = self.host_drag.as_ref().is_some_and(|drag| {
             (!drag.started && now - drag.armed_at > ARM_TIMEOUT)
                 || drag.dropped_at.is_some_and(|at| now - at > FINISH_TIMEOUT)
+                || drag
+                    .cancelled_at
+                    .is_some_and(|at| now - at > FINISH_TIMEOUT)
         });
         if expired {
-            let dropped = self
+            let (dropped, started) = self
                 .host_drag
                 .as_ref()
-                .is_some_and(|d| d.dropped_at.is_some());
-            if !dropped {
+                .map_or((false, false), |d| (d.dropped_at.is_some(), d.started));
+            if !started {
                 log(&self.line, "the worker never pressed the button");
             }
             let _ = self.end_host_drag(dropped);

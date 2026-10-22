@@ -13,6 +13,18 @@ say "logged-on $XDG_SESSION_TYPE"
 say "tools: $(for tool in gjs python3 wl-copy xclip; do command -v $tool > /dev/null && printf '%s ' $tool; done)"
 say "typelibs: $(ls /usr/lib/x86_64-linux-gnu/girepository-1.0 2> /dev/null | grep -E '^(Gtk|Gdk)-' | tr '\n' ' ')"
 
+# Ubuntu's welcome wizard comes up at each logon until it's gone through, over the
+# screen and with the focus: closed, as soon as it shows up.
+(
+    for _ in $(seq 120); do
+        for pid in $(pgrep -u "$(id -u)" -f 'welcome|initial-setup|desktop-provision|desktop-init|provd'); do
+            say "closing $(tr '\0' ' ' < /proc/$pid/cmdline | cut -c1-100)"
+            kill "$pid"
+        done
+        sleep 0.5
+    done
+) &
+
 pkill -x vmmc-agent
 sleep 0.5
 cp "$disc/vmmc-agent" /tmp/vmmc-agent
@@ -30,5 +42,13 @@ printf 'aus dem Gast' > "$out/Ordner/tief/ärger.txt"
 (cd "$out" && find . -type f | sort | while read -r file; do
     say "guest-file $(sha256sum "$file" | cut -d' ' -f1) ${file#./}"
 done)
+
+# Later, for the log: what the peer and the session warned about.
+(
+    sleep 75
+    tail -n 20 /tmp/vmmc-peer.log | while read -r line; do say "peer: $line"; done
+    journalctl --user -b -p warning --no-pager -o cat 2> /dev/null | tail -n 15 |
+        while read -r line; do say "journal: $line"; done
+) &
 
 exec gjs -m "$disc/dnd-peer.js" "$out" 2> /tmp/vmmc-peer.log

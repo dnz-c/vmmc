@@ -14,7 +14,7 @@ publish = false
 [dependencies]
 agent-proto = { path = "../../../crates/agent-proto" }
 libc = "0.2.191"
-x11rb = { version = "0.14.0", default-features = false, features = ["xfixes"] }
+x11rb = { version = "0.14.0", default-features = false, features = ["shape", "xfixes"] }
 
 [profile.release]
 panic = "abort"

@@ -743,6 +743,11 @@ impl Drags {
                     };
                     host.since = Instant::now();
                     let at = host.at;
+                    // A nudge first: a compositor (GNOME's) looks for what's under the
+                    // pointer as it moves, and the agent's window went up under a still
+                    // pointer.
+                    self.pointer(Self::inward(at), false);
+                    self.pointer(at, false);
                     self.pointer(at, true);
                     self.release_if_ready();
                 }

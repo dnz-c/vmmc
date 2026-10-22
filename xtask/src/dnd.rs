@@ -433,15 +433,45 @@ pub(crate) fn drive(vm: &mut Session, id: &str, dir: &Path) -> Result<(), String
         thread::sleep(Duration::from_millis(250));
     }
 
-    // A drag in that leaves again.
     let host_dir = dir.join("host-files");
     let paths = host_files(&host_dir)?;
     let target = layout.tablet(layout.target);
+    // Each part runs whatever came of the ones before, to hear about all of them. The
+    // drag out first: on a guest no drag has been through yet.
+    let mut failures = Vec::new();
+    if let Err(e) = drag_out(vm, &mut pipe, dir, &layout, &guest_files) {
+        failures.push(format!("a drag out: {e}"));
+    }
+    if let Err(e) = drag_that_drops(vm, &mut pipe, id, &host_dir, &paths, target) {
+        failures.push(format!("a drag that drops: {e}"));
+        // Whatever's left of it in the guest gives up meanwhile.
+        thread::sleep(Duration::from_secs(6));
+    }
+    if let Err(e) = drag_that_leaves(vm, &mut pipe, &paths, target) {
+        failures.push(format!("a drag that leaves: {e}"));
+    }
+    // And one that drops after it.
+    if let Err(e) = drag_that_drops(vm, &mut pipe, id, &host_dir, &paths, target) {
+        failures.push(format!("a drag that drops after one that left: {e}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// A drag into the guest that leaves again: it's called off there.
+fn drag_that_leaves(
+    vm: &mut Session,
+    pipe: &mut Connection,
+    paths: &[PathBuf],
+    target: (u32, u32),
+) -> Result<(), String> {
+    let pipe = &mut *pipe;
     let mark = vm.len();
-    let drag = drag_enter(&mut pipe, transfer::items(&paths), target)?;
-    wait_drag(&mut pipe, drag, Duration::from_secs(5), |s| {
-        *s == DragState::InGuest
-    })?;
+    let drag = drag_enter(pipe, transfer::items(paths), target)?;
+    wait_drag(pipe, drag, Duration::from_secs(5), |s| *s == DragState::InGuest)?;
     for step in 1..=5 {
         pipe.command(&Request::DragMove {
             drag,
@@ -460,13 +490,43 @@ pub(crate) fn drive(vm: &mut Session, id: &str, dir: &Path) -> Result<(), String
         return Err("the drag that left was dropped in the guest".into());
     }
     eprintln!("xtask: a drag that left the guest was called off there");
+    Ok(())
+}
 
-    // A drag in that drops, its files sent on a connection of their own.
+/// A drag into the guest that drops, its files sent on a connection of their own: the
+/// guest gets them as they are on the host.
+fn drag_that_drops(
+    vm: &mut Session,
+    pipe: &mut Connection,
+    id: &str,
+    host_dir: &Path,
+    paths: &[PathBuf],
+    target: (u32, u32),
+) -> Result<(), String> {
     let mark = vm.len();
     let started = Instant::now();
-    let drag = drag_enter(&mut pipe, transfer::items(&paths), target)?;
+    let drag = drag_enter(pipe, transfer::items(paths), target)?;
+    let result = drop_files(vm, pipe, id, host_dir, paths, target, drag, mark, started);
+    if result.is_err() {
+        let _ = pipe.command(&Request::DragLeave { drag });
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drop_files(
+    vm: &mut Session,
+    pipe: &mut Connection,
+    id: &str,
+    host_dir: &Path,
+    paths: &[PathBuf],
+    target: (u32, u32),
+    drag: u32,
+    mark: usize,
+    started: Instant,
+) -> Result<(), String> {
     let sender = {
-        let (id, paths) = (id.to_owned(), paths.clone());
+        let (id, paths) = (id.to_owned(), paths.to_vec());
         thread::spawn(move || {
             let mut connection = vmmc_client::connect_id(&id, Duration::from_secs(5))?;
             transfer::send(
@@ -478,9 +538,7 @@ pub(crate) fn drive(vm: &mut Session, id: &str, dir: &Path) -> Result<(), String
             )
         })
     };
-    wait_drag(&mut pipe, drag, Duration::from_secs(5), |s| {
-        *s == DragState::InGuest
-    })?;
+    wait_drag(pipe, drag, Duration::from_secs(5), |s| *s == DragState::InGuest)?;
     for step in (0..=4).rev() {
         pipe.command(&Request::DragMove {
             drag,
@@ -498,13 +556,13 @@ pub(crate) fn drive(vm: &mut Session, id: &str, dir: &Path) -> Result<(), String
     sender
         .join()
         .map_err(|_| "the sending thread panicked".to_owned())??;
-    let state = wait_drag(&mut pipe, drag, Duration::from_secs(10), |s| {
+    let state = wait_drag(pipe, drag, Duration::from_secs(10), |s| {
         matches!(s, DragState::Finished { .. })
     })?;
     if state != (DragState::Finished { dropped: true }) {
         return Err(format!("the drag ended {state:?}"));
     }
-    let (host_hashes, host_dirs) = hashed(&host_dir)?;
+    let (host_hashes, host_dirs) = hashed(host_dir)?;
     let dropped = reported(vm, mark, "dropped-file");
     if dropped != host_hashes {
         return Err(format!(
@@ -533,23 +591,49 @@ pub(crate) fn drive(vm: &mut Session, id: &str, dir: &Path) -> Result<(), String
         host_hashes.len(),
         started.elapsed().as_millis()
     );
+    Ok(())
+}
 
-    // A drag out of the guest: pressed on the source, out of the screen's left edge.
+/// A drag out of the guest: pressed on the source, out past the screen's left edge, and
+/// the host fetches the files it carries.
+fn drag_out(
+    vm: &mut Session,
+    pipe: &mut Connection,
+    dir: &Path,
+    layout: &Layout,
+    guest_files: &BTreeMap<String, String>,
+) -> Result<(), String> {
     let source = layout.tablet(layout.source);
     let mark = vm.len();
-    pointer(&mut pipe, source, false)?;
+    let result = drag_out_files(vm, pipe, dir, source, guest_files, mark);
+    // Whatever happened, the button goes up.
+    let _ = pointer(pipe, source, false);
+    result
+}
+
+fn drag_out_files(
+    vm: &mut Session,
+    pipe: &mut Connection,
+    dir: &Path,
+    source: (u32, u32),
+    guest_files: &BTreeMap<String, String>,
+    mark: usize,
+) -> Result<(), String> {
+    pointer(pipe, source, false)?;
     thread::sleep(Duration::from_millis(300));
-    pointer(&mut pipe, source, true)?;
-    vm.expect("VMMC-DND: drag-started", mark, Duration::from_secs(10))?;
+    pointer(pipe, source, true)?;
+    // Some programs start their drag on the press (WinForms), others once the pointer
+    // has moved a little (GTK).
     let steps = 8;
     for step in 1..=steps {
         let x = source.0 - source.0 * step / steps;
-        pointer(&mut pipe, (x, source.1), true)?;
+        pointer(pipe, (x, source.1), true)?;
         thread::sleep(Duration::from_millis(60));
     }
+    vm.expect("VMMC-DND: drag-started", mark, Duration::from_secs(10))?;
     let edge = (0, source.1);
     let probe = match call(
-        &mut pipe,
+        pipe,
         &Request::ProbeGuestDrag {
             x: edge.0,
             y: edge.1,
@@ -560,7 +644,7 @@ pub(crate) fn drive(vm: &mut Session, id: &str, dir: &Path) -> Result<(), String
     };
     let deadline = Instant::now() + Duration::from_secs(5);
     let items = loop {
-        match call(&mut pipe, &Request::GuestDrag { probe })? {
+        match call(pipe, &Request::GuestDrag { probe })? {
             Response::GuestDrag(GuestDrag::Files(items)) => break items,
             Response::GuestDrag(GuestDrag::Looking) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(50));
@@ -582,16 +666,16 @@ pub(crate) fn drive(vm: &mut Session, id: &str, dir: &Path) -> Result<(), String
         return Err(format!("the guest's drag carries {items:?}"));
     }
     let started = Instant::now();
-    let transfer = match call(&mut pipe, &Request::ReceiveFiles { probe })? {
+    let transfer = match call(pipe, &Request::ReceiveFiles { probe })? {
         Response::Transfer { transfer } => transfer,
         other => return Err(format!("unexpected answer {other:?}")),
     };
     let into = dir.join("from-guest");
     let _ = fs::remove_dir_all(&into);
     fs::create_dir_all(&into).map_err(|e| format!("can't create {}: {e}", into.display()))?;
-    transfer::receive(&mut pipe, transfer, &into, &AtomicBool::new(false), |_| {})?;
+    transfer::receive(pipe, transfer, &into, &AtomicBool::new(false), |_| {})?;
     let (got, got_dirs) = hashed(&into)?;
-    if got != guest_files {
+    if got != *guest_files {
         return Err(format!(
             "the host got {got:?}, not the guest's {guest_files:?}"
         ));

@@ -47,6 +47,10 @@ app.connect('activate', () => {
     window.set_child(box);
 
     const drop = Gtk.DropTarget.new(Gdk.FileList.$gtype, Gdk.DragAction.COPY);
+    drop.connect('enter', (target) => {
+        mark(`drop-enter formats=${target.get_current_drop()?.get_formats().to_string()}`);
+        return Gdk.DragAction.COPY;
+    });
     drop.connect('drop', (_target, value) => {
         for (const file of value.get_files())
             report('dropped-file', file, file.get_parent());
@@ -68,8 +72,8 @@ app.connect('activate', () => {
         return false;
     });
     drag.connect('drag-end', (_source, _drag, deleteData) => {
-        if (deleteData)
-            mark('drag-done effect=Move');
+        // A refused drop ends here too, without deleting.
+        mark(`drag-done effect=${deleteData ? 'Move' : 'None'}`);
     });
     source.add_controller(drag);
 
