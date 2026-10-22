@@ -74,12 +74,25 @@ pub enum Outcome {
     Error(Sense),
 }
 
-/// A [`Cdrom`]'s state.
+/// A media event for GET EVENT STATUS NOTIFICATION, reported once: MMC's codes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum MediaEvent {
+    #[default]
+    None = 0,
+    /// The drive's eject button: the guest should let the medium go and eject it.
+    EjectRequest = 1,
+    NewMedia = 2,
+    MediaRemoval = 3,
+}
+
+/// A [`Cdrom`]'s state. A change of disc waiting for the guest to let go of the old
+/// one isn't in it: the restored drive has the disc it had.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CdromState {
     sense: Sense,
-    media_event: bool,
+    media_event: MediaEvent,
     unit_attention: bool,
+    locked: bool,
     had_medium: bool,
 }
 
@@ -87,18 +100,29 @@ pub struct CdromState {
 pub struct Cdrom {
     medium: Option<Arc<dyn BlockBackend>>,
     sense: Sense,
-    /// A medium was inserted and the host hasn't been told yet.
-    media_event: bool,
+    /// What the host hasn't been told yet.
+    media_event: MediaEvent,
     /// The medium changed: the next command fails with a unit attention.
     unit_attention: bool,
+    /// The guest prevents the medium's removal (Linux does while a disc is mounted).
+    locked: bool,
+    /// A change of medium the host asked for while the drive was locked, waiting for the
+    /// guest to eject the old one.
+    pending: Option<Option<Arc<dyn BlockBackend>>>,
     serial: String,
 }
 
 impl Cdrom {
     pub fn new(medium: Option<Arc<dyn BlockBackend>>, serial: &str) -> Self {
         Self {
-            media_event: medium.is_some(),
+            media_event: if medium.is_some() {
+                MediaEvent::NewMedia
+            } else {
+                MediaEvent::None
+            },
             unit_attention: false,
+            locked: false,
+            pending: None,
             medium,
             sense: Sense::NONE,
             serial: serial.to_owned(),
@@ -184,13 +208,19 @@ impl Cdrom {
             Err(Sense::NO_MEDIUM)
         } else {
             match opcode {
-                TEST_UNIT_READY
-                | START_STOP_UNIT
-                | PREVENT_ALLOW_REMOVAL
-                | SEEK_10
-                | VERIFY_10
-                | SYNCHRONIZE_CACHE
-                | MODE_SELECT_10
+                PREVENT_ALLOW_REMOVAL => {
+                    self.locked = cdb[4] & 0x03 != 0;
+                    Ok(Vec::new())
+                }
+                START_STOP_UNIT => {
+                    // Eject (LoEj without Start): the guest let go of the disc, so a
+                    // change the host asked for happens now. Otherwise the disc stays.
+                    if cdb[4] & 0x03 == 0x02 && self.finish_change() {
+                        tracing::info!("the guest ejected its disc, and the new one went in");
+                    }
+                    Ok(Vec::new())
+                }
+                TEST_UNIT_READY | SEEK_10 | VERIFY_10 | SYNCHRONIZE_CACHE | MODE_SELECT_10
                 | SET_CD_SPEED => Ok(Vec::new()),
                 INQUIRY => self.inquiry(cdb),
                 READ_CAPACITY => {
@@ -238,6 +268,7 @@ impl Cdrom {
             sense: self.sense,
             media_event: self.media_event,
             unit_attention: self.unit_attention,
+            locked: self.locked,
             had_medium: self.medium.is_some(),
         }
     }
@@ -248,17 +279,54 @@ impl Cdrom {
         self.sense = state.sense;
         self.media_event = state.media_event;
         self.unit_attention = state.unit_attention;
+        self.locked = state.locked;
+        self.pending = None;
         if state.had_medium != self.medium.is_some() {
-            self.media_event = self.medium.is_some();
+            self.media_event = self.medium_event();
             self.unit_attention = true;
         }
     }
 
-    /// Takes the medium out (`None`) or puts one in. The host sees a unit attention.
-    pub fn change_medium(&mut self, medium: Option<Arc<dyn BlockBackend>>) {
-        self.media_event = medium.is_some();
+    /// Takes the medium out (`None`) or puts one in. While the guest keeps the drive
+    /// locked, as Linux does while the disc is mounted, it's asked to let the disc go
+    /// first, as a drive's eject button does: the change happens when the guest ejects
+    /// it, or with [`Cdrom::finish_change`]. Returns whether it happened now.
+    pub fn change_medium(&mut self, medium: Option<Arc<dyn BlockBackend>>) -> bool {
+        if self.locked && self.medium.is_some() {
+            self.pending = Some(medium);
+            self.media_event = MediaEvent::EjectRequest;
+            return false;
+        }
+        self.pending = None;
+        self.swap(medium);
+        true
+    }
+
+    /// Makes a change the guest hasn't let happen yet. Returns whether there was one.
+    pub fn finish_change(&mut self) -> bool {
+        match self.pending.take() {
+            Some(medium) => {
+                self.swap(medium);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The host sees a unit attention, and the media event.
+    fn swap(&mut self, medium: Option<Arc<dyn BlockBackend>>) {
         self.medium = medium;
+        self.media_event = self.medium_event();
         self.unit_attention = true;
+    }
+
+    /// The event for the medium the drive has now, just changed.
+    fn medium_event(&self) -> MediaEvent {
+        if self.medium.is_some() {
+            MediaEvent::NewMedia
+        } else {
+            MediaEvent::MediaRemoval
+        }
     }
 
     fn inquiry(&self, cdb: &[u8; 16]) -> Result<Vec<u8>, Sense> {
@@ -423,11 +491,7 @@ impl Cdrom {
             // No event available, and media events are what's supported.
             return Ok(vec![0, 2, 0x80, MEDIA_CLASS]);
         }
-        let event = if std::mem::take(&mut self.media_event) {
-            2 // new media
-        } else {
-            0 // no change
-        };
+        let event = std::mem::take(&mut self.media_event) as u8;
         let present = u8::from(self.medium.is_some()) << 1;
         Ok(vec![0, 6, 4, MEDIA_CLASS, event, present, 0, 0])
     }
@@ -469,7 +533,7 @@ impl Cdrom {
         capabilities[2] = 0x3b; // reads CD-R, CD-RW, method 2, DVD-ROM, DVD-R
         capabilities[4] = 0x71; // audio play, composite, ports, multi-session
         capabilities[5] = 0xff; // CD-DA, accurate stream, and the rest
-        capabilities[6] = 0x29; // tray, eject, lock
+        capabilities[6] = 0x29 | u8::from(self.locked) << 1; // tray, eject, lock (and if locked)
         capabilities[8..10].copy_from_slice(&5_540u16.to_be_bytes()); // 32x, KB/s
         capabilities[10..12].copy_from_slice(&256u16.to_be_bytes()); // volume levels
         capabilities[12..14].copy_from_slice(&256u16.to_be_bytes()); // buffer, KB
@@ -665,5 +729,58 @@ mod tests {
         let sense = data(cd.command(&cdb(&[0x03, 0, 0, 0, 18])));
         assert_eq!((sense[2], sense[12]), (UNIT_ATTENTION, 0x28));
         assert_eq!(cd.command(&cdb(&[0x00])), Outcome::Error(Sense::NO_MEDIUM));
+    }
+
+    /// The media event GET EVENT STATUS NOTIFICATION reports, and whether a medium is in.
+    fn media_event(cd: &mut Cdrom) -> (u8, bool) {
+        let events = data(cd.command(&cdb(&[0x4a, 1, 0, 0, 0x10, 0, 0, 0, 8])));
+        (events[4], events[5] & 2 != 0)
+    }
+
+    #[test]
+    fn taking_the_disc_out_reports_its_removal() {
+        let mut cd = cdrom(32);
+        media_event(&mut cd);
+        assert!(cd.change_medium(None), "an unlocked drive changes at once");
+        assert_eq!(media_event(&mut cd), (3, false), "media removal");
+    }
+
+    #[test]
+    fn a_locked_disc_changes_once_the_guest_ejects_it() {
+        let mut cd = cdrom(32);
+        media_event(&mut cd);
+        // Locked, as Linux does while the disc is mounted.
+        data(cd.command(&cdb(&[0x1e, 0, 0, 0, 1])));
+        let new = Arc::new(MemDisk::new(64 * SECTOR_SIZE as usize, true));
+        assert!(!cd.change_medium(Some(new)), "the guest is asked first");
+        assert_eq!(
+            media_event(&mut cd),
+            (1, true),
+            "an eject request, the old disc in"
+        );
+        assert_eq!(data(cd.command(&cdb(&[0x25])))[3], 31, "still the old disc");
+        // The guest unmounts, unlocks and ejects.
+        data(cd.command(&cdb(&[0x1e, 0, 0, 0, 0])));
+        data(cd.command(&cdb(&[0x1b, 0, 0, 0, 0x02])));
+        assert_eq!(media_event(&mut cd), (2, true), "new media");
+        assert_eq!(
+            cd.command(&cdb(&[0x00])),
+            Outcome::Error(Sense::MEDIUM_CHANGED)
+        );
+        assert_eq!(data(cd.command(&cdb(&[0x25])))[3], 63, "the new disc");
+        assert!(!cd.finish_change(), "nothing left to do");
+    }
+
+    #[test]
+    fn a_locked_disc_changes_anyway_when_the_host_insists() {
+        let mut cd = cdrom(32);
+        data(cd.command(&cdb(&[0x1e, 0, 0, 0, 1])));
+        assert!(!cd.change_medium(None));
+        assert!(cd.finish_change());
+        assert_eq!(media_event(&mut cd), (3, false));
+        // A guest's eject with nothing waiting leaves the disc where it is.
+        let mut cd = cdrom(32);
+        data(cd.command(&cdb(&[0x1b, 0, 0, 0, 0x02])));
+        assert_eq!(data(cd.command(&cdb(&[0x25])))[3], 31);
     }
 }

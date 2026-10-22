@@ -520,10 +520,20 @@ struct Port {
 pub struct DiscDrive(Arc<Mutex<Drive>>);
 
 impl DiscDrive {
-    /// Takes the disc out (`None`) or puts one in.
-    pub fn change(&self, medium: Option<Arc<dyn disk::BlockBackend>>) {
-        if let Drive::Cdrom(cdrom) = &mut *lock(&self.0) {
-            cdrom.change_medium(medium);
+    /// Takes the disc out (`None`) or puts one in. Returns whether it happened now, or
+    /// waits for the guest to eject the disc it holds (see [`Cdrom::change_medium`]).
+    pub fn change(&self, medium: Option<Arc<dyn disk::BlockBackend>>) -> bool {
+        match &mut *lock(&self.0) {
+            Drive::Cdrom(cdrom) => cdrom.change_medium(medium),
+            Drive::Disk(_) => true,
+        }
+    }
+
+    /// Makes a change that's waiting for the guest. Returns whether there was one.
+    pub fn finish_change(&self) -> bool {
+        match &mut *lock(&self.0) {
+            Drive::Cdrom(cdrom) => cdrom.finish_change(),
+            Drive::Disk(_) => false,
         }
     }
 }

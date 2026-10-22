@@ -22,6 +22,9 @@ use crate::console::Targets;
 
 /// How often the screen thread looks for a new picture.
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// How long a guest gets to eject a disc it holds before the host's change happens
+/// anyway.
+const EJECT_GRACE: Duration = Duration::from_secs(10);
 
 struct Shared {
     targets: Targets,
@@ -263,8 +266,24 @@ fn handle(shared: &Shared, request: Request) -> Response {
                         },
                         None => None,
                     };
-                    slot.change(medium);
-                    eprintln!("vmmc-vmx: a client changed the disc in DVD drive {drive}");
+                    if slot.change(medium) {
+                        eprintln!("vmmc-vmx: a client changed the disc in DVD drive {drive}");
+                    } else {
+                        // The guest has the disc in use (mounted): it's asked to let it
+                        // go, and the change happens when it ejects it, or after a while.
+                        eprintln!(
+                            "vmmc-vmx: the guest holds the disc in DVD drive {drive}: asked it to eject it"
+                        );
+                        let slot = slot.clone();
+                        thread::spawn(move || {
+                            thread::sleep(EJECT_GRACE);
+                            if slot.finish_change() {
+                                eprintln!(
+                                    "vmmc-vmx: the guest didn't eject the disc in DVD drive {drive}: changed it anyway"
+                                );
+                            }
+                        });
+                    }
                 }
                 Request::Hello { .. }
                 | Request::Status
