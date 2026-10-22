@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use self::descriptor::{Access, Descriptor, ExtentLine, ExtentType, NO_PARENT};
-use self::sparse::{Grain, SECTOR, SparseExtent};
+use self::sparse::{Grain, Header, SECTOR, SparseExtent};
 use crate::BlockBackend;
 
 /// The deepest chain of delta disks opened; deeper is surely a loop.
@@ -518,15 +518,25 @@ fn new_ddb(sectors: u64) -> Vec<(String, String)> {
 
 /// Writes a new monolithic sparse disk of `len` bytes (whole sectors) with `descriptor`
 /// (its extent filled in). An existing file is never replaced.
-fn write_sparse_file(path: &Path, len: u64, mut descriptor: Descriptor) -> io::Result<()> {
-    if len == 0 || !len.is_multiple_of(SECTOR) {
-        return Err(invalid("a disk is a whole number of 512-byte sectors"));
-    }
-    let sectors = len / SECTOR;
+fn write_sparse_file(path: &Path, len: u64, descriptor: Descriptor) -> io::Result<()> {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| invalid("the disk's file name isn't valid Unicode"))?;
+    write_sparse_file_named(path, name, len, descriptor)
+}
+
+/// As [`write_sparse_file`], its extent named `name` (the file's name once renamed).
+fn write_sparse_file_named(
+    path: &Path,
+    name: &str,
+    len: u64,
+    mut descriptor: Descriptor,
+) -> io::Result<()> {
+    if len == 0 || !len.is_multiple_of(SECTOR) {
+        return Err(invalid("a disk is a whole number of 512-byte sectors"));
+    }
+    let sectors = len / SECTOR;
     descriptor.extents = vec![ExtentLine {
         access: Access::ReadWrite,
         sectors,
@@ -744,6 +754,104 @@ pub fn reparent(path: &Path, parent: &Path) -> io::Result<()> {
     descriptor.parent_hint = Some(relative_path(dir, parent));
     descriptor.parent_cid = parent_cid;
     store_descriptor(&home, Some(&file), &descriptor)
+}
+
+/// Makes the monolithic sparse disk at `path` `len` bytes long (whole sectors, more
+/// than it is); the new space reads as zeroes. The disk is written anew with room for
+/// the size (VMware wants all of a sparse disk's tables ahead of its grains), its data
+/// copied (grains of zeroes left out) and its disk database kept. Not for a delta disk,
+/// or a disk others are deltas of (it gets a new CID), and nothing else may have it
+/// open.
+pub fn expand(path: &Path, len: u64) -> io::Result<()> {
+    let (_, header) = check_monolithic(path, "expanded")?;
+    if !len.is_multiple_of(SECTOR) {
+        return Err(invalid("a disk is a whole number of 512-byte sectors"));
+    }
+    if len / SECTOR <= header.capacity {
+        return Err(invalid(&format!(
+            "{} is {} MiB already: a disk can only grow",
+            path.display(),
+            (header.capacity * SECTOR) >> 20
+        )));
+    }
+    rewrite(path, len)
+}
+
+/// Writes the monolithic sparse disk at `path` anew without its grains of zeroes,
+/// keeping its disk database (its UUID and geometry). Returns the bytes freed. Not for
+/// a delta disk, or a disk others are deltas of (it gets a new CID), and nothing else
+/// may have it open.
+pub fn compact(path: &Path) -> io::Result<u64> {
+    let (_, header) = check_monolithic(path, "compacted")?;
+    let before = fs::metadata(path)?.len();
+    rewrite(path, header.capacity * SECTOR)?;
+    Ok(before.saturating_sub(fs::metadata(path)?.len()))
+}
+
+/// The monolithic sparse disk at `path`'s descriptor and header, with what's refused: a
+/// delta disk (its parent wouldn't match it any more) and other kinds.
+fn check_monolithic(path: &Path, what: &str) -> io::Result<(Descriptor, Header)> {
+    let file = open_file(path, true)?;
+    let (descriptor, home) = read_descriptor(path, &file)?;
+    if descriptor.parent_cid != NO_PARENT {
+        return Err(invalid(&format!(
+            "{} is a delta disk, which can't be {what}: delete its VM's snapshots first",
+            path.display()
+        )));
+    }
+    let monolithic = matches!(home, DescriptorHome::Embedded { .. })
+        && descriptor.extents.len() == 1
+        && descriptor.extents[0].kind == ExtentType::Sparse;
+    if !monolithic {
+        return Err(invalid(&format!(
+            "{} isn't a monolithic sparse disk (vmmc-cli disk convert makes one)",
+            path.display()
+        )));
+    }
+    let mut bytes = [0u8; 512];
+    file_read(&file, &mut bytes, 0)?;
+    Ok((descriptor, Header::parse(&bytes)?))
+}
+
+/// Writes the disk at `path` anew as a monolithic sparse disk of `len` bytes, with its
+/// data (grains of zeroes left out) and its disk database (the geometry's cylinders
+/// for the size), then puts it in the old one's place.
+fn rewrite(path: &Path, len: u64) -> io::Result<()> {
+    let (descriptor, _) = check_monolithic(path, "rewritten")?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| invalid("the disk's file name isn't valid Unicode"))?;
+    let mut fresh = Descriptor {
+        other: descriptor.other.clone(),
+        cid: NO_PARENT,
+        parent_cid: NO_PARENT,
+        create_type: "monolithicSparse".into(),
+        parent_hint: None,
+        extents: Vec::new(),
+        ddb: descriptor.ddb.clone(),
+    };
+    let geometry = |key| descriptor.ddb(key).and_then(|v| v.parse::<u64>().ok());
+    if let (Some(heads), Some(per_track)) = (
+        geometry("ddb.geometry.heads"),
+        geometry("ddb.geometry.sectors"),
+    ) && heads * per_track > 0
+    {
+        let cylinders = (len / SECTOR / (heads * per_track)).clamp(1, 65_535);
+        fresh.set_ddb("ddb.geometry.cylinders", cylinders.to_string());
+    }
+    let written = path.with_extension("vmdk-rewrite");
+    let _ = fs::remove_file(&written);
+    let copied = Vmdk::open(path, true).and_then(|from| {
+        write_sparse_file_named(&written, name, len, fresh)?;
+        let to = Vmdk::open(&written, false)?;
+        crate::copy(&from, &to, |_| {})
+    });
+    if let Err(e) = copied {
+        let _ = fs::remove_file(&written);
+        return Err(e);
+    }
+    fs::rename(&written, path)
 }
 
 /// `target` as seen from `dir`: relative when both are absolute on one drive (or

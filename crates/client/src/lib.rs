@@ -280,6 +280,45 @@ pub fn clone_vm(
     Ok(clone)
 }
 
+/// `vm`'s writable disk `number` (from 1), for changing it: the VM must be off and have
+/// no snapshots, whose deltas wouldn't match the disk any more.
+fn disk_to_change(vm: &Vm, number: usize) -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    if is_running(vm) {
+        return Err(format!("{} is running: shut it down first", vm.config.name));
+    }
+    let tree = vmconfig::snapshots::Tree::load(vm).map_err(|e| e.to_string())?;
+    if !tree.snapshots.is_empty() {
+        return Err(format!(
+            "{} has snapshots, which its disk would no longer match: delete them first",
+            vm.config.name
+        ));
+    }
+    let disk = vm
+        .config
+        .disks
+        .iter()
+        .filter(|disk| !disk.read_only)
+        .nth(number.wrapping_sub(1))
+        .ok_or_else(|| format!("{} has no disk {number}", vm.config.name))?;
+    Ok(vm.resolve(&disk.path))
+}
+
+/// Makes `vm`'s writable disk `number` (from 1) `len` bytes long, rewriting it; the
+/// guest then has unpartitioned space at its end. The VM must be off, without
+/// snapshots.
+pub fn expand_disk(vm: &Vm, number: usize, len: u64) -> Result<(), String> {
+    let path = disk_to_change(vm, number)?;
+    disk::expand(&path, len).map_err(|e| e.to_string())
+}
+
+/// Rewrites `vm`'s writable disk `number` (from 1) without its grains of zeroes, and
+/// returns the bytes freed. The VM must be off, without snapshots.
+pub fn compact_disk(vm: &Vm, number: usize) -> Result<u64, String> {
+    let path = disk_to_change(vm, number)?;
+    disk::compact(&path).map_err(|e| e.to_string())
+}
+
 /// Suspends the running `vm`: its state is saved, and its next start resumes it.
 #[cfg(windows)]
 pub fn suspend(vm: &Vm) -> Result<(), String> {

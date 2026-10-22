@@ -13,7 +13,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 pub use switchable::Switchable;
-pub use vmdk::{create_delta, create_sparse, merge_into_parent, parent_of, reparent};
+pub use vmdk::{
+    compact, create_delta, create_sparse, expand, merge_into_parent, parent_of, reparent,
+};
 
 /// Opens a disk image: a VMDK if its name ends in `.vmdk`, otherwise a raw image. The
 /// name decides, never the contents: a guest can write anything into a raw image,

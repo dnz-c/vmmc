@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 agent-proto.workspace = true
+disk.workspace = true
 ipc.workspace = true
 vmconfig.workspace = true
 

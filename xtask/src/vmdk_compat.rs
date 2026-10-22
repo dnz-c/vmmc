@@ -281,6 +281,36 @@ pub fn test() -> Result<(), String> {
     )?;
     eprintln!("xtask: VMware reads a chain vmmc merged");
 
+    // 6. vmmc's disk expanded, then compacted.
+    let resized = dir.join("resized.vmdk");
+    disk::create_sparse(&resized, small).map_err(|e| e.to_string())?;
+    let mut resized_writes = writes(small, 13);
+    write_all(&resized, &resized_writes)?;
+    disk::expand(&resized, 4 * small).map_err(|e| e.to_string())?;
+    let beyond = writes(4 * small, 14);
+    let tail = beyond.last().cloned().unwrap();
+    write_all(&resized, std::slice::from_ref(&tail))?;
+    resized_writes.push(tail);
+    consistent(&tool, &resized)?;
+    check(
+        &vmware_copy(&tool, &resized, "2", "check-expanded.vmdk")?,
+        &resized_writes,
+        "VMware's copy of the expanded disk",
+    )?;
+    // A grain written and zeroed again goes.
+    let zeroed = (small + (1 << 20), vec![0u8; 64 << 10]);
+    write_all(&resized, &[(zeroed.0, data(64 << 10, 15))])?;
+    write_all(&resized, std::slice::from_ref(&zeroed))?;
+    resized_writes.push(zeroed);
+    disk::compact(&resized).map_err(|e| e.to_string())?;
+    consistent(&tool, &resized)?;
+    check(
+        &vmware_copy(&tool, &resized, "2", "check-compacted.vmdk")?,
+        &resized_writes,
+        "VMware's copy of the compacted disk",
+    )?;
+    eprintln!("xtask: VMware reads a disk vmmc expanded and compacted");
+
     // Every disk is closed by now (each was opened for one check).
     fs::remove_dir_all(&dir).map_err(|e| format!("can't remove {}: {e}", dir.display()))?;
     eprintln!("vmdk-compat-test passed");

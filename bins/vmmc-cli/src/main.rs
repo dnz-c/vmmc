@@ -258,6 +258,26 @@ enum DiskCommand {
     /// Copy a disk into a new one, in the format its name says (.vmdk: VMDK, otherwise
     /// raw). Reads any VMDK VMware makes; writes monolithic sparse VMDKs.
     Convert { from: PathBuf, to: PathBuf },
+    /// Make a VM's disk bigger (it's written anew). The guest then has free space at
+    /// the end of the disk, for its partition to grow into. The VM must be off, without
+    /// snapshots.
+    Expand {
+        vm: String,
+        #[arg(long, value_parser = vmconfig::parse_size)]
+        size: u64,
+        /// Which of its disks, from 1.
+        #[arg(long, default_value_t = 1)]
+        disk: usize,
+    },
+    /// Write a VM's disk anew without the space that holds only zeroes (zero free
+    /// space in the guest first, as Windows' `sdelete -z` does). The VM must be off,
+    /// without snapshots.
+    Compact {
+        vm: String,
+        /// Which of its disks, from 1.
+        #[arg(long, default_value_t = 1)]
+        disk: usize,
+    },
 }
 
 fn is_vmdk(path: &Path) -> bool {
@@ -626,6 +646,24 @@ fn run(command: Command) -> Result<(), String> {
         Command::Disk(DiskCommand::Convert { from, to }) => {
             convert(&from, &to)?;
             println!("converted {} to {}", from.display(), to.display());
+        }
+        Command::Disk(DiskCommand::Expand { vm, size, disk }) => {
+            let vm = find_vm(&vm)?;
+            vmmc_client::expand_disk(&vm, disk, size)?;
+            println!(
+                "{}'s disk {disk} is {} now: extend its partition in the guest to use it",
+                vm.config.name,
+                gib(size)
+            );
+        }
+        Command::Disk(DiskCommand::Compact { vm, disk }) => {
+            let vm = find_vm(&vm)?;
+            let freed = vmmc_client::compact_disk(&vm, disk)?;
+            println!(
+                "{}'s disk {disk} takes {} MiB less",
+                vm.config.name,
+                freed >> 20
+            );
         }
     }
     Ok(())

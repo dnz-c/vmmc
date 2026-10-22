@@ -218,6 +218,88 @@ fn a_delta_merges_into_its_parent_and_the_one_above_moves_onto_it() {
 }
 
 #[test]
+fn an_expanded_disk_keeps_its_data_and_takes_writes_in_the_new_space() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("disk.vmdk");
+    create_sparse(&path, 10 * MIB).unwrap();
+    Vmdk::open(&path, false)
+        .unwrap()
+        .write_at(&pattern(3 * GRAIN as usize, 1), 10 * MIB - 3 * GRAIN)
+        .unwrap();
+    assert!(expand(&path, 5 * MIB).is_err(), "only up");
+    // Far enough for more grain tables than the directory had room for.
+    expand(&path, 300 * MIB).unwrap();
+    {
+        let disk = Vmdk::open(&path, false).unwrap();
+        assert_eq!(disk.len(), 300 * MIB);
+        assert_eq!(
+            read(&disk, 10 * MIB - 3 * GRAIN, 3 * GRAIN as usize),
+            pattern(3 * GRAIN as usize, 1)
+        );
+        assert_eq!(
+            read(&disk, 10 * MIB, 4096),
+            vec![0; 4096],
+            "new space is zeroes"
+        );
+        disk.write_at(&pattern(5000, 2), 299 * MIB).unwrap();
+        disk.write_at(&pattern(512, 3), 300 * MIB - 512).unwrap();
+        assert_eq!(disk.descriptor().ddb("ddb.geometry.cylinders"), Some("300"));
+    }
+    let disk = Vmdk::open(&path, true).unwrap();
+    assert_eq!(read(&disk, 299 * MIB, 5000), pattern(5000, 2));
+    assert_eq!(read(&disk, 300 * MIB - 512, 512), pattern(512, 3));
+    assert_eq!(
+        read(&disk, 10 * MIB - 3 * GRAIN, 3 * GRAIN as usize),
+        pattern(3 * GRAIN as usize, 1)
+    );
+    let delta = dir.path().join("delta.vmdk");
+    drop(disk);
+    create_delta(&delta, &path).unwrap();
+    assert!(expand(&delta, 400 * MIB).is_err(), "not a delta");
+}
+
+#[test]
+fn compacting_drops_the_grains_of_zeroes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("disk.vmdk");
+    create_sparse(&path, 20 * MIB).unwrap();
+    let geometry_before;
+    {
+        let disk = Vmdk::open(&path, false).unwrap();
+        disk.write_at(&pattern(4 * GRAIN as usize, 1), 0).unwrap();
+        // Written, then zeroed: allocated, but holding nothing.
+        disk.write_at(&pattern(8 * GRAIN as usize, 2), 4 * MIB)
+            .unwrap();
+        disk.write_at(&vec![0; 8 * GRAIN as usize], 4 * MIB)
+            .unwrap();
+        geometry_before = disk
+            .descriptor()
+            .ddb("ddb.geometry.cylinders")
+            .map(str::to_owned);
+    }
+    let freed = compact(&path).unwrap();
+    assert_eq!(freed, 8 * GRAIN, "the zeroed grains");
+    let disk = Vmdk::open(&path, true).unwrap();
+    assert_eq!(
+        read(&disk, 0, 4 * GRAIN as usize),
+        pattern(4 * GRAIN as usize, 1)
+    );
+    assert_eq!(
+        read(&disk, 4 * MIB, 8 * GRAIN as usize),
+        vec![0; 8 * GRAIN as usize]
+    );
+    assert_eq!(
+        disk.descriptor()
+            .ddb("ddb.geometry.cylinders")
+            .map(str::to_owned),
+        geometry_before,
+        "its disk database stays"
+    );
+    assert_eq!(disk.descriptor().extents[0].file, "disk.vmdk");
+    assert!(!dir.path().join("disk.vmdk-compact").exists());
+}
+
+#[test]
 fn a_delta_on_a_changed_parent_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().join("base.vmdk");
