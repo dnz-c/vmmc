@@ -763,11 +763,18 @@ export component AppWindow inherits Window {
         width: root.width;
         height: root.height;
         heading: root.message-title;
-        ScrollView {
-            Text {
+        // As wide as the sheet, so long lines wrap rather than run off both edges.
+        message-scroll := ScrollView {
+            viewport-width: self.visible-width;
+            viewport-height: max(self.visible-height, message-body.preferred-height);
+            message-body := Text {
+                x: 0;
+                y: 0;
+                width: message-scroll.visible-width;
                 text: root.message-text;
                 color: #d0d0d0;
                 wrap: word-wrap;
+                vertical-alignment: top;
             }
         }
         HorizontalLayout {

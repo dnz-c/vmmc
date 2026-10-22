@@ -7,7 +7,8 @@
 //!   labeled low: its VM's folder, which [`allow_writes`] labels.
 //! - **Job:** no child processes, and no access to the desktop, clipboard or other
 //!   processes' windows.
-//! - **Handles:** it inherits exactly its log (as stdout and stderr) and a null stdin.
+//! - **Handles:** it inherits exactly its log (as stdout and stderr) and a null stdin,
+//!   and has no console (so no console host process beside it).
 //!
 //! WHP works in this sandbox: the worker creates its partition at low integrity.
 
@@ -41,7 +42,7 @@ use windows::Win32::System::JobObjects::{
     JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation, SetInformationJobObject,
 };
 use windows::Win32::System::Threading::{
-    CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessAsUserW,
+    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, CreateProcessAsUserW, DETACHED_PROCESS,
     CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
     GetExitCodeProcess, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
     OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ResumeThread,
@@ -75,9 +76,11 @@ pub fn interactive() -> bool {
     named.is_ok() && String::from_utf16_lossy(&name[..len]).eq_ignore_ascii_case("WinSta0")
 }
 
-/// How a sandboxed process ends when its desktop doesn't let it in: Windows can't
-/// start its DLLs (user32's needs the window station and desktop). Seen on GitHub's
-/// hosted runners, whose desktop doesn't admit a restricted, low-integrity token.
+/// How a sandboxed process ends when a DLL's start-up fails: user32's when the desktop
+/// doesn't let it in (seen on GitHub's hosted runners, whose desktop doesn't admit a
+/// restricted, low-integrity token), the console's when a console host couldn't start
+/// beside it (so the worker has no console), or a DLL some other software loads into
+/// every process.
 pub const DLL_INIT_FAILED: u32 = 0xc000_0142;
 
 /// Token group flags (in SystemServices, which this crate doesn't otherwise need).
@@ -495,8 +498,12 @@ pub fn spawn(exe: &Path, args: &[String], log: &Path, sandboxed: bool) -> Result
         startup.StartupInfo.hStdOutput = handles[0];
         startup.StartupInfo.hStdError = handles[0];
         startup.lpAttributeList = list;
+        // No console at all, not even a hidden one (CREATE_NO_WINDOW): Windows would start
+        // a console host for it as a second process, which the job forbids. Windows 11
+        // lets it through anyway; where it doesn't, the worker's start-up fails
+        // (STATUS_DLL_INIT_FAILED). Its output goes to the log either way.
         let flags = EXTENDED_STARTUPINFO_PRESENT
-            | CREATE_NO_WINDOW
+            | DETACHED_PROCESS
             | CREATE_NEW_PROCESS_GROUP
             | CREATE_SUSPENDED;
         let mut info = PROCESS_INFORMATION::default();

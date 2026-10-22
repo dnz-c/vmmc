@@ -152,4 +152,9 @@ fn every_state_draws() {
     app.set_message_text("Windows 10 x64 opens in place.\n\nWorth knowing:\n• no sound card yet\n• Windows sees new hardware: it may ask to be activated again".into());
     app.set_message_open(true);
     snapshot(&window, "message");
+
+    // One long line, as errors are: it wraps.
+    app.set_message_title("Ubuntu didn't start".into());
+    app.set_message_text("the sandboxed VM failed as it started (STATUS_DLL_INIT_FAILED): this session's desktop doesn't admit sandboxed programs, or software that loads itself into every program (some antivirus and overlay tools do) fails in the sandbox; set VMMC_NO_SANDBOX=1 to run VMs unsandboxed".into());
+    snapshot(&window, "message-long");
 }

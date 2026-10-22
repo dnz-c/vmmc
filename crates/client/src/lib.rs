@@ -302,7 +302,7 @@ pub fn start(vm: &Vm) -> Result<Connection, String> {
         }
         if let Some(code) = process.exit_code() {
             if code == sandbox::DLL_INIT_FAILED {
-                return Err("Windows didn't let the sandboxed VM start in this session (its desktop doesn't admit sandboxed programs); set VMMC_NO_SANDBOX=1 to run it unsandboxed".into());
+                return Err("the sandboxed VM failed as it started (STATUS_DLL_INIT_FAILED): this session's desktop doesn't admit sandboxed programs, or software that loads itself into every program (some antivirus and overlay tools do) fails in the sandbox; set VMMC_NO_SANDBOX=1 to run VMs unsandboxed".into());
             }
             return Err(format!(
                 "the VM stopped (exit code {code}): {}",
