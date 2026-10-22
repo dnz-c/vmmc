@@ -153,6 +153,17 @@ export component AppWindow inherits Window {
     in-out property <string> snapshot-description;
     callback take-snapshot();
 
+    // Cloning the current VM: what's cloned (a snapshot, or the VM as it is), and
+    // whether that can be cloned now.
+    in-out property <bool> clone-open;
+    in-out property <string> clone-name;
+    in-out property <bool> clone-linked;
+    in property <string> clone-source;
+    in property <bool> clone-of-snapshot;
+    in property <bool> clone-allowed;
+    callback open-clone();
+    callback make-clone();
+
     // A question: Cancel, or its action.
     in-out property <bool> confirm-open;
     in property <string> confirm-title;
@@ -500,6 +511,10 @@ export component AppWindow inherits Window {
                                     Button {
                                         text: "Show files";
                                         clicked => { root.show-folder(); }
+                                    }
+                                    Button {
+                                        text: "Clone…";
+                                        clicked => { root.open-clone(); }
                                     }
                                     Button {
                                         text: "Remove from library";
@@ -899,6 +914,49 @@ export component AppWindow inherits Window {
                 primary: true;
                 enabled: root.snapshot-name != "";
                 clicked => { root.take-snapshot(); }
+            }
+        }
+    }
+
+    // Cloning the current VM.
+    if root.clone-open: Sheet {
+        width: root.width;
+        height: root.height;
+        heading: "Clone";
+        Text {
+            text: root.clone-source;
+            color: #b0b0b0;
+            wrap: word-wrap;
+        }
+        Field {
+            label: "Name";
+            LineEdit {
+                text <=> root.clone-name;
+            }
+        }
+        CheckBox {
+            text: "Linked clone";
+            enabled: root.clone-of-snapshot;
+            checked <=> root.clone-linked;
+        }
+        Text {
+            text: root.clone-of-snapshot ? "A linked clone writes to new disks on top of the snapshot's: it takes little space and no time, and the snapshot can't be deleted while the clone is there. A full clone copies the disks." : "A linked clone is made from a snapshot: pick one in the list first. A full clone copies the disks.";
+            color: #8a8a8a;
+            wrap: word-wrap;
+        }
+        Rectangle { }
+        HorizontalLayout {
+            alignment: end;
+            spacing: 8px;
+            Button {
+                text: "Cancel";
+                clicked => { root.clone-open = false; }
+            }
+            Button {
+                text: "Clone";
+                primary: true;
+                enabled: root.clone-allowed && root.clone-name != "";
+                clicked => { root.make-clone(); }
             }
         }
     }

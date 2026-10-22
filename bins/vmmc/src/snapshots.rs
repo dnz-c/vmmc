@@ -126,6 +126,14 @@ fn every_state_draws() {
     app.set_snapshot_open(true);
     snapshot(&window, "take-snapshot");
     app.set_snapshot_open(false);
+    app.set_clone_source("A new VM from the snapshot “Trying a driver” of Windows 11: its disks and settings as they were then, but not its memory.".into());
+    app.set_clone_of_snapshot(true);
+    app.set_clone_allowed(true);
+    app.set_clone_linked(true);
+    app.set_clone_name("Windows 11 clone".into());
+    app.set_clone_open(true);
+    snapshot(&window, "clone");
+    app.set_clone_open(false);
     app.set_confirm_title("Revert to “Trying a driver”?".into());
     app.set_confirm_text("What Windows 11 did since “Trying a driver” is lost, unless a snapshot taken since keeps it.".into());
     app.set_confirm_action("Revert".into());

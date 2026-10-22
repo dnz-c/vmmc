@@ -113,6 +113,9 @@ struct App {
     snapshot_rows: Vec<SnapshotRow>,
     /// What the question on screen does if the user says yes.
     confirm: Option<Confirm>,
+    /// Set (from another thread) when the library's file changed: the next refresh
+    /// loads it again.
+    library_changed: Arc<AtomicBool>,
 }
 
 type Shared = Rc<RefCell<App>>;
@@ -171,6 +174,7 @@ fn run() -> Result<(), String> {
         transfers: Vec::new(),
         snapshot_rows: Vec::new(),
         confirm: None,
+        library_changed: Arc::new(AtomicBool::new(false)),
     }));
     #[cfg(windows)]
     dnd::clean_staging();
@@ -198,6 +202,13 @@ fn run() -> Result<(), String> {
     let state_timer = slint::Timer::default();
     let watched = app.clone();
     state_timer.start(slint::TimerMode::Repeated, STATE_INTERVAL, move || {
+        let changed = watched
+            .borrow()
+            .library_changed
+            .swap(false, Ordering::Relaxed);
+        if changed {
+            reload(&watched);
+        }
         refresh(&watched);
     });
     let frame_timer = slint::Timer::default();
@@ -1042,6 +1053,88 @@ fn wire(window: &AppWindow, app: &Shared) {
             name: snapshot.name.clone(),
         });
         ask(&window, &format!("Delete “{}”?", snapshot.name), &text, "Delete");
+    }));
+    window.on_open_clone(with!(app, window, {
+        let Some(vm) = current_vm(&app, &window) else {
+            return;
+        };
+        let id = window.get_selected_snapshot().to_string();
+        let snapshot = Tree::load(&vm).ok().and_then(|tree| tree.get(&id).cloned());
+        let running = window.get_current().running;
+        let (source, allowed) = match &snapshot {
+            Some(snapshot) => (
+                format!(
+                    "A new VM from the snapshot “{}” of {}: its disks and settings as they were then, but not its memory.",
+                    snapshot.name, vm.config.name
+                ),
+                true,
+            ),
+            None if running => (
+                format!(
+                    "{} is running: shut it down to clone it as it is, or pick a snapshot of it in the list.",
+                    vm.config.name
+                ),
+                false,
+            ),
+            None => (
+                format!("A new VM from {} as it is: its disks and settings.", vm.config.name),
+                true,
+            ),
+        };
+        window.set_clone_source(source.into());
+        window.set_clone_allowed(allowed);
+        window.set_clone_of_snapshot(snapshot.is_some());
+        window.set_clone_linked(false);
+        window.set_clone_name(unique_name(&app, &format!("{} clone", vm.config.name)).into());
+        window.set_clone_open(true);
+    }));
+    window.on_make_clone(with!(app, window, {
+        let Some(vm) = current_vm(&app, &window) else {
+            return;
+        };
+        let selected = window.get_selected_snapshot().to_string();
+        let snapshot = (window.get_clone_of_snapshot() && !selected.is_empty()).then_some(selected);
+        let linked = window.get_clone_linked() && snapshot.is_some();
+        let name = window.get_clone_name().trim().to_owned();
+        window.set_clone_open(false);
+        let weak = window.as_weak();
+        let library_changed = app.borrow().library_changed.clone();
+        in_background(
+            &window,
+            format!("Cloning {}…", vm.config.name),
+            "Couldn't clone",
+            move || {
+                let mut shown = 0;
+                let clone = vmmc_client::clone_vm(
+                    &vm,
+                    snapshot.as_deref(),
+                    &name,
+                    linked,
+                    |done, total| {
+                        let percent = done * 100 / total.max(1);
+                        if percent > shown {
+                            shown = percent;
+                            let (weak, text) = (
+                                weak.clone(),
+                                format!("Cloning {}: {percent}%", vm.config.name),
+                            );
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(window) = weak.upgrade() {
+                                    window.set_status_text(text.into());
+                                }
+                            });
+                        }
+                    },
+                )?;
+                library_changed.store(true, Ordering::Relaxed);
+                Ok(format!(
+                    "{} {} as {}",
+                    if linked { "linked" } else { "cloned" },
+                    vm.config.name,
+                    clone.config.name
+                ))
+            },
+        );
     }));
     window.on_confirmed(with!(app, window, {
         let Some(confirm) = app.borrow_mut().confirm.take() else {
