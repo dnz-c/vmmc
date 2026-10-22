@@ -517,7 +517,7 @@ pub fn display_test() -> Result<(), String> {
 
 /// The vmmc Tools disc, all in the root: Windows' setup (with Windows line ends), the
 /// driver package, the certificate it's signed with and the agent; Linux's install
-/// script and agent.
+/// script, the autorun script GNOME offers to run, and the agent.
 fn write_tools_iso(
     package: &Path,
     agent: &Path,
@@ -534,10 +534,9 @@ fn write_tools_iso(
     }
     files.push(("vmmcagent.exe".to_owned(), read(agent)?));
     files.push(("vmmc-test-signing.cer".to_owned(), read(certificate)?));
-    files.push((
-        "install-linux.sh".to_owned(),
-        linux_tools_file("install-linux.sh")?,
-    ));
+    for name in ["install-linux.sh", "autorun.sh"] {
+        files.push((name.to_owned(), linux_tools_file(name)?));
+    }
     files.push(("vmmc-agent".to_owned(), read(linux_agent)?));
     let files: Vec<(&str, &[u8])> = files
         .iter()

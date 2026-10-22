@@ -138,6 +138,11 @@ pub fn tools_iso() -> Option<PathBuf> {
 /// The vmmc Tools disc's file name.
 pub const TOOLS_ISO: &str = "vmmc-tools.iso";
 
+/// Whether vmmc Tools are for a guest of `os` (a preset's ID): Windows and Linux.
+pub fn has_tools(os: &str) -> bool {
+    os.starts_with("windows") || matches!(os, "ubuntu" | "linux")
+}
+
 /// Whether `vm` is suspended: its next start resumes it.
 pub fn is_suspended(vm: &Vm) -> bool {
     vmconfig::snapshots::suspended_file(vm).is_file()
@@ -208,10 +213,17 @@ pub fn suspend(vm: &Vm) -> Result<(), String> {
     }
 }
 
+/// What a Linux guest's user does with the vmmc Tools disc.
+#[cfg(windows)]
+const LINUX_TOOLS: &str = "The vmmc Tools disc is in the VM's DVD drive. In the guest, open a terminal (Ctrl+Alt+T in Ubuntu) and run:\n\nsudo sh \"$(findmnt -nro TARGET -S LABEL=VMMC_TOOLS)/install-linux.sh\"\n\n(Where the desktop offers to run the software on the disc, that does the same.) It installs vmmc's agent, which shares the clipboard with the host and lets you drag files between the host and the guest. Dragging files needs the VM's network adapter.";
+
 /// Puts the vmmc Tools disc into the running VM's first DVD drive. Returns what the
 /// user should know next.
 #[cfg(windows)]
 pub fn insert_tools(vm: &Vm) -> Result<String, String> {
+    if !has_tools(&vm.config.os) {
+        return Err("vmmc Tools are for Windows and Linux guests".into());
+    }
     let iso = tools_iso().ok_or(
         "the vmmc Tools disc (vmmc-tools.iso) isn't there: build it with `cargo xtask guest-drivers`",
     )?;
@@ -229,7 +241,7 @@ pub fn insert_tools(vm: &Vm) -> Result<String, String> {
             }
         })?;
     if !vm.config.os.starts_with("windows") {
-        return Ok("The vmmc Tools disc is in the VM's DVD drive. In the guest, open a terminal and run:\n\nsudo sh /media/$USER/VMMC_TOOLS/install-linux.sh\n\nThat installs vmmc's agent, which shares the clipboard with the host and lets you drag files between the host and the guest.".to_owned());
+        return Ok(LINUX_TOOLS.to_owned());
     }
     let mut text = "The vmmc Tools disc is in the VM's DVD drive. In Windows, open it (AutoPlay offers it, or open the drive in Explorer) and run setup; it asks for administrator rights. It installs vmmc's agent, which shares the clipboard with the host and lets you drag files between the host and the guest.".to_owned();
     if vm.config.firmware.secure_boot {

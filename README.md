@@ -120,11 +120,14 @@ target\release\vmmc.exe
   tablet, so it moves freely in and out. With **Fit guest to window**, a Windows guest
   with vmmc's display driver takes the window's size. **Full screen**, **Ctrl+Alt+Del**,
   shut down (the power button), power off and reset are on the toolbar.
-- **The clipboard** (text) is shared with the guest whose console is open, once
-  **Install vmmc Tools** has put vmmc's agent in it (Windows, or Linux with
-  `sudo sh /media/$USER/VMMC_TOOLS/install-linux.sh`): what you copy on the host can be
-  pasted in the guest, and the other way round. The agent needs no driver, so it works
-  with Secure Boot on.
+- **vmmc Tools:** **Install vmmc Tools** on a running VM's toolbar puts the Tools disc
+  in its DVD drive. In Windows, AutoPlay offers its setup. In Linux, run
+  `sudo sh "$(findmnt -nro TARGET -S LABEL=VMMC_TOOLS)/install-linux.sh"` in a terminal
+  (the app shows it). They install vmmc's agent, which needs no driver, so it works with
+  Secure Boot on.
+- **The clipboard** (text) is shared with the guest whose console is open, once vmmc
+  Tools are in it: what you copy on the host can be pasted in the guest, and the other
+  way round.
 - **Drag and drop:** drag files or folders from Explorer onto the console and drop them
   where the pointer is in the guest (a folder, the desktop, a program's window); drag
   them out of the guest past the console's edge and drop them on the host. The files go

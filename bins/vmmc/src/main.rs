@@ -355,7 +355,7 @@ fn row(vm: &Vm, folder: Option<&str>, running: bool) -> VmRow {
         path: vm.path.display().to_string().into(),
         name: config.name.clone().into(),
         folder: folder.unwrap_or_default().into(),
-        windows: config.os.starts_with("windows"),
+        tools: vmmc_client::has_tools(&config.os),
         heading: "".into(),
         os: if config.vmware.is_some() {
             format!("{} (from VMware)", os_label(&config.os)).into()

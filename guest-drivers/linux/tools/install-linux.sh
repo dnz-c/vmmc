@@ -1,9 +1,12 @@
 #!/bin/sh
 # vmmc Tools for Linux, from the vmmc Tools disc: vmmc's agent (vmmc-agent), which shares
 # the clipboard with the host and drags files between the host and the guest. Run it as
-# root from the disc, which the desktop shows under /media:
+# root from the disc, wherever the desktop mounted it (/media/$USER/VMMC_TOOLS, or
+# /run/media/$USER/VMMC_TOOLS on Ubuntu 26.04):
 #
-#     sudo sh /media/$USER/VMMC_TOOLS/install-linux.sh
+#     sudo sh "$(findmnt -nro TARGET -S LABEL=VMMC_TOOLS)/install-linux.sh"
+#
+# Or through the disc's autorun.sh (pkexec), which a desktop with autorun on offers to run.
 #
 # It installs the agent in /usr/local/bin, lets the desktop's user open the serial port
 # the agent talks to the host on (/dev/ttyS1), and starts the agent with each desktop
@@ -38,13 +41,23 @@ NoDisplay=true
 X-GNOME-Autostart-Phase=Applications
 EOF
 
-# Now, in the session of the user who ran this. (Their agent finds the desktop itself.)
+# Now, in the session of the user who ran this, through sudo or pkexec. (Their agent
+# finds the desktop itself.)
 user=${SUDO_USER:-}
+if [ -z "$user" ] && [ -n "${PKEXEC_UID:-}" ]; then
+    user=$(id -nu "$PKEXEC_UID")
+fi
+done="vmmc Tools are installed: the clipboard and drag and drop now work with the host."
 if [ -n "$user" ] && [ "$user" != root ]; then
     uid=$(id -u "$user")
     pkill -u "$user" -x vmmc-agent 2>/dev/null || true
     sleep 0.3
     sudo -u "$user" env XDG_RUNTIME_DIR="/run/user/$uid" HOME="$(getent passwd "$user" | cut -d: -f6)" \
         setsid /usr/local/bin/vmmc-agent > /dev/null 2>&1 < /dev/null &
+    # Said on the desktop too: from the disc's autorun there's no terminal to say it in.
+    if command -v notify-send > /dev/null; then
+        sudo -u "$user" env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+            notify-send --app-name="vmmc Tools" "vmmc Tools" "$done" 2>/dev/null || true
+    fi
 fi
-echo "vmmc Tools are installed: the clipboard and drag and drop now work with the host."
+echo "$done"

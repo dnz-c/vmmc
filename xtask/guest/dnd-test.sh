@@ -43,6 +43,40 @@ printf 'aus dem Gast' > "$out/Ordner/tief/ärger.txt"
     say "guest-file $(sha256sum "$file" | cut -d' ' -f1) ${file#./}"
 done)
 
+# After the drags, the host takes the Tools disc out and puts it in again, as the app's
+# Install vmmc Tools does: Ubuntu ejects it when asked, the desktop mounts the new one,
+# GIO finds software to run on it (autorun.sh), and the install the app tells of works
+# (with sudo, as in a terminal).
+(
+    # Where the desktop mounted it: /media/$USER/VMMC_TOOLS, or /run/media/$USER/...
+    # (Ubuntu 26.04).
+    tools_mount() {
+        findmnt -nro TARGET -S LABEL=VMMC_TOOLS | head -n 1
+    }
+    # It's in from the start, mounted for the session.
+    for _ in $(seq 60); do [ -n "$(tools_mount)" ] && break; sleep 1; done
+    tools=$(tools_mount)
+    if [ -n "$tools" ]; then say "tools-disc mounted at $tools"; else say "tools-disc missing"; fi
+    while [ -n "$(tools_mount)" ]; do sleep 0.5; done
+    say "tools-disc ejected"
+    # The drags are over: the peer goes, so the screenshot shows the desktop.
+    pkill -f dnd-peer.js
+    for _ in $(seq 120); do [ -n "$(tools_mount)" ] && break; sleep 0.5; done
+    tools=$(tools_mount)
+    [ -n "$tools" ] || { say "tools-disc not-back"; exit; }
+    say "tools-disc back at $tools"
+    say "tools-autorun $(ls -l "$tools/autorun.sh" 2>&1)"
+    sleep 2
+    say "tools-content $(gio mount -li 2> /dev/null | grep -A30 "Mount.*VMMC_TOOLS" | grep -m1 x_content_types)"
+    say "tools-handler $(gio mime x-content/unix-software 2>&1 | tr '\n' ' ')"
+    sleep 8
+    # As the app says to, in a terminal.
+    printf 'vmmc\n' | sudo -S sh "$(findmnt -nro TARGET -S LABEL=VMMC_TOOLS)/install-linux.sh" 2>&1 |
+        while read -r line; do say "tools-install: $line"; done
+    sleep 3
+    say "tools-installed agent=$(pgrep -a -x vmmc-agent | tr '\n' ' ')"
+) &
+
 # Later, for the log: what the peer and the session warned about.
 (
     sleep 75

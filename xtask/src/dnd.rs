@@ -142,14 +142,19 @@ pub fn ubuntu_test() -> Result<(), String> {
         .arg(&disc);
     eprintln!("$ {command:?}");
     let mut vm = Session::spawn(command)?;
-    // The drags too when the clipboard fails, to hear about both.
-    let copied = clipboard(&mut vm, &id);
-    let dragged = drive(&mut vm, &id, &dir);
-    let result = match (copied, dragged) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(e), Ok(())) => Err(format!("the clipboard: {e}")),
-        (Ok(()), Err(e)) => Err(e),
-        (Err(clip), Err(drag)) => Err(format!("the clipboard: {clip}; and {drag}")),
+    // Each part whatever came of the ones before, to hear about all of them.
+    let failures: Vec<String> = [
+        clipboard(&mut vm, &id).map_err(|e| format!("the clipboard: {e}")),
+        drive(&mut vm, &id, &dir),
+        tools_disc(&mut vm, &id, &tools).map_err(|e| format!("the Tools disc: {e}")),
+    ]
+    .into_iter()
+    .filter_map(Result::err)
+    .collect();
+    let result = if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; and "))
     };
     for line in vm
         .text(0, vm.len())
@@ -168,6 +173,62 @@ pub fn ubuntu_test() -> Result<(), String> {
     }
     result?;
     eprintln!("{UBUNTU} passed");
+    Ok(())
+}
+
+/// The Tools disc out and in again, as the app's Install vmmc Tools puts it in a running
+/// VM. Ubuntu has it mounted, so the drive asks it to eject it first; then the desktop
+/// mounts the new one, with autorun.sh runnable (Rock Ridge) and seen by GIO as software
+/// (which a desktop with autorun on offers to run), and the install the app tells of
+/// works from it (with sudo, as in a terminal): the agent it starts reaches the worker.
+fn tools_disc(vm: &mut Session, id: &str, tools: &Path) -> Result<(), String> {
+    let mut pipe = vmmc_client::connect_id(id, Duration::from_secs(10))?;
+    vm.expect("VMMC-DND: tools-disc mounted", 0, Duration::from_secs(10))?;
+    let mark = vm.len();
+    pipe.command(&Request::InsertDisc {
+        drive: 0,
+        path: None,
+    })?;
+    vm.expect(
+        "VMMC-DND: tools-disc ejected",
+        mark,
+        Duration::from_secs(30),
+    )?;
+    pipe.command(&Request::InsertDisc {
+        drive: 0,
+        path: Some(tools.display().to_string()),
+    })?;
+    let back = vm.expect("VMMC-DND: tools-disc back", mark, Duration::from_secs(60))?;
+    // What the desktop shows for it, to look at.
+    thread::sleep(Duration::from_secs(5));
+    let _ = vm.send("\x01s");
+    let line = |vm: &Session, prefix: &str| -> Result<String, String> {
+        let at = vm.expect(prefix, back, Duration::from_secs(60))?;
+        let text = vm.text(at, vm.len());
+        Ok(text.lines().next().unwrap_or_default().trim().to_owned())
+    };
+    let autorun = line(vm, "VMMC-DND: tools-autorun ")?;
+    if !autorun.starts_with("-r-xr-xr-x") {
+        return Err(format!("autorun.sh on the mounted disc: {autorun}"));
+    }
+    let content = line(vm, "VMMC-DND: tools-content ")?;
+    if !content.contains("x-content/unix-software") {
+        return Err(format!(
+            "GIO sees no software to run on the disc: {content:?}"
+        ));
+    }
+    let agent = line(vm, "VMMC-DND: tools-installed agent=")?;
+    if !agent.contains("/usr/local/bin/vmmc-agent") {
+        return Err(format!(
+            "no installed agent runs after the install: {agent:?}"
+        ));
+    }
+    vm.expect(
+        "vmmc-vmx: agent: connected to the desktop",
+        back,
+        Duration::from_secs(30),
+    )?;
+    eprintln!("xtask: the Tools disc went in again, and its install worked");
     Ok(())
 }
 
@@ -471,7 +532,9 @@ fn drag_that_leaves(
     let pipe = &mut *pipe;
     let mark = vm.len();
     let drag = drag_enter(pipe, transfer::items(paths), target)?;
-    wait_drag(pipe, drag, Duration::from_secs(5), |s| *s == DragState::InGuest)?;
+    wait_drag(pipe, drag, Duration::from_secs(5), |s| {
+        *s == DragState::InGuest
+    })?;
     for step in 1..=5 {
         pipe.command(&Request::DragMove {
             drag,
@@ -538,7 +601,9 @@ fn drop_files(
             )
         })
     };
-    wait_drag(pipe, drag, Duration::from_secs(5), |s| *s == DragState::InGuest)?;
+    wait_drag(pipe, drag, Duration::from_secs(5), |s| {
+        *s == DragState::InGuest
+    })?;
     for step in (0..=4).rev() {
         pipe.command(&Request::DragMove {
             drag,

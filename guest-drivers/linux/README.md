@@ -31,15 +31,31 @@ disc with `tools/install-linux.sh`.
 
 ## Installing
 
-In the guest, with the vmmc Tools disc in (the desktop shows it under `/media`):
+**Install vmmc Tools** in vmmc's toolbar puts the vmmc Tools disc in the running VM's
+DVD drive, and the desktop mounts it (`/media/$USER/VMMC_TOOLS`, or
+`/run/media/$USER/VMMC_TOOLS` on Ubuntu 26.04). Then, in a terminal:
 
 ```sh
-sudo sh /media/$USER/VMMC_TOOLS/install-linux.sh
+sudo sh "$(findmnt -nro TARGET -S LABEL=VMMC_TOOLS)/install-linux.sh"
 ```
+
+A desktop that runs software from inserted media offers to run the disc's
+`autorun.sh` instead, which runs the script through `pkexec` (asking for the user's
+password). GNOME has that off by default since GNOME 45 (Ubuntu 24.04 and later); it's
+**Removable Media** in Settings.
+
+If the guest has the old disc mounted, it's asked to let it go first, as a drive's eject
+button does (vmmc's drive reports an eject request); Ubuntu unmounts and ejects it, and
+the new disc goes in.
 
 The script installs the agent in `/usr/local/bin`, lets whoever uses the desktop open
 `/dev/ttyS1` (a udev rule), starts the agent with each desktop session
 (`/etc/xdg/autostart`), and starts it now for the user who ran it.
 
-`cargo xtask ubuntu-dnd-test` installs Ubuntu Desktop, installs the tools this way, and
-checks the clipboard and drags both ways with a GTK 4 (Wayland) program in the guest.
+The disc's Rock Ridge entries keep the scripts' names and make them runnable.
+
+`cargo xtask ubuntu-dnd-test` installs Ubuntu Desktop with the tools, checks the
+clipboard and drags both ways with a GTK 4 (Wayland) program in the guest, then takes
+the Tools disc out and puts it in again as the toolbar does: Ubuntu ejects the mounted
+disc when asked, mounts the new one, GIO sees software to run on it, and the `sudo`
+install above works.
