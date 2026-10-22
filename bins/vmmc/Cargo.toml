@@ -8,8 +8,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+agent-proto.workspace = true
 ipc.workspace = true
-slint.workspace = true
+slint = { workspace = true, features = ["raw-window-handle-06"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 vmconfig.workspace = true
@@ -17,17 +18,25 @@ vmmc-client.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 keyhook.workspace = true
+raw-window-handle = "0.6.2"
 windows = { workspace = true, features = [
+    "Win32_Graphics_Gdi",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_System_Ole",
+    "Win32_System_SystemServices",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
 ] }
+# For COM objects of the app's own (drag and drop's).
+windows-core = "0.62.2"
 
 [dev-dependencies]
 png.workspace = true
+tempfile.workspace = true
 
 [build-dependencies]
 slint-build.workspace = true

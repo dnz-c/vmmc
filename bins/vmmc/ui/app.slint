@@ -106,7 +106,8 @@ export component AppWindow inherits Window {
     in-out property <bool> right;
     in-out property <bool> middle;
     // The console's size changed (for fitting the guest to it).
-    callback console-resized(length, length);
+    // The console's place in the window (logical pixels), and its size.
+    callback console-resized(length, length, length, length);
 
     callback open-vm(string);
     callback select-tab(int);
@@ -379,9 +380,10 @@ export component AppWindow inherits Window {
                             background: black;
                             // Screen pixels per guest pixel, as the picture is scaled to fit.
                             property <float> scale: min(self.width / (root.frame-width * 1phx), self.height / (root.frame-height * 1phx));
-                            init => { root.console-resized(self.width, self.height); }
-                            changed width => { root.console-resized(self.width, self.height); }
-                            changed height => { root.console-resized(self.width, self.height); }
+                            init => { root.console-resized(self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
+                            changed width => { root.console-resized(self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
+                            changed height => { root.console-resized(self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
+                            changed absolute-position => { root.console-resized(self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
                             if !root.console-live: Text {
                                 text: "Connecting…";
                                 color: #808080;

@@ -1,6 +1,7 @@
 //! A running VM's console in the app: its shared screen, and a thread that sends input
 //! and commands down its pipe, so a slow worker never stalls the window. The thread
-//! also asks now and then what the guest copied to its clipboard.
+//! also asks now and then what the guest copied to its clipboard, and answers the calls
+//! drag and drop waits on.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -14,11 +15,20 @@ use vmconfig::Vm;
 
 /// How often the guest's clipboard is asked for.
 const CLIPBOARD_POLL: Duration = Duration::from_millis(500);
+/// How long [`Session::call`] waits for its answer.
+const CALL_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// A request for the console's thread, and where its answer goes if someone waits.
+type Queued = (Request, Option<Sender<Result<Response, String>>>);
 
 pub struct Session {
     /// The VM's file.
     pub path: PathBuf,
-    requests: Sender<Request>,
+    /// The VM, for connections of its own (a drag's files).
+    pub vm: Vm,
+    requests: Sender<Queued>,
+    /// Where the keyboard hook's keys go, into `requests`.
+    keys: Sender<Request>,
     /// What the guest copies, from the request thread.
     copied: Receiver<String>,
     section: Section,
@@ -35,8 +45,23 @@ impl Session {
     pub fn open(vm: &Vm) -> Result<Self, String> {
         let mut connection = vmmc_client::connect(vm, Duration::from_millis(500))?;
         let section = connection.screen()?;
-        let (requests, queued) = mpsc::channel::<Request>();
+        let (requests, queued) = mpsc::channel::<Queued>();
         let (copies, copied) = mpsc::channel::<String>();
+        // Keys, as plain requests, for the hook's thread.
+        let (keys, typed) = mpsc::channel::<Request>();
+        {
+            let requests = requests.clone();
+            thread::Builder::new()
+                .name("console-keys".into())
+                .spawn(move || {
+                    for key in typed {
+                        if requests.send((key, None)).is_err() {
+                            return;
+                        }
+                    }
+                })
+                .map_err(|e| e.to_string())?;
+        }
         thread::Builder::new()
             .name("console-requests".into())
             .spawn(move || {
@@ -45,9 +70,16 @@ impl Session {
                 let mut polled = Instant::now() - CLIPBOARD_POLL;
                 loop {
                     match queued.recv_timeout(CLIPBOARD_POLL) {
-                        Ok(request) => {
-                            if let Err(e) = connection.call(&request) {
-                                tracing::debug!(%e, "the VM's worker went away");
+                        Ok((request, reply)) => {
+                            let answer = connection.call(&request);
+                            let gone = answer
+                                .as_ref()
+                                .is_err_and(|e| e.starts_with("the VM's worker stopped"));
+                            if let Some(reply) = reply {
+                                let _ = reply.send(answer);
+                            }
+                            if gone {
+                                tracing::debug!("the VM's worker went away");
                                 return;
                             }
                         }
@@ -79,7 +111,9 @@ impl Session {
             .map_err(|e| e.to_string())?;
         Ok(Self {
             path: vm.path.clone(),
+            vm: vm.clone(),
             requests,
+            keys,
             copied,
             section,
             frame_seq: 0,
@@ -91,7 +125,18 @@ impl Session {
 
     /// Sends a request; false once the worker is gone.
     pub fn send(&self, request: Request) -> bool {
-        self.requests.send(request).is_ok()
+        self.requests.send((request, None)).is_ok()
+    }
+
+    /// Sends a request and waits (a little) for its answer.
+    pub fn call(&self, request: Request) -> Result<Response, String> {
+        let (reply, answer) = mpsc::channel();
+        self.requests
+            .send((request, Some(reply)))
+            .map_err(|_| "the VM's worker went away".to_owned())?;
+        answer
+            .recv_timeout(CALL_TIMEOUT)
+            .map_err(|_| "the VM's worker didn't answer".to_owned())?
     }
 
     /// The text the guest copied last, if it copied something since this was asked.
@@ -101,7 +146,7 @@ impl Session {
 
     /// Where keys go, for the keyboard hook.
     pub fn sender(&self) -> Sender<Request> {
-        self.requests.clone()
+        self.keys.clone()
     }
 
     /// A new picture, if the guest drew one.

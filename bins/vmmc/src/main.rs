@@ -10,6 +10,8 @@
 mod clipboard;
 mod console;
 mod dialogs;
+#[cfg(windows)]
+mod dnd;
 #[cfg(test)]
 mod snapshots;
 
@@ -93,6 +95,19 @@ struct App {
     released: Arc<AtomicBool>,
     /// The host clipboard's sequence number the console's guest has (or set itself).
     clipboard_seen: Option<u32>,
+    /// The console's place in the window and its size, in logical pixels.
+    console_area: Option<((f32, f32), (f32, f32))>,
+    /// Whether the window's drop target is in place.
+    #[cfg(windows)]
+    drop_target: bool,
+    /// A drag from the host over the window.
+    #[cfg(windows)]
+    incoming: Option<dnd::Incoming>,
+    #[cfg(windows)]
+    outgoing: dnd::Outgoing,
+    /// Drags' transfers, for the status bar.
+    #[cfg(windows)]
+    transfers: Vec<dnd::Shown>,
 }
 
 type Shared = Rc<RefCell<App>>;
@@ -126,7 +141,18 @@ fn run() -> Result<(), String> {
         capture: Arc::new(AtomicBool::new(false)),
         released: Arc::new(AtomicBool::new(false)),
         clipboard_seen: None,
+        console_area: None,
+        #[cfg(windows)]
+        drop_target: false,
+        #[cfg(windows)]
+        incoming: None,
+        #[cfg(windows)]
+        outgoing: dnd::Outgoing::Idle,
+        #[cfg(windows)]
+        transfers: Vec::new(),
     }));
+    #[cfg(windows)]
+    dnd::clean_staging();
     window.set_os_labels(strings(PRESETS.iter().map(|p| p.label)));
     window.set_editions(strings(media_editions()));
     reload(&app);
@@ -485,6 +511,8 @@ fn close_console(state: &mut App, window: &AppWindow) {
 
 /// Shows the current console's newest picture and cursor, and fits the guest.
 fn frame(app: &Shared) {
+    #[cfg(windows)]
+    drags(app);
     let mut state = app.borrow_mut();
     let Some(window) = state.window.upgrade() else {
         return;
@@ -575,6 +603,26 @@ fn frame(app: &Shared) {
                 height: size.1,
             });
         }
+    }
+}
+
+/// Drag and drop's part of each frame: the window's drop target once it exists, a drag
+/// out of the guest that's being looked for, and the transfers in the status bar.
+#[cfg(windows)]
+fn drags(app: &Shared) {
+    let Some(window) = app.borrow().window.upgrade() else {
+        return;
+    };
+    if !app.borrow().drop_target && dnd::register(app, &window) {
+        app.borrow_mut().drop_target = true;
+    }
+    if matches!(app.borrow().outgoing, dnd::Outgoing::Probing(_)) {
+        dnd::poll_probe(app, &window);
+    }
+    let mut state = app.borrow_mut();
+    if !state.transfers.is_empty() {
+        let text = dnd::status(&mut state.transfers).unwrap_or_default();
+        window.set_status_text(text.into());
     }
 }
 
@@ -799,11 +847,25 @@ fn wire(window: &AppWindow, app: &Shared) {
                     window.set_fullscreen_bar(false);
                 }
             }
+            let frame = match app.borrow().console.as_ref() {
+                Some(console) => console.frame,
+                None => return,
+            };
+            let at = console::tablet_position(x, y, (width, height), frame);
+            // Past the console's edge with the button held: maybe a drag out of the
+            // guest, which takes the pointer from the guest while it's looked into.
+            #[cfg(windows)]
+            if let Some(window) = w.upgrade() {
+                let outside = x < 0.0 || y < 0.0 || x >= width || y >= height;
+                if dnd::pointer_left(&app, &window, outside, left, at) {
+                    return;
+                }
+            }
             let state = app.borrow();
             let Some(console) = state.console.as_ref() else {
                 return;
             };
-            let (x, y) = console::tablet_position(x, y, (width, height), console.frame);
+            let (x, y) = at;
             let buttons = u8::from(left) | (u8::from(right) << 1) | (u8::from(middle) << 2);
             console.send(Request::Pointer {
                 x,
@@ -815,9 +877,10 @@ fn wire(window: &AppWindow, app: &Shared) {
     }
     {
         let app = app.clone();
-        window.on_console_resized(move |width, height| {
+        window.on_console_resized(move |x, y, width, height| {
             let size = (width.max(0.0) as u32, height.max(0.0) as u32);
             let mut state = app.borrow_mut();
+            state.console_area = Some(((x, y), (width, height)));
             if state.console_size.map(|(s, _)| s) != Some(size) {
                 state.console_size = Some((size, Instant::now()));
             }
