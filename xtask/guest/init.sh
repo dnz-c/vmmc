@@ -26,17 +26,27 @@ else
 fi
 echo "VMMC-TEST: dmi=$(cat /sys/class/dmi/id/product_name 2>/dev/null)"
 
-# The scratch disk: virtio-blk when booted directly, the second NVMe namespace when
-# booted through UEFI from NVMe (the first holds the EFI system partition), or a SATA
-# disk when booted from CD. Drivers probe in the background, so give the disk a few
-# seconds to appear.
+# The scratch disk: virtio-blk when booted directly, NVMe namespace 2 when booted
+# through UEFI from NVMe (namespace 1 holds the EFI system partition), or a SATA disk
+# when booted from CD. Linux names namespaces in the order it finds them, which varies
+# (nvme0n2 may be namespace 1), so namespace 2 is found by its ID. Drivers probe in the
+# background, so give the disk a few seconds to appear.
+nvme_namespace_2() {
+    for namespace in /sys/block/nvme0n*; do
+        [ "$(cat "$namespace/nsid" 2>/dev/null)" = 2 ] && echo "/dev/${namespace##*/}"
+    done
+}
 disk=
 for _ in $(seq 50); do
-    for candidate in /dev/vda /dev/nvme0n2 /dev/sda; do
+    for candidate in /dev/vda $(nvme_namespace_2) /dev/sda; do
         [ -b "$candidate" ] && disk=$candidate && break 2
     done
     sleep 0.1
 done
+case $disk in
+/dev/nvme*) disk_name="nvme namespace 2" ;;
+*) disk_name=${disk#/dev/} ;;
+esac
 
 # Booted from CD (vmmc.cd): the disc must also be readable as ISO 9660 with Joliet.
 if grep -q vmmc.cd /proc/cmdline; then
@@ -76,9 +86,9 @@ disk_round_trip() {
 if [ -z "$disk" ]; then
     echo "VMMC-TEST: disk=missing"
 elif disk_round_trip; then
-    echo "VMMC-TEST: disk=ok ${disk#/dev/}"
+    echo "VMMC-TEST: disk=ok $disk_name"
 else
-    echo "VMMC-TEST: disk=FAILED ${disk#/dev/}"
+    echo "VMMC-TEST: disk=FAILED $disk_name"
 fi
 
 # USB (vmmc.usb): the xHCI's tablet and keyboard, by their pid.codes IDs.

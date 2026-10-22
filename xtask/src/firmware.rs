@@ -35,7 +35,7 @@ pub(crate) const LINUX_MARKERS: [&str; 9] = [
     "VMMC-TEST: cpus=4",
     "VMMC-TEST: efi=yes",
     "VMMC-TEST: dmi=vmmc Virtual Machine",
-    "VMMC-TEST: disk=ok nvme0n2",
+    "VMMC-TEST: disk=ok nvme namespace 2",
     "VMMC-TEST: tpm=2 pcr0=measured ppi=1.3",
     "VMMC-TEST: net=ok",
     "VMMC-TEST: dns=ok",
