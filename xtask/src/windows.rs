@@ -60,6 +60,15 @@ pub(crate) const RESOLUTION: &str = "1920x1080";
 /// Boots the Windows a test named `name` installed, from its disk alone, with the
 /// debug console saved to `log`.
 pub(crate) fn boot_installed(name: &str, log: &Path) -> Result<Session, String> {
+    boot_installed_with(name, log, &[])
+}
+
+/// [`boot_installed`], with more of vmmc-vmx's options.
+pub(crate) fn boot_installed_with(
+    name: &str,
+    log: &Path,
+    extra: &[std::ffi::OsString],
+) -> Result<Session, String> {
     let workspace = workspace();
     let native = native::fetch(&workspace)?;
     let exe = build_vmmc_vmx(&workspace)?;
@@ -81,7 +90,8 @@ pub(crate) fn boot_installed(name: &str, log: &Path) -> Result<Session, String> 
         .arg("--screenshot")
         .arg(dir.join("screens"))
         .arg("--firmware-log")
-        .arg(log);
+        .arg(log)
+        .args(extra);
     eprintln!("$ {command:?}");
     Session::spawn(command)
 }

@@ -1,0 +1,23 @@
+[package]
+name = "vmmc-agent"
+description = "vmmc's agent for Linux guests: the clipboard, and drag and drop"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+publish = false
+
+# Built for the guest, static (x86_64-unknown-linux-musl, linked with rust-lld), by
+# `cargo xtask guest-drivers`: apart from the host's workspace.
+[workspace]
+
+[dependencies]
+agent-proto = { path = "../../../crates/agent-proto" }
+libc = "0.2.191"
+x11rb = { version = "0.14.0", default-features = false, features = ["xfixes"] }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+strip = true

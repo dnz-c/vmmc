@@ -1,0 +1,111 @@
+#cloud-config
+# Ubuntu Desktop autoinstall for `cargo xtask ubuntu-dnd-test`, read by cloud-init from
+# the CIDATA disc. The installed system logs vmmc on by itself, installs vmmc Tools from
+# their disc at its first boot, and at each logon runs the script on the test disc,
+# which is mounted at /mnt/vmmc-test.
+autoinstall:
+  version: 1
+  early-commands:
+    - "echo 'VMMC-DND: autoinstall' > /dev/ttyS0"
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+  timezone: Etc/UTC
+  identity:
+    realname: vmmc
+    hostname: vmmc-ubuntu
+    username: vmmc
+    # "vmmc": a throwaway test VM.
+    password: "$6$vmmctestsalt$B7N3MJ/x3lLqhX2rs30Dz8iS8q79bqX3Vw./58DiO4M1XdNPy.Hz40KUmmtfKBq0Ezho5VGSPSZ.QV.eQTMmh/"
+  storage:
+    layout:
+      name: direct
+  refresh-installer:
+    update: false
+  codecs:
+    install: false
+  drivers:
+    install: false
+  late-commands:
+    # Logs on by itself, with nothing on the way: no welcome, no screen lock.
+    - |
+      mkdir -p /target/etc/gdm3
+      cat > /target/etc/gdm3/custom.conf <<'EOF'
+      [daemon]
+      AutomaticLoginEnable=true
+      AutomaticLogin=vmmc
+      EOF
+    - |
+      mkdir -p /target/home/vmmc/.config
+      echo yes > /target/home/vmmc/.config/gnome-initial-setup-done
+      chroot /target chown -R vmmc:vmmc /home/vmmc/.config
+    - |
+      mkdir -p /target/etc/dconf/profile /target/etc/dconf/db/local.d
+      printf 'user-db:user\nsystem-db:local\n' > /target/etc/dconf/profile/user
+      cat > /target/etc/dconf/db/local.d/00-vmmc-test <<'EOF'
+      [org/gnome/desktop/session]
+      idle-delay=uint32 0
+      [org/gnome/desktop/screensaver]
+      lock-enabled=false
+      [org/gnome/settings-daemon/plugins/power]
+      sleep-inactive-ac-type='nothing'
+      EOF
+      chroot /target dconf update
+    # The power button powers off at once, whatever GNOME would rather do.
+    - |
+      mkdir -p /target/etc/systemd/logind.conf.d
+      printf '[Login]\nHandlePowerKey=poweroff\nPowerKeyIgnoreInhibited=yes\n' > /target/etc/systemd/logind.conf.d/vmmc-test.conf
+    # COM1, for the test's reports.
+    - chroot /target usermod -aG dialout vmmc
+    # The test disc, when there is one.
+    - mkdir -p /target/mnt/vmmc-test
+    - "echo 'LABEL=VMMC_TEST /mnt/vmmc-test iso9660 ro,nofail,x-systemd.device-timeout=5s 0 0' >> /target/etc/fstab"
+    - |
+      cat > /target/usr/local/bin/vmmc-test-hook <<'EOF'
+      #!/bin/sh
+      # At each logon: the test disc's script, if a test disc is in.
+      echo "VMMC-DND: session $XDG_SESSION_TYPE" > /dev/ttyS0
+      if [ -f /mnt/vmmc-test/vmmc-test.sh ]; then
+          exec sh /mnt/vmmc-test/vmmc-test.sh
+      fi
+      EOF
+      chmod 755 /target/usr/local/bin/vmmc-test-hook
+      mkdir -p /target/etc/xdg/autostart
+      cat > /target/etc/xdg/autostart/vmmc-test.desktop <<'EOF'
+      [Desktop Entry]
+      Type=Application
+      Name=vmmc test
+      Exec=/usr/local/bin/vmmc-test-hook
+      NoDisplay=true
+      EOF
+    # vmmc Tools, from their disc, at the first boot, before anyone logs on.
+    - |
+      cat > /target/usr/local/sbin/vmmc-install-tools <<'EOF'
+      #!/bin/sh
+      mkdir -p /mnt/vmmc-tools
+      mount -o ro LABEL=VMMC_TOOLS /mnt/vmmc-tools
+      if sh /mnt/vmmc-tools/install-linux.sh > /dev/ttyS0 2>&1; then
+          echo "VMMC-DND: tools=ok" > /dev/ttyS0
+      else
+          echo "VMMC-DND: tools=failed" > /dev/ttyS0
+      fi
+      umount /mnt/vmmc-tools
+      systemctl disable vmmc-install-tools.service
+      EOF
+      chmod 755 /target/usr/local/sbin/vmmc-install-tools
+      cat > /target/etc/systemd/system/vmmc-install-tools.service <<'EOF'
+      [Unit]
+      Description=vmmc test: install vmmc Tools from their disc
+      Before=display-manager.service
+      After=local-fs.target systemd-udev-settle.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/vmmc-install-tools
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      ln -s /etc/systemd/system/vmmc-install-tools.service /target/etc/systemd/system/multi-user.target.wants/vmmc-install-tools.service
+    - "echo 'VMMC-DND: installed' > /dev/ttyS0"
+  shutdown: poweroff

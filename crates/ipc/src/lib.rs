@@ -5,11 +5,16 @@
 //!   A connection starts with [`Request::Hello`], whose versions must match.
 //! - **Screen:** the worker shares a memory section holding the guest's picture and
 //!   cursor ([`screen`]); a client gets it with [`Request::Screen`].
+//! - **Drag and drop:** through vmmc's agent in the guest (see the `agent_proto`
+//!   crate). A drag into the guest is [`Request::DragEnter`] and its moves, its files
+//!   following in [`Request::SendChunks`] on a connection of their own; one out of the
+//!   guest starts with [`Request::ProbeGuestDrag`], and its files come back through
+//!   [`Request::ReceiveChunks`].
 
-#[cfg(windows)]
-pub mod clipboard;
 pub mod pipe;
 pub mod screen;
+
+pub use agent_proto::{Chunk, Item, clipboard};
 
 use std::io::{self, Read, Write};
 
@@ -17,7 +22,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// The protocol version; both ends must speak the same one.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 /// No message is larger.
 pub const MAX_MESSAGE: usize = 1 << 20;
 
@@ -83,6 +88,65 @@ pub enum Request {
     GuestClipboard {
         since: u64,
     },
+    /// A drag from the host came onto the console at `x, y` (tablet coordinates, as
+    /// [`Request::Pointer`]'s), with these items: answered with [`Response::Drag`].
+    /// The worker drives the guest's pointer from here until the drag drops or leaves.
+    DragEnter {
+        items: Vec<Item>,
+        x: u32,
+        y: u32,
+    },
+    /// The host's drag moved.
+    DragMove {
+        drag: u32,
+        x: u32,
+        y: u32,
+    },
+    /// The host's drag dropped at `x, y`. The guest drops there once it has the files.
+    DragDrop {
+        drag: u32,
+        x: u32,
+        y: u32,
+    },
+    /// The host's drag left the console, or was called off.
+    DragLeave {
+        drag: u32,
+    },
+    /// How a drag into the guest is going: answered with [`Response::DragState`].
+    DragState {
+        drag: u32,
+    },
+    /// More of a drag's files (its transfer is the drag's number). Answered with
+    /// [`Response::Done`] once the worker has room for them, which may take a while;
+    /// an error means the transfer is over.
+    SendChunks {
+        transfer: u32,
+        chunks: Vec<Chunk>,
+    },
+    /// The guest's left button is held and the host's pointer left the console at
+    /// `x, y`: is a drag going on in the guest? Answered with [`Response::Probe`].
+    ProbeGuestDrag {
+        x: u32,
+        y: u32,
+    },
+    /// What a probe found: answered with [`Response::GuestDrag`].
+    GuestDrag {
+        probe: u32,
+    },
+    /// Starts fetching the files of the drag a probe found: answered with
+    /// [`Response::Transfer`].
+    ReceiveFiles {
+        probe: u32,
+    },
+    /// A transfer's next chunks, waiting a moment for some: answered with
+    /// [`Response::Chunks`] (none yet, if it's empty), or an error once it's over.
+    ReceiveChunks {
+        transfer: u32,
+    },
+    /// Calls a transfer off.
+    CancelTransfer {
+        transfer: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,7 +177,58 @@ pub enum Response {
         seq: u64,
         text: Option<String>,
     },
+    /// A drag into the guest began: its number.
+    Drag {
+        drag: u32,
+    },
+    DragState(DragState),
+    /// A probe began: its number.
+    Probe {
+        probe: u32,
+    },
+    GuestDrag(GuestDrag),
+    /// A transfer began: its number.
+    Transfer {
+        transfer: u32,
+    },
+    Chunks(Vec<Chunk>),
     Error(String),
+}
+
+/// How a drag into the guest is going.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DragState {
+    /// The guest's agent is getting ready.
+    Arming,
+    /// The drag is in the guest, following the host's.
+    InGuest,
+    /// The host dropped; the guest drops once it has all the files.
+    Dropping,
+    /// Over: the guest dropped the files somewhere, or not.
+    Finished {
+        dropped: bool,
+    },
+    Failed(String),
+}
+
+/// What a probe found.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GuestDrag {
+    /// Still looking.
+    Looking,
+    /// A drag of these items: the guest's button is let go, and the host can take over.
+    Files(Vec<Item>),
+    /// No drag of files.
+    Nothing,
+}
+
+/// vmmc's agent in the guest, once it has said hello.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Agent {
+    /// `windows` or `linux`.
+    pub os: String,
+    /// What it does: `agent_proto::features` bits.
+    pub features: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +238,7 @@ pub struct Status {
     pub sandbox: String,
     /// The guest's picture, if it shows one.
     pub screen: Option<(u32, u32)>,
+    pub agent: Option<Agent>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

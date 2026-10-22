@@ -10,7 +10,7 @@
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -220,6 +220,8 @@ pub struct Targets {
     /// The VM's file as it is now (a snapshot changes its disks), if it has one.
     vm: Arc<Mutex<Option<vmconfig::Vm>>>,
     restart: Arc<Mutex<Option<Restart>>>,
+    /// How many machines have run: each guest reset makes a new one.
+    generation: Arc<AtomicU64>,
 }
 
 impl Targets {
@@ -362,7 +364,15 @@ impl Targets {
     }
 
     pub fn set(&self, target: Option<Target>) {
+        if target.is_some() {
+            self.generation.fetch_add(1, Ordering::Relaxed);
+        }
         *self.current.lock().unwrap_or_else(PoisonError::into_inner) = target;
+    }
+
+    /// Which machine is running (or ran last): it changes with each new one.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
 
     pub fn get(&self) -> Option<Target> {
@@ -406,10 +416,7 @@ fn input_source() -> InputSource {
 
 /// Forwards stdin to the current machine on a background thread until the user quits
 /// or stdin closes. The thread is never joined: a blocked read can't be interrupted.
-pub fn spawn_input(
-    targets: Targets,
-    clipboard: Arc<crate::clipboard::Clipboard>,
-) -> io::Result<()> {
+pub fn spawn_input(targets: Targets, agent: Arc<crate::agent::Agent>) -> io::Result<()> {
     thread::Builder::new()
         .name("console-input".into())
         .spawn(move || {
@@ -458,7 +465,7 @@ pub fn spawn_input(
                             }
                         }
                         Input::Clipboard(text) => {
-                            clipboard.put_in_guest(&text);
+                            agent.put_in_guest(&text);
                             eprint!(
                                 "\r\nvmmc-vmx: put {} characters on the guest's clipboard\r\n",
                                 text.chars().count()

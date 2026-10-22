@@ -67,6 +67,7 @@ use devices::virtio::net::VirtioNet;
 use devices::virtio::pci::{CONFIG_BAR, CONFIG_BAR_SIZE, MSIX_BAR, MSIX_BAR_SIZE, VirtioPci};
 use devices::{PowerEvent, PowerHandler};
 use hv::{Hypervisor, LocalApicMode, Partition, PartitionConfig};
+pub use net::{LocalService, LocalStream};
 use net::{Nat, NatConfig};
 use vm_core::{BusDevice, StopHandle, StopReason, Vm, VmExit, VmVcpu};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
@@ -192,6 +193,9 @@ pub struct MachineConfig {
     /// Where the guest's second serial port (COM2) writes: vmmc's agent in the guest
     /// talks to the host there.
     pub agent_output: Box<dyn Write + Send>,
+    /// A port on each network adapter's gateway that the host answers in-process: where
+    /// vmmc's agent sends files.
+    pub nat_service: Option<net::LocalService>,
     /// Boot this firmware. Without it, load a kernel with [`Machine::load_linux`].
     pub firmware: Option<FirmwareConfig>,
     /// A TPM 2.0, behind a CRB. It outlives the machine: each new machine resets it,
@@ -619,13 +623,17 @@ impl<P: Partition + 'static> Machine<P> {
                 next_virtio_slot = slot + 1;
             }
             let mut e1000e_added = false;
+            let nat_config = || NatConfig {
+                service: config.nat_service.clone(),
+                ..NatConfig::default()
+            };
             for nic in &config.nics {
                 match nic.model {
                     NicModel::Virtio => {
                         let mut device = VirtioNet::new(nic.mac);
                         let receiver = device.receiver();
-                        let nat = Nat::start(NatConfig::default(), Arc::new(receiver))
-                            .map_err(Error::Thread)?;
+                        let nat =
+                            Nat::start(nat_config(), Arc::new(receiver)).map_err(Error::Thread)?;
                         device.set_backend(Arc::new(nat));
                         let mut pci =
                             VirtioPci::new(Box::new(device), vm.memory().clone(), sink.clone());
@@ -652,8 +660,8 @@ impl<P: Partition + 'static> Machine<P> {
                         let mut device =
                             E1000e::new(nic.mac, vm.memory().clone(), sink.clone(), Some(intx));
                         let receiver = device.receiver();
-                        let nat = Nat::start(NatConfig::default(), Arc::new(receiver))
-                            .map_err(Error::Thread)?;
+                        let nat =
+                            Nat::start(nat_config(), Arc::new(receiver)).map_err(Error::Thread)?;
                         device.set_backend(Arc::new(nat));
                         if direct_boot {
                             device

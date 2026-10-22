@@ -12,7 +12,7 @@
 //! `--no-reboot`, 3 on a triple fault, 1 on any error. Ctrl-A p presses the ACPI power
 //! button, Ctrl-A r prints each vCPU's registers, and Ctrl-A m saves guest RAM.
 
-mod clipboard;
+mod agent;
 mod console;
 #[cfg(windows)]
 mod install;
@@ -176,6 +176,10 @@ struct RunArgs {
     /// configured as it was then, with its disks as they were.
     #[arg(long, value_name = "FILE")]
     restore: Option<PathBuf>,
+    /// Also serve the control pipe, as `serve` does, as `\\.\pipe\vmmc-ID`: for tests
+    /// that drive the VM as the app does while watching its console.
+    #[arg(long, value_name = "ID")]
+    pipe_id: Option<String>,
 }
 
 /// Where a build keeps the firmware: next to the program, or in `target\native` for
@@ -556,25 +560,22 @@ fn run(args: RunArgs, frontend: Frontend) -> Result<RunOutcome, Box<dyn Error>> 
     };
     let targets = console::Targets::new(screenshots.clone(), args.save_state.clone());
     targets.set_vm(args.loaded.clone());
-    // Shared with vmmc's agent in the guest, through whichever machine runs.
-    let clipboard = clipboard::Clipboard::start(
-        {
-            let targets = targets.clone();
-            move || targets.get().map(|target| target.agent)
-        },
-        frontend == Frontend::Console,
-    )?;
+    // vmmc's agent in the guest, through whichever machine runs.
+    let agent = agent::Agent::start(targets.clone(), frontend == Frontend::Console)?;
     let _raw = match frontend {
         Frontend::Console => {
             let raw = console::RawConsole::enable();
-            console::spawn_input(targets.clone(), clipboard.clone())?;
+            console::spawn_input(targets.clone(), agent.clone())?;
+            if let Some(id) = &args.pipe_id {
+                serve::start(targets.clone(), agent.clone(), "test", id)?;
+            }
             Some(raw)
         }
         Frontend::Pipe => {
             let vm = args.loaded.as_ref().ok_or("serve needs --vm")?;
             serve::start(
                 targets.clone(),
-                clipboard.clone(),
+                agent.clone(),
                 &vm.config.name,
                 &vm.config.uuid,
             )?;
@@ -626,7 +627,7 @@ fn run(args: RunArgs, frontend: Frontend) -> Result<RunOutcome, Box<dyn Error>> 
             &nics,
             tpm.as_ref(),
             &vm_targets,
-            &clipboard,
+            &agent,
             vm_screenshots.as_deref(),
         )
         .map_err(|e| e.to_string())
@@ -662,7 +663,7 @@ fn run_machines(
     nics: &[NicConfig],
     tpm: Option<&SharedTpm>,
     targets: &console::Targets,
-    clipboard: &Arc<clipboard::Clipboard>,
+    agent: &Arc<agent::Agent>,
     screenshots: Option<&screenshot::Screenshots>,
 ) -> Result<RunOutcome, Box<dyn Error>> {
     use machine::{Machine, MachineConfig};
@@ -701,7 +702,8 @@ fn run_machines(
                     Some(installer) => installer.tap(Box::new(console::ConsoleOutput)),
                     None => Box::new(console::ConsoleOutput),
                 },
-                agent_output: clipboard.sink(),
+                agent_output: agent.sink(),
+                nat_service: Some(agent.service()),
                 firmware: boot.firmware_config()?,
                 tpm: tpm.cloned(),
                 enlightenments: !args.no_enlightenments,

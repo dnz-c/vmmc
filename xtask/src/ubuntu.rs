@@ -159,52 +159,63 @@ fn powered_off(vm: &mut Session, what: &str) -> Result<(), String> {
     }
 }
 
-pub fn test() -> Result<(), String> {
-    let ubuntu_iso = fetch_iso()?;
+/// The command that boots test `name`'s Ubuntu from its disk (the image directory's
+/// `NAME-disk.vmdk`), its state in `target/NAME/vm`, screenshots every 30 s in
+/// `target/NAME/SCREENS`.
+pub(crate) fn machine(name: &str, screens: &str) -> Result<Command, String> {
     let workspace = workspace();
     let native = native::fetch(&workspace)?;
     let exe = build_vmmc_vmx(&workspace)?;
-    let dir = workspace.join("target").join("ubuntu-desktop-test");
+    let dir = workspace.join("target").join(name);
+    let disk = crate::image_dir()?.join(format!("{name}-disk.vmdk"));
+    let mut command = Command::new(&exe);
+    command
+        .arg("run")
+        .arg("--firmware")
+        .arg(native.join("OVMF_CODE.fd"))
+        .arg("--vars-template")
+        .arg(native.join("OVMF_VARS.secboot.fd"))
+        .arg("--vm-dir")
+        .arg(dir.join("vm"))
+        .arg("--disk")
+        .arg(format!("{},nvme", disk.display()))
+        .args(["--cpus", CPUS, "--memory", MEMORY_MIB])
+        .arg("--screenshot")
+        .arg(dir.join(screens))
+        .args(["--screenshot-every", "30"]);
+    Ok(command)
+}
+
+/// Installs Ubuntu Desktop for test `name` onto a new disk, with `user_data` (cloud-init
+/// autoinstall) on its CIDATA disc, whose early and late commands write `started` and
+/// `installed` to COM1. Passes once the installer powers the VM off.
+pub(crate) fn install(
+    name: &str,
+    user_data: &str,
+    started: &str,
+    installed: &str,
+) -> Result<(), String> {
+    let ubuntu_iso = fetch_iso()?;
+    let dir = workspace().join("target").join(name);
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).map_err(|e| format!("can't create {}: {e}", dir.display()))?;
-
-    // The guest fetches a page from this through the NAT's gateway on its first boot.
-    let http = crate::serve_http()?;
     let seed = dir.join("cidata.iso");
+    let meta = format!("instance-id: vmmc-{name}\n");
     let disc = iso::build(
         "CIDATA",
         &[
-            ("user-data", user_data(http).as_bytes()),
-            ("meta-data", b"instance-id: vmmc-ubuntu-desktop-test\n"),
+            ("user-data", user_data.as_bytes()),
+            ("meta-data", meta.as_bytes()),
         ],
         None,
     );
     fs::write(&seed, disc).map_err(|e| format!("can't write {}: {e}", seed.display()))?;
-    let disk = crate::image_dir()?.join("ubuntu-desktop-test-disk.vmdk");
+    let disk = crate::image_dir()?.join(format!("{name}-disk.vmdk"));
     let _ = fs::remove_file(&disk);
     disk::create_sparse(&disk, DISK_SIZE)
         .map_err(|e| format!("can't create {}: {e}", disk.display()))?;
 
-    let machine = |screens: &str| {
-        let mut command = Command::new(&exe);
-        command
-            .arg("run")
-            .arg("--firmware")
-            .arg(native.join("OVMF_CODE.fd"))
-            .arg("--vars-template")
-            .arg(native.join("OVMF_VARS.secboot.fd"))
-            .arg("--vm-dir")
-            .arg(dir.join("vm"))
-            .arg("--disk")
-            .arg(format!("{},nvme", disk.display()))
-            .args(["--cpus", CPUS, "--memory", MEMORY_MIB])
-            .arg("--screenshot")
-            .arg(dir.join(screens))
-            .args(["--screenshot-every", "30"]);
-        command
-    };
-
-    let mut install = machine("screens");
+    let mut install = machine(name, "screens")?;
     install
         .arg("--cdrom")
         .arg(&ubuntu_iso)
@@ -216,7 +227,7 @@ pub fn test() -> Result<(), String> {
         dir.join("screens").display()
     );
     let mut vm = Session::spawn(install)?;
-    let installed = (|| {
+    let result = (|| {
         vm.expect(GRUB_MENU, 0, MENU_TIMEOUT)?;
         // GRUB's command line rather than the menu entry, so the kernel gets ours.
         vm.send("c")?;
@@ -227,18 +238,30 @@ pub fn test() -> Result<(), String> {
                 at = vm.expect("grub>", at, Duration::from_secs(60))?;
             }
         }
-        at = vm.expect("VMMC-UBUNTU: autoinstall", at, LIVE_TIMEOUT)?;
-        vm.expect("VMMC-UBUNTU: installed", at, INSTALL_TIMEOUT)?;
+        at = vm.expect(started, at, LIVE_TIMEOUT)?;
+        vm.expect(installed, at, INSTALL_TIMEOUT)?;
         powered_off(&mut vm, "installing")
     })();
     report(&vm);
-    if let Err(e) = installed {
+    if result.is_err() {
         vm.dump_state();
         vm.kill();
-        return Err(e);
     }
+    result
+}
 
-    let mut first_boot = machine("screens-first-boot");
+pub fn test() -> Result<(), String> {
+    const NAME: &str = "ubuntu-desktop-test";
+    // The guest fetches a page from this through the NAT's gateway on its first boot.
+    let http = crate::serve_http()?;
+    install(
+        NAME,
+        &user_data(http),
+        "VMMC-UBUNTU: autoinstall",
+        "VMMC-UBUNTU: installed",
+    )?;
+
+    let mut first_boot = machine(NAME, "screens-first-boot")?;
     first_boot.args(["--nic", "e1000e"]);
     eprintln!("$ {first_boot:?}");
     let mut vm = Session::spawn(first_boot)?;

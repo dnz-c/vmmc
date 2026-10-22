@@ -1,6 +1,7 @@
 //! Developer tasks: `cargo xtask <task>`.
 
 mod cpio;
+mod dnd;
 mod drivers;
 mod easy_install;
 mod esp;
@@ -44,6 +45,11 @@ tasks:
   win-display-test
                 install Windows with Secure Boot off and test signing on, install the
                 display driver and check that the resolution changes ($VMMC_WIN11_ISO)
+  win-dnd-test  drag files into a Windows guest and out of it through vmmc's agent
+                (installs Windows from $VMMC_WIN11_ISO the first time)
+  ubuntu-dnd-test
+                the clipboard both ways, and drags into and out of Ubuntu Desktop
+                through vmmc's Linux agent (installs Ubuntu the first time, 15-60 min)
   win-perf [RUNS]
                 boot the Windows win11-test installed RUNS times (3) each without and
                 with Hyper-V enlightenments, in a release build, and compare timings
@@ -107,6 +113,8 @@ fn main() -> ExitCode {
             drivers::build(env::args().any(|arg| arg == "--trace")).map(|_| ())
         }
         Some("win-display-test") => drivers::display_test(),
+        Some("win-dnd-test") => dnd::win_test(),
+        Some("ubuntu-dnd-test") => dnd::ubuntu_test(),
         Some("win-perf") => match env::args().nth(2).map(|runs| runs.parse::<usize>()) {
             None => perf::test(3),
             Some(Ok(runs)) if runs > 0 => perf::test(runs),

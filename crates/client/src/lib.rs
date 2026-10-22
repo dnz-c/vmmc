@@ -8,6 +8,7 @@
 pub mod host;
 #[cfg(windows)]
 pub mod sandbox;
+pub mod transfer;
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -68,9 +69,16 @@ impl Connection {
 /// Connects to the worker of `vm`, if it's running, waiting up to `timeout`.
 #[cfg(windows)]
 pub fn connect(vm: &Vm, timeout: Duration) -> Result<Connection, String> {
-    let path = ipc::pipe::pipe_path(&vm.config.uuid);
-    let pipe = ipc::pipe::connect(&path, timeout)
-        .map_err(|e| format!("{} isn't running ({e})", vm.config.name))?;
+    connect_id(&vm.config.uuid, timeout)
+        .map_err(|e| format!("{} isn't running ({e})", vm.config.name))
+}
+
+/// Connects to the worker serving `\\.\pipe\vmmc-<id>` (a VM's UUID, or the
+/// `--pipe-id` of a test's `vmmc-vmx run`), waiting up to `timeout`.
+#[cfg(windows)]
+pub fn connect_id(id: &str, timeout: Duration) -> Result<Connection, String> {
+    let path = ipc::pipe::pipe_path(id);
+    let pipe = ipc::pipe::connect(&path, timeout).map_err(|e| e.to_string())?;
     hello(pipe)
 }
 
@@ -220,7 +228,10 @@ pub fn insert_tools(vm: &Vm) -> Result<String, String> {
                 e
             }
         })?;
-    let mut text = "The vmmc Tools disc is in the VM's DVD drive. In Windows, open it (AutoPlay offers it, or open the drive in Explorer) and run setup; it asks for administrator rights.".to_owned();
+    if !vm.config.os.starts_with("windows") {
+        return Ok("The vmmc Tools disc is in the VM's DVD drive. In the guest, open a terminal and run:\n\nsudo sh /media/$USER/VMMC_TOOLS/install-linux.sh\n\nThat installs vmmc's agent, which shares the clipboard with the host and lets you drag files between the host and the guest.".to_owned());
+    }
+    let mut text = "The vmmc Tools disc is in the VM's DVD drive. In Windows, open it (AutoPlay offers it, or open the drive in Explorer) and run setup; it asks for administrator rights. It installs vmmc's agent, which shares the clipboard with the host and lets you drag files between the host and the guest.".to_owned();
     if vm.config.firmware.secure_boot {
         text += "\n\nSecure Boot is on in this VM, and vmmc's display driver isn't signed by Microsoft yet, so Windows won't load it: setup will say so. To use it now, shut the VM down, turn Secure Boot off in its settings, start it, and run setup again.";
     } else {

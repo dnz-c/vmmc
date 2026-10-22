@@ -390,16 +390,25 @@ impl Session {
         thread::spawn(move || {
             let mut chunk = [0u8; 4096];
             let mut plain = PlainText::default();
+            // A character a read cut in two, until the rest comes.
+            let mut partial = Vec::new();
             while let Ok(read @ 1..) = stdout.read(&mut chunk) {
                 // Flushed, so prompts without a newline show up in the log too.
                 let mut echo = std::io::stdout().lock();
                 let _ = echo.write_all(&chunk[..read]).and_then(|()| echo.flush());
                 drop(echo);
-                let text = plain.filter(&chunk[..read]);
+                partial.extend(plain.filter(&chunk[..read]));
+                let whole = match std::str::from_utf8(&partial) {
+                    Ok(_) => partial.len(),
+                    // Cut short at the end: the rest waits for the next read.
+                    Err(e) if e.error_len().is_none() => e.valid_up_to(),
+                    Err(_) => partial.len(),
+                };
                 collected
                     .lock()
                     .unwrap()
-                    .push_str(&String::from_utf8_lossy(&text));
+                    .push_str(&String::from_utf8_lossy(&partial[..whole]));
+                partial.drain(..whole);
             }
             ending.store(true, Ordering::Release);
         });

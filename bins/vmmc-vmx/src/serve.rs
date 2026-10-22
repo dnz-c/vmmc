@@ -25,7 +25,7 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 struct Shared {
     targets: Targets,
-    clipboard: Arc<crate::clipboard::Clipboard>,
+    agent: Arc<crate::agent::Agent>,
     section: Section,
     name: String,
     uuid: String,
@@ -38,7 +38,7 @@ struct Shared {
 /// another worker has the VM.
 pub fn start(
     targets: Targets,
-    clipboard: Arc<crate::clipboard::Clipboard>,
+    agent: Arc<crate::agent::Agent>,
     name: &str,
     uuid: &str,
 ) -> io::Result<()> {
@@ -46,7 +46,7 @@ pub fn start(
     section.view().init();
     let shared = Arc::new(Shared {
         targets,
-        clipboard,
+        agent,
         section,
         name: name.to_owned(),
         uuid: uuid.to_owned(),
@@ -157,13 +157,25 @@ fn handle(shared: &Shared, request: Request) -> Response {
     match request {
         Request::Hello { .. } => Response::Error("already said hello".into()),
         Request::SetGuestClipboard { text } => {
-            shared.clipboard.put_in_guest(&text);
+            shared.agent.put_in_guest(&text);
             Response::Done
         }
         Request::GuestClipboard { since } => {
-            let (seq, text) = shared.clipboard.guest_copied(since);
+            let (seq, text) = shared.agent.guest_copied(since);
             Response::GuestClipboard { seq, text }
         }
+        // Drag and drop, through the agent.
+        Request::SendChunks { transfer, chunks } => shared.agent.send_chunks(transfer, chunks),
+        Request::ReceiveChunks { transfer } => shared.agent.receive_chunks(transfer),
+        Request::CancelTransfer { transfer } => shared.agent.cancel_transfer(transfer),
+        request @ (Request::DragEnter { .. }
+        | Request::DragMove { .. }
+        | Request::DragDrop { .. }
+        | Request::DragLeave { .. }
+        | Request::DragState { .. }
+        | Request::ProbeGuestDrag { .. }
+        | Request::GuestDrag { .. }
+        | Request::ReceiveFiles { .. }) => shared.agent.call(request),
         // Before taking the machine's handles: a revert waits for the machine to stop,
         // and its disks must close then.
         Request::Snapshot { name, description } => {
@@ -208,6 +220,7 @@ fn handle(shared: &Shared, request: Request) -> Response {
                 },
                 sandbox: shared.sandbox.clone(),
                 screen: (picture != 0).then_some(((picture >> 32) as u32, picture as u32)),
+                agent: shared.agent.info(),
             })
         }
         Request::Stop => {
@@ -261,7 +274,18 @@ fn handle(shared: &Shared, request: Request) -> Response {
                 | Request::Revert { .. }
                 | Request::Suspend
                 | Request::SetGuestClipboard { .. }
-                | Request::GuestClipboard { .. } => {
+                | Request::GuestClipboard { .. }
+                | Request::SendChunks { .. }
+                | Request::ReceiveChunks { .. }
+                | Request::CancelTransfer { .. }
+                | Request::DragEnter { .. }
+                | Request::DragMove { .. }
+                | Request::DragDrop { .. }
+                | Request::DragLeave { .. }
+                | Request::DragState { .. }
+                | Request::ProbeGuestDrag { .. }
+                | Request::GuestDrag { .. }
+                | Request::ReceiveFiles { .. } => {
                     unreachable!("handled above")
                 }
             }

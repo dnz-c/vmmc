@@ -9,10 +9,20 @@ Without it, Windows draws through the firmware's framebuffer and keeps the resol
 the VM started with (`vmmc-vmx run --resolution`).
 
 The vmmc Tools disc also has **the agent** (`agent/vmmcagent.exe`), an ordinary program
-with no driver: setup installs it in `Program Filesmmc Tools` and starts it at each
-logon. It shares the clipboard's text with the host over the VM's second serial port
-(COM2), in frames the `ipc` crate's `clipboard` module describes: what the user copies
-goes to the host, and what the host sends goes on the clipboard.
+with no driver: setup installs it in `Program Files\vmmc Tools` and starts it at each
+logon. It talks to the host over the VM's second serial port (COM2), in the protocol
+the `agent_proto` crate describes:
+
+- **The clipboard's text:** what the user copies goes to the host, and what the host
+  sends goes on the clipboard.
+- **Drags from the host:** the agent stages the dragged items in `%TEMP%\vmmc`, and an
+  invisible window over the screen takes the worker's button press, which starts a drag
+  (`DoDragDrop`) of them; the host's drag steers it, and the worker lets the button go
+  once the files are there. Their contents come over TCP from the VM's NAT, which vmmc
+  answers itself.
+- **Drags out to the host:** another invisible window over the screen, which takes
+  drops, catches the guest's drag when the host's pointer leaves the console, reads the
+  files it carries (`CF_HDROP`), refuses the drop, and sends the files when asked.
 
 ## Building
 

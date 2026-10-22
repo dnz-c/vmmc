@@ -70,9 +70,38 @@ const PACKAGE: [&str; 4] = [
 pub struct Drivers {
     /// The display driver's package: `vmmcdisp.inf`, `.sys` and `.cat`.
     pub display: PathBuf,
-    /// The agent that shares the clipboard (`vmmcagent.exe`), which needs no driver.
+    /// The agent that shares the clipboard and drags files (`vmmcagent.exe`), which
+    /// needs no driver.
     pub agent: PathBuf,
+    /// The Linux agent (`vmmc-agent`), static.
+    pub linux_agent: PathBuf,
     pub certificate: PathBuf,
+}
+
+/// The Rust target the Linux agent is built for: static, so it runs on any distribution.
+const LINUX_TARGET: &str = "x86_64-unknown-linux-musl";
+
+/// Builds the Linux agent (`guest-drivers/linux/agent`, a workspace of its own), linked
+/// with rust-lld, which Rust brings along.
+pub fn build_linux_agent() -> Result<PathBuf, String> {
+    let dir = workspace()
+        .join("guest-drivers")
+        .join("linux")
+        .join("agent");
+    run(Command::new(env!("CARGO"))
+        .current_dir(&dir)
+        .args(["build", "--release", "--target", LINUX_TARGET])
+        .env("CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER", "rust-lld"))?;
+    let agent = dir
+        .join("target")
+        .join(LINUX_TARGET)
+        .join("release")
+        .join("vmmc-agent");
+    if agent.is_file() {
+        Ok(agent)
+    } else {
+        Err(format!("no {} after the build", agent.display()))
+    }
 }
 
 /// The tools a build uses.
@@ -290,7 +319,15 @@ pub fn build(trace: bool) -> Result<Drivers, String> {
         .arg(format!("/Fo{}", obj.join("vmmcagent.obj").display()))
         .arg(format!("/Fe{}", agent.display()))
         .arg(source.with_file_name("agent").join("vmmcagent.cpp"))
-        .args(["/link", "/SUBSYSTEM:WINDOWS", "user32.lib", "kernel32.lib"])
+        .args(["/link", "/SUBSYSTEM:WINDOWS"])
+        .args([
+            "user32.lib",
+            "kernel32.lib",
+            "gdi32.lib",
+            "ole32.lib",
+            "shell32.lib",
+            "ws2_32.lib",
+        ])
         .arg(format!("/LIBPATH:{}", msvc_root.join(r"lib\x64").display()))
         .arg(format!("/LIBPATH:{}", libs.join(r"um\x64").display()))
         .arg(format!("/LIBPATH:{}", libs.join(r"ucrt\x64").display())))?;
@@ -310,6 +347,7 @@ pub fn build(trace: bool) -> Result<Drivers, String> {
         .arg(format!("/driver:{}", display.display()))
         .arg("/os:10_X64"))?;
 
+    let linux_agent = build_linux_agent()?;
     let certificate = out.join("vmmc-test-signing.cer");
     let thumbprint = test_certificate(&certificate)?;
     run(Command::new(tools.tool("x64", "signtool.exe"))
@@ -324,11 +362,12 @@ pub fn build(trace: bool) -> Result<Drivers, String> {
         certificate.display()
     );
     let tools = out.join(TOOLS_ISO);
-    write_tools_iso(&display, &agent, &certificate, &tools)?;
+    write_tools_iso(&display, &agent, &linux_agent, &certificate, &tools)?;
     eprintln!("xtask: vmmc Tools disc in {}", tools.display());
     Ok(Drivers {
         display,
         agent,
+        linux_agent,
         certificate,
     })
 }
@@ -476,11 +515,13 @@ pub fn display_test() -> Result<(), String> {
     Ok(())
 }
 
-/// The vmmc Tools disc: setup (with Windows line ends), the driver package and the
-/// certificate it's signed with, all in the root.
+/// The vmmc Tools disc, all in the root: Windows' setup (with Windows line ends), the
+/// driver package, the certificate it's signed with and the agent; Linux's install
+/// script and agent.
 fn write_tools_iso(
     package: &Path,
     agent: &Path,
+    linux_agent: &Path,
     certificate: &Path,
     iso: &Path,
 ) -> Result<(), String> {
@@ -493,6 +534,11 @@ fn write_tools_iso(
     }
     files.push(("vmmcagent.exe".to_owned(), read(agent)?));
     files.push(("vmmc-test-signing.cer".to_owned(), read(certificate)?));
+    files.push((
+        "install-linux.sh".to_owned(),
+        linux_tools_file("install-linux.sh")?,
+    ));
+    files.push(("vmmc-agent".to_owned(), read(linux_agent)?));
     let files: Vec<(&str, &[u8])> = files
         .iter()
         .map(|(name, data)| (name.as_str(), data.as_slice()))
@@ -503,7 +549,7 @@ fn write_tools_iso(
 
 /// A file of the Tools disc's setup (`guest-drivers/windows/tools`), with Windows line
 /// ends.
-fn tools_file(name: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn tools_file(name: &str) -> Result<Vec<u8>, String> {
     let path = workspace()
         .join("guest-drivers")
         .join("windows")
@@ -511,6 +557,18 @@ fn tools_file(name: &str) -> Result<Vec<u8>, String> {
         .join(name);
     let text = String::from_utf8(read(&path)?).map_err(|_| format!("{name} isn't UTF-8"))?;
     Ok(windows::crlf(&text).into_bytes())
+}
+
+/// A file of the Tools disc's Linux part (`guest-drivers/linux/tools`), with Unix line
+/// ends, whatever the checkout has.
+pub(crate) fn linux_tools_file(name: &str) -> Result<Vec<u8>, String> {
+    let path = workspace()
+        .join("guest-drivers")
+        .join("linux")
+        .join("tools")
+        .join(name);
+    let text = String::from_utf8(read(&path)?).map_err(|_| format!("{name} isn't UTF-8"))?;
+    Ok(text.replace(char::from(13), "").into_bytes())
 }
 
 fn read(path: &Path) -> Result<Vec<u8>, String> {

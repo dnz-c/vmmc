@@ -1,8 +1,8 @@
 # vmmc Tools for Windows, from the vmmc Tools disc:
 #
-# - The agent (vmmcagent.exe), which shares the clipboard with the host: installed in
-#   Program Files and started at each logon. It needs no driver, so it's installed
-#   whatever the Secure Boot setting.
+# - The agent (vmmcagent.exe), which shares the clipboard with the host and drags files
+#   between the host and the guest: installed in Program Files and started at each
+#   logon. It needs no driver, so it's installed whatever the Secure Boot setting.
 # - vmmc's display driver (resolutions, the desktop following vmmc's window, a hardware
 #   cursor). It's test-signed for now, and Windows loads test-signed drivers only with
 #   test signing on, which Secure Boot doesn't allow: with Secure Boot on, this says so.
@@ -73,7 +73,7 @@ try {
     $secureBoot = $false
     try { $secureBoot = Confirm-SecureBootUEFI } catch { }
     if ($secureBoot) {
-        Say ("Clipboard sharing with vmmc is installed.`n`nSecure Boot is on in this VM, and " +
+        Say ("Clipboard sharing and drag and drop with vmmc are installed.`n`nSecure Boot is on in this VM, and " +
              "vmmc's display driver isn't signed by Microsoft yet, so Windows won't load it. To " +
              "use it too: shut this VM down, turn Secure Boot off in vmmc's settings for it, " +
              "start it, and run vmmc Tools again.") 'Warning'
@@ -107,7 +107,7 @@ try {
             'vmmc Tools', 'YesNo', 'Question')
         if ($answer -eq 'Yes') { Restart-Computer -Force }
     } else {
-        Say 'vmmc Tools are installed: Windows now follows the size of vmmc''s window, and shares its clipboard with the host.'
+        Say 'vmmc Tools are installed: Windows now follows the size of vmmc''s window, shares its clipboard with the host, and takes files dragged in (and gives them out).'
     }
 } catch {
     Say "vmmc Tools couldn't be installed:`n`n$($_.Exception.Message)" 'Error'
