@@ -1,9 +1,10 @@
-//! Writes ISO 9660 disc images: files in the root directory, with Joliet names, and
-//! optionally an El Torito boot entry for UEFI (a FAT image, as UEFI firmware expects).
+//! Writes ISO 9660 disc images: files in the root directory, with Joliet names (for
+//! Windows) and Rock Ridge names and modes (for Linux), and optionally an El Torito boot
+//! entry for UEFI (a FAT image, as UEFI firmware expects).
 //!
-//! Written from ECMA-119, the Joliet specification and the El Torito specification.
-//! Everything is laid out in order: volume descriptors from sector 16, path tables, the
-//! two root directories, the boot catalog, then file data.
+//! Written from ECMA-119, the Joliet specification, SUSP and RRIP 1.10, and the El
+//! Torito specification. Everything is laid out in order: volume descriptors from sector
+//! 16, path tables, the two root directories, the boot catalog, then file data.
 
 const SECTOR: usize = 2048;
 /// Fixed timestamps keep images reproducible: 2026-01-01 00:00:00 UTC.
@@ -24,8 +25,9 @@ fn both16(value: u16) -> [u8; 4] {
     out
 }
 
-/// A name as ISO 9660 level 1 allows it: upper case, `[A-Z0-9_]`, 8.3, version 1.
-fn iso_name(name: &str) -> Vec<u8> {
+/// A name as ISO 9660 level 1 allows it: upper case, `[A-Z0-9_]`, 8.3, version 1. With
+/// `number`, it ends the stem, to tell apart names that fold to the same.
+fn iso_name(name: &str, number: Option<usize>) -> Vec<u8> {
     let clean = |part: &str, len: usize| -> String {
         part.chars()
             .map(|c| c.to_ascii_uppercase())
@@ -34,7 +36,31 @@ fn iso_name(name: &str) -> Vec<u8> {
             .collect()
     };
     let (stem, extension) = name.rsplit_once('.').unwrap_or((name, ""));
-    format!("{}.{};1", clean(stem, 8), clean(extension, 3)).into_bytes()
+    let stem = match number {
+        Some(n) => {
+            let n = n.to_string();
+            format!("{}{n}", clean(stem, 8 - n.len()))
+        }
+        None => clean(stem, 8),
+    };
+    format!("{stem}.{};1", clean(extension, 3)).into_bytes()
+}
+
+/// The files' names in the primary directory, each one different.
+fn iso_names(entries: &[(&str, &[u8])]) -> Vec<Vec<u8>> {
+    let mut used = std::collections::HashSet::new();
+    entries
+        .iter()
+        .map(|(name, _)| {
+            let mut id = iso_name(name, None);
+            let mut number = 1;
+            while !used.insert(id.clone()) {
+                id = iso_name(name, Some(number));
+                number += 1;
+            }
+            id
+        })
+        .collect()
 }
 
 /// A Joliet name: UCS-2 big-endian.
@@ -45,7 +71,14 @@ fn joliet_name(name: &str) -> Vec<u8> {
         .collect()
 }
 
-fn directory_record(extent: u32, len: u32, directory: bool, name: &[u8]) -> Vec<u8> {
+/// A directory record, its System Use field (Rock Ridge's entries) after the name.
+fn directory_record(
+    extent: u32,
+    len: u32,
+    directory: bool,
+    name: &[u8],
+    system_use: &[u8],
+) -> Vec<u8> {
     let mut record = vec![0u8; 33];
     record[2..10].copy_from_slice(&both32(extent));
     record[10..18].copy_from_slice(&both32(len));
@@ -57,8 +90,73 @@ fn directory_record(extent: u32, len: u32, directory: bool, name: &[u8]) -> Vec<
     if record.len() % 2 == 1 {
         record.push(0);
     }
+    record.extend_from_slice(system_use);
+    if record.len() % 2 == 1 {
+        record.push(0);
+    }
     record[0] = record.len() as u8;
     record
+}
+
+/// A SUSP entry: signature, length, version 1, data.
+fn susp(signature: &[u8; 2], data: &[u8]) -> Vec<u8> {
+    let mut entry = signature.to_vec();
+    entry.push((4 + data.len()) as u8);
+    entry.push(1);
+    entry.extend_from_slice(data);
+    entry
+}
+
+/// Rock Ridge's POSIX attributes: the mode, links, and root as owner.
+fn rock_ridge_px(mode: u32) -> Vec<u8> {
+    let links = if mode & 0o040000 != 0 { 2 } else { 1 };
+    let mut data = both32(mode).to_vec();
+    data.extend_from_slice(&both32(links));
+    data.extend_from_slice(&both32(0));
+    data.extend_from_slice(&both32(0));
+    susp(b"PX", &data)
+}
+
+/// The root's "." entries: SUSP is in use (SP), and the extension is Rock Ridge (ER),
+/// which is what makes Linux read the primary directory with its names.
+fn rock_ridge_root() -> Vec<u8> {
+    let mut entries = susp(b"SP", &[0xbe, 0xef, 0]);
+    let (id, descriptor, source): (&[u8], &[u8], &[u8]) =
+        (b"RRIP_1991A", b"POSIX FILE SYSTEM SEMANTICS", b"IEEE P1282");
+    let mut data = vec![
+        id.len() as u8,
+        descriptor.len() as u8,
+        source.len() as u8,
+        1,
+    ];
+    data.extend_from_slice(id);
+    data.extend_from_slice(descriptor);
+    data.extend_from_slice(source);
+    entries.extend(susp(b"ER", &data));
+    entries.extend(rock_ridge_px(DIRECTORY_MODE));
+    entries
+}
+
+/// Read and search for everyone.
+const DIRECTORY_MODE: u32 = 0o040555;
+
+/// A file's mode: read-only for everyone, and runnable if it's a script (`#!`) or an
+/// ELF program, so a Linux guest can run it from the disc.
+fn file_mode(data: &[u8]) -> u32 {
+    if data.starts_with(b"#!") || data.starts_with(b"\x7fELF") {
+        0o100555
+    } else {
+        0o100444
+    }
+}
+
+/// A file's Rock Ridge entries: its mode and its name as it is.
+fn rock_ridge_file(name: &str, data: &[u8]) -> Vec<u8> {
+    let mut entries = rock_ridge_px(file_mode(data));
+    let mut nm = vec![0u8];
+    nm.extend_from_slice(name.as_bytes());
+    entries.extend(susp(b"NM", &nm));
+    entries
 }
 
 /// Fills a text field: ASCII padded with spaces, or UCS-2 spaces for Joliet.
@@ -81,6 +179,8 @@ struct Layout {
     total: u32,
     path_tables: [u32; 2],
     root: u32,
+    /// The root directory's length, whole sectors.
+    root_len: u32,
 }
 
 fn volume_descriptor(kind: u8, joliet: bool, volume_id: &str, layout: &Layout) -> Vec<u8> {
@@ -101,7 +201,7 @@ fn volume_descriptor(kind: u8, joliet: bool, volume_id: &str, layout: &Layout) -
     sector[132..140].copy_from_slice(&both32(10));
     sector[140..144].copy_from_slice(&layout.path_tables[0].to_le_bytes());
     sector[148..152].copy_from_slice(&layout.path_tables[1].to_be_bytes());
-    let root = directory_record(layout.root, SECTOR as u32, true, &[0]);
+    let root = directory_record(layout.root, layout.root_len, true, &[0], &[]);
     sector[156..156 + root.len()].copy_from_slice(&root);
     for range in [
         190..318,
@@ -139,6 +239,59 @@ fn path_table(root: u32, big_endian: bool) -> Vec<u8> {
     table
 }
 
+/// A root directory at sector `root`: ".", "..", then the files sorted by their names,
+/// in whole sectors (a record doesn't cross into the next one). The primary one carries
+/// Rock Ridge; the Joliet one has Joliet names.
+fn root_directory(
+    root: u32,
+    entries: &[(&str, &[u8])],
+    extents: &[u32],
+    rock_ridge: bool,
+) -> Vec<u8> {
+    let ids = if rock_ridge {
+        iso_names(entries)
+    } else {
+        entries.iter().map(|(name, _)| joliet_name(name)).collect()
+    };
+    let mut files: Vec<(Vec<u8>, Vec<u8>)> = entries
+        .iter()
+        .zip(extents)
+        .zip(ids)
+        .map(|(((name, data), &extent), id)| {
+            let system_use = if rock_ridge {
+                rock_ridge_file(name, data)
+            } else {
+                Vec::new()
+            };
+            let record = directory_record(extent, data.len() as u32, false, &id, &system_use);
+            (id, record)
+        })
+        .collect();
+    files.sort();
+    let (dot, dot_dot) = if rock_ridge {
+        (rock_ridge_root(), rock_ridge_px(DIRECTORY_MODE))
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let directory = |len: u32| {
+        let mut out = Vec::new();
+        let records = [
+            directory_record(root, len, true, &[0], &dot),
+            directory_record(root, len, true, &[1], &dot_dot),
+        ];
+        for record in records.iter().chain(files.iter().map(|(_, record)| record)) {
+            if record.len() > SECTOR - out.len() % SECTOR {
+                out.resize(out.len().next_multiple_of(SECTOR), 0);
+            }
+            out.extend_from_slice(record);
+        }
+        out.resize(out.len().next_multiple_of(SECTOR), 0);
+        out
+    };
+    // The records' lengths don't depend on the directory's.
+    directory(directory(0).len() as u32)
+}
+
 /// An image with `files` in the root directory. With `efi_boot`, a FAT image that UEFI
 /// firmware boots from (it's also visible as `efiboot.img`).
 pub fn build(volume_id: &str, files: &[(&str, &[u8])], efi_boot: Option<&[u8]>) -> Vec<u8> {
@@ -147,22 +300,27 @@ pub fn build(volume_id: &str, files: &[(&str, &[u8])], efi_boot: Option<&[u8]>) 
         entries.push(("efiboot.img", image));
     }
 
+    // The root directories' lengths, which their contents don't change.
+    let unplaced = vec![0; entries.len()];
+    let iso_root_len = root_directory(0, &entries, &unplaced, true).len() as u32;
+    let joliet_root_len = root_directory(0, &entries, &unplaced, false).len() as u32;
+
     // Sectors, in order.
     let mut next = 16u32;
-    let mut take = || {
+    let mut take = |sectors: u32| {
         let at = next;
-        next += 1;
+        next += sectors;
         at
     };
-    let primary = take();
-    let boot_record = efi_boot.is_some().then(&mut take);
-    let joliet = take();
-    let terminator = take();
-    let iso_tables = [take(), take()];
-    let joliet_tables = [take(), take()];
-    let iso_root = take();
-    let joliet_root = take();
-    let catalog = efi_boot.is_some().then(&mut take);
+    let primary = take(1);
+    let boot_record = efi_boot.is_some().then(|| take(1));
+    let joliet = take(1);
+    let terminator = take(1);
+    let iso_tables = [take(1), take(1)];
+    let joliet_tables = [take(1), take(1)];
+    let iso_root = take(iso_root_len / SECTOR as u32);
+    let joliet_root = take(joliet_root_len / SECTOR as u32);
+    let catalog = efi_boot.is_some().then(|| take(1));
     let mut extents = Vec::with_capacity(entries.len());
     for (_, data) in &entries {
         extents.push(next);
@@ -179,11 +337,13 @@ pub fn build(volume_id: &str, files: &[(&str, &[u8])], efi_boot: Option<&[u8]>) 
         total,
         path_tables: iso_tables,
         root: iso_root,
+        root_len: iso_root_len,
     };
     let joliet_layout = Layout {
         total,
         path_tables: joliet_tables,
         root: joliet_root,
+        root_len: joliet_root_len,
     };
     put(
         primary,
@@ -201,28 +361,14 @@ pub fn build(volume_id: &str, files: &[(&str, &[u8])], efi_boot: Option<&[u8]>) 
     put(joliet_tables[0], &path_table(joliet_root, false));
     put(joliet_tables[1], &path_table(joliet_root, true));
 
-    // Both root directories: ".", "..", then the files sorted by their names.
-    for (root, name_of) in [
-        (iso_root, iso_name as fn(&str) -> Vec<u8>),
-        (joliet_root, joliet_name as fn(&str) -> Vec<u8>),
-    ] {
-        let mut records = directory_record(root, SECTOR as u32, true, &[0]);
-        records.extend(directory_record(root, SECTOR as u32, true, &[1]));
-        let mut sorted: Vec<(Vec<u8>, u32, usize)> = entries
-            .iter()
-            .zip(&extents)
-            .map(|((name, data), &extent)| (name_of(name), extent, data.len()))
-            .collect();
-        sorted.sort();
-        for (name, extent, len) in sorted {
-            records.extend(directory_record(extent, len as u32, false, &name));
-        }
-        assert!(
-            records.len() <= SECTOR,
-            "the root directory fits one sector"
-        );
-        put(root, &records);
-    }
+    put(
+        iso_root,
+        &root_directory(iso_root, &entries, &extents, true),
+    );
+    put(
+        joliet_root,
+        &root_directory(joliet_root, &entries, &extents, false),
+    );
 
     if let (Some(boot_record), Some(catalog), Some(boot_image)) = (boot_record, catalog, efi_boot) {
         let mut record = vec![0u8; SECTOR];
@@ -266,22 +412,119 @@ mod tests {
         u32::from_le_bytes(bytes[..4].try_into().unwrap())
     }
 
-    /// The root directory's (name, extent, length) entries, skipping "." and "..".
-    fn list(image: &[u8], descriptor: usize) -> Vec<(Vec<u8>, u32, u32)> {
+    /// The root directory's records, as the volume descriptor's root record has it: a
+    /// zero after a record means the rest of that sector is empty.
+    fn records(image: &[u8], descriptor: usize) -> Vec<&[u8]> {
         let pvd = &image[descriptor * SECTOR..];
-        let root = u32_le(&pvd[156 + 2..]) as usize;
-        let mut at = root * SECTOR;
+        let root = u32_le(&pvd[156 + 2..]) as usize * SECTOR;
+        let end = root + u32_le(&pvd[156 + 10..]) as usize;
+        let mut at = root;
         let mut out = Vec::new();
-        while image[at] != 0 {
+        while at < end {
             let len = image[at] as usize;
-            let name_len = image[at + 32] as usize;
-            let name = image[at + 33..at + 33 + name_len].to_vec();
-            if name != [0] && name != [1] {
-                out.push((name, u32_le(&image[at + 2..]), u32_le(&image[at + 10..])));
+            if len == 0 {
+                at = (at / SECTOR + 1) * SECTOR;
+                continue;
             }
+            assert_eq!(
+                at / SECTOR,
+                (at + len - 1) / SECTOR,
+                "a record within a sector"
+            );
+            out.push(&image[at..at + len]);
             at += len;
         }
         out
+    }
+
+    /// The root directory's (name, extent, length) entries, skipping "." and "..".
+    fn list(image: &[u8], descriptor: usize) -> Vec<(Vec<u8>, u32, u32)> {
+        records(image, descriptor)
+            .into_iter()
+            .filter_map(|record| {
+                let name = record[33..33 + record[32] as usize].to_vec();
+                (name != [0] && name != [1])
+                    .then(|| (name, u32_le(&record[2..]), u32_le(&record[10..])))
+            })
+            .collect()
+    }
+
+    /// A record's SUSP entries by signature.
+    fn system_use(record: &[u8]) -> Vec<([u8; 2], Vec<u8>)> {
+        let name_len = record[32] as usize;
+        let mut at = 33 + name_len + (1 - name_len % 2);
+        let mut out = Vec::new();
+        while at + 4 <= record.len() {
+            let len = record[at + 2] as usize;
+            out.push((
+                [record[at], record[at + 1]],
+                record[at + 4..at + len].to_vec(),
+            ));
+            at += len;
+        }
+        out
+    }
+
+    #[test]
+    fn rock_ridge_keeps_names_and_runnable_files() {
+        let image = build(
+            "VMMC_TEST",
+            &[
+                ("install-linux.sh", b"#!/bin/sh\necho hi\n"),
+                ("vmmc-agent", b"\x7fELF\x02\x01"),
+                ("readme.txt", b"text"),
+            ],
+            None,
+        );
+        let primary = records(&image, 16);
+        let dot = system_use(primary[0]);
+        assert_eq!(&dot[0].0, b"SP");
+        assert_eq!(dot[0].1, [0xbe, 0xef, 0]);
+        let er = &dot.iter().find(|(sig, _)| sig == b"ER").expect("ER").1;
+        assert_eq!(&er[4..4 + er[0] as usize], b"RRIP_1991A");
+        let mut files: Vec<(String, u32)> = primary[2..]
+            .iter()
+            .map(|record| {
+                let entries = system_use(record);
+                let px = &entries.iter().find(|(sig, _)| sig == b"PX").unwrap().1;
+                let nm = &entries.iter().find(|(sig, _)| sig == b"NM").unwrap().1;
+                (String::from_utf8(nm[1..].to_vec()).unwrap(), u32_le(px))
+            })
+            .collect();
+        files.sort();
+        assert_eq!(
+            files,
+            [
+                ("install-linux.sh".into(), 0o100555),
+                ("readme.txt".into(), 0o100444),
+                ("vmmc-agent".into(), 0o100555),
+            ]
+        );
+        assert!(
+            records(&image, 17)
+                .iter()
+                .all(|record| system_use(record).is_empty()),
+            "no Rock Ridge in the Joliet directory"
+        );
+    }
+
+    #[test]
+    fn a_big_root_directory_takes_more_sectors() {
+        let names: Vec<String> = (0..60)
+            .map(|i| format!("a-long-file-name-{i:02}.txt"))
+            .collect();
+        let files: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &b"x"[..])).collect();
+        let image = build("VMMC_TEST", &files, None);
+        for descriptor in [16, 17] {
+            let pvd = &image[descriptor * SECTOR..];
+            assert!(u32_le(&pvd[156 + 10..]) as usize > SECTOR);
+            let listed = list(&image, descriptor);
+            assert_eq!(listed.len(), 60);
+            for (_, extent, len) in listed {
+                assert_eq!(len, 1);
+                assert_eq!(image[extent as usize * SECTOR], b'x');
+            }
+        }
     }
 
     #[test]
@@ -338,7 +581,16 @@ mod tests {
 
     #[test]
     fn long_names_fold_to_8_3() {
-        assert_eq!(iso_name("autounattend.xml"), b"AUTOUNAT.XML;1");
-        assert_eq!(iso_name("a-b.tx"), b"A_B.TX;1");
+        assert_eq!(iso_name("autounattend.xml", None), b"AUTOUNAT.XML;1");
+        assert_eq!(iso_name("a-b.tx", None), b"A_B.TX;1");
+        let names = iso_names(&[
+            ("install-linux.sh", b""),
+            ("install-windows.sh", b""),
+            ("install-x.sh", b""),
+        ]);
+        assert_eq!(
+            names,
+            [&b"INSTALL_.SH;1"[..], b"INSTALL1.SH;1", b"INSTALL2.SH;1"]
+        );
     }
 }
