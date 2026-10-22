@@ -34,6 +34,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "agent-proto"
+version = "0.0.1"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2329,6 +2336,7 @@ dependencies = [
 name = "ipc"
 version = "0.0.1"
 dependencies = [
+ "agent-proto",
  "postcard",
  "serde",
  "windows",
@@ -4122,6 +4130,7 @@ dependencies = [
  "num-traits",
  "once_cell",
  "pin-weak",
+ "raw-window-handle",
  "slint-macros",
  "unicode-segmentation",
  "vtable",
@@ -4970,9 +4979,11 @@ dependencies = [
 name = "vmmc"
 version = "0.0.1"
 dependencies = [
+ "agent-proto",
  "ipc",
  "keyhook",
  "png",
+ "raw-window-handle",
  "slint",
  "slint-build",
  "tracing",
@@ -4980,6 +4991,7 @@ dependencies = [
  "vmconfig",
  "vmmc-client",
  "windows",
+ "windows-core",
 ]
 
 [[package]]
@@ -4998,6 +5010,7 @@ dependencies = [
 name = "vmmc-client"
 version = "0.0.1"
 dependencies = [
+ "agent-proto",
  "ipc",
  "tempfile",
  "vmconfig",
@@ -5008,6 +5021,7 @@ dependencies = [
 name = "vmmc-vmx"
 version = "0.0.1"
 dependencies = [
+ "agent-proto",
  "clap",
  "disk",
  "hv-whp",

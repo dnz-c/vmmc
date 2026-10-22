@@ -1,0 +1,18 @@
+[package]
+name = "agent-proto"
+description = "The protocol between vmmc's agent in a guest and the VM's worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Serde for the types the app and the worker pass through their pipe too.
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { workspace = true, optional = true }
+
+[lints]
+workspace = true

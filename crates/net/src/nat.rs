@@ -4,7 +4,8 @@
 //! - **TCP:** when the guest sends a SYN to any address, a smoltcp socket starts
 //!   listening on exactly that address and port (smoltcp's AnyIP mode), and a host
 //!   connection opens to the real destination. Data flows between the two; closes and
-//!   resets follow. Connections to the gateway address go to the host's loopback.
+//!   resets follow. Connections to the gateway address go to the host's loopback, except
+//!   on the port of the config's [`LocalService`], which the service takes in-process.
 //! - **UDP:** handled without smoltcp. DHCP (port 67) and DNS (to the DNS address) are
 //!   answered here; every other datagram goes out through a host UDP socket per flow.
 //! - **ARP and ping to the gateway:** smoltcp. ARP is only answered for the NAT's
@@ -31,6 +32,7 @@ use smoltcp::wire::{
 };
 
 use crate::frames::{self, UdpDatagram};
+use crate::local::LocalStream;
 use crate::{FrameSink, NatConfig, NetBackend, Waker, dhcp, dns};
 
 const TCP_BUFFER: usize = 256 * 1024;
@@ -43,11 +45,47 @@ const LISTEN_TIMEOUT: Duration = Duration::from_secs(30);
 const IDLE_POLL: Duration = Duration::from_millis(250);
 const MTU: usize = 1500;
 
+/// A connection's host side: a socket, or a local service's stream.
+trait HostStream: Send + Sync {
+    fn read_some(&self, buffer: &mut [u8]) -> std::io::Result<usize>;
+    fn write_all_of(&self, data: &[u8]) -> std::io::Result<()>;
+    fn shut(&self, how: Shutdown) -> std::io::Result<()>;
+}
+
+impl HostStream for TcpStream {
+    fn read_some(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        (&*self).read(buffer)
+    }
+
+    fn write_all_of(&self, data: &[u8]) -> std::io::Result<()> {
+        (&*self).write_all(data)
+    }
+
+    fn shut(&self, how: Shutdown) -> std::io::Result<()> {
+        self.shutdown(how)
+    }
+}
+
+impl HostStream for LocalStream {
+    fn read_some(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        (&*self).read(buffer)
+    }
+
+    fn write_all_of(&self, data: &[u8]) -> std::io::Result<()> {
+        (&*self).write_all(data)
+    }
+
+    fn shut(&self, how: Shutdown) -> std::io::Result<()> {
+        self.shutdown(how);
+        Ok(())
+    }
+}
+
 enum Event {
     Guest(Vec<u8>),
     Connected {
         id: u64,
-        stream: TcpStream,
+        stream: Arc<dyn HostStream>,
     },
     ConnectFailed {
         id: u64,
@@ -196,7 +234,7 @@ impl Backlog {
 enum Host {
     Connecting,
     Connected {
-        stream: Arc<TcpStream>,
+        stream: Arc<dyn HostStream>,
         writer: Sender<Option<Vec<u8>>>,
         backlog: Arc<Backlog>,
     },
@@ -468,13 +506,39 @@ impl Engine {
                 created: std::time::Instant::now(),
             },
         );
+        if address == self.config.gateway
+            && let Some(service) = self
+                .config
+                .service
+                .as_ref()
+                .filter(|service| service.port == port)
+        {
+            let (near, far) = LocalStream::pair();
+            let accept = service.accept.clone();
+            let spawned = thread::Builder::new()
+                .name("net-local".into())
+                .spawn(move || accept(far));
+            if spawned.is_ok() {
+                self.connected(id, Arc::new(near));
+            } else {
+                let _ = self.events.send(Event::ConnectFailed { id });
+            }
+            return;
+        }
         let destination = SocketAddr::V4(SocketAddrV4::new(self.host_address(address), port));
         let events = self.events.clone();
         let spawned = thread::Builder::new()
             .name("net-connect".into())
             .spawn(move || {
                 let event = match TcpStream::connect_timeout(&destination, CONNECT_TIMEOUT) {
-                    Ok(stream) => Event::Connected { id, stream },
+                    Ok(stream) => {
+                        let _ = stream.set_nodelay(true);
+                        tracing::debug!(peer = ?stream.peer_addr().ok(), "NAT: host connection open");
+                        Event::Connected {
+                            id,
+                            stream: Arc::new(stream),
+                        }
+                    }
                     Err(e) => {
                         tracing::debug!(%destination, %e, "NAT: host connection failed");
                         Event::ConnectFailed { id }
@@ -487,19 +551,16 @@ impl Engine {
         }
     }
 
-    fn connected(&mut self, id: u64, stream: TcpStream) {
-        tracing::debug!(peer = ?stream.peer_addr().ok(), "NAT: host connection open");
+    fn connected(&mut self, id: u64, stream: Arc<dyn HostStream>) {
         let Some(connection) = self.connections.get_mut(&id) else {
-            let _ = stream.shutdown(Shutdown::Both);
+            let _ = stream.shut(Shutdown::Both);
             return;
         };
-        let _ = stream.set_nodelay(true);
         let backlog = Arc::new(Backlog::default());
         let (writer, writes) = mpsc::channel::<Option<Vec<u8>>>();
         // One socket, read and written from two threads: no `try_clone`, whose
         // duplicated socket can't always be shut down on Windows (WSAENOTCONN), which
         // left the host's side of a closed connection open.
-        let stream = Arc::new(stream);
         let reader = stream.clone();
         let write_stream = stream.clone();
         let events = self.events.clone();
@@ -509,7 +570,7 @@ impl Engine {
             .spawn(move || {
                 let mut buffer = vec![0u8; 64 * 1024];
                 loop {
-                    match (&*reader).read(&mut buffer) {
+                    match reader.read_some(&mut buffer) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             if !reader_backlog.add(n)
@@ -531,11 +592,11 @@ impl Engine {
             .name("net-write".into())
             .spawn(move || {
                 while let Ok(Some(data)) = writes.recv() {
-                    if (&*write_stream).write_all(&data).is_err() {
+                    if write_stream.write_all_of(&data).is_err() {
                         break;
                     }
                 }
-                if let Err(e) = write_stream.shutdown(Shutdown::Write) {
+                if let Err(e) = write_stream.shut(Shutdown::Write) {
                     tracing::debug!(%e, "NAT: can't pass the guest's FIN on");
                 }
             });
@@ -629,7 +690,7 @@ impl Engine {
         } = &connection.host
         {
             backlog.close();
-            let _ = stream.shutdown(Shutdown::Both);
+            let _ = stream.shut(Shutdown::Both);
         }
         self.sockets.remove(connection.handle);
     }

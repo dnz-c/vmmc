@@ -139,11 +139,15 @@ impl Guest {
 
     /// A guest that has done DHCP, whose NIC holds `capacity` frames if given.
     fn with_nic_capacity(capacity: Option<usize>) -> Self {
+        Self::with(NatConfig::default(), capacity)
+    }
+
+    fn with(config: NatConfig, capacity: Option<usize>) -> Self {
         let received = Arc::new(Received {
             capacity,
             ..Received::default()
         });
-        let nat = Nat::start(NatConfig::default(), received.clone()).unwrap();
+        let nat = Nat::start(config, received.clone()).unwrap();
         let mut nic = GuestNic {
             nat: Arc::new(nat),
             received,
@@ -287,6 +291,71 @@ fn tcp_through_the_gateway_reaches_host_loopback() {
         )
     });
     server.join().unwrap();
+}
+
+#[test]
+fn the_local_service_takes_its_port_in_process() {
+    // A service that answers each line in upper case, then closes when the guest does.
+    let (accepted, connections) = std::sync::mpsc::channel();
+    let service = LocalService {
+        port: 5640,
+        accept: Arc::new(move |stream: LocalStream| {
+            let _ = accepted.send(());
+            let mut data = Vec::new();
+            (&stream).read_to_end(&mut data).unwrap();
+            (&stream).write_all(&data.to_ascii_uppercase()).unwrap();
+        }),
+    };
+    let mut guest = Guest::with(
+        NatConfig {
+            service: Some(service),
+            ..NatConfig::default()
+        },
+        None,
+    );
+    let handle = guest.tcp_socket();
+    let context = guest.iface.context();
+    guest
+        .sockets
+        .get_mut::<tcp::Socket>(handle)
+        .connect(context, gateway(5640), 49_153)
+        .unwrap();
+    guest.until("the connection", |guest| {
+        guest.sockets.get::<tcp::Socket>(handle).may_send()
+    });
+    // More than the buffers hold.
+    let data: Vec<u8> = (0..400_000u32)
+        .map(|i| {
+            b"abcdefghij
+"[(i % 11) as usize]
+        })
+        .collect();
+    let mut sent = 0;
+    let mut closed = false;
+    let mut answer = Vec::new();
+    guest.until("the answer", |guest| {
+        let socket = guest.sockets.get_mut::<tcp::Socket>(handle);
+        if sent < data.len() && socket.can_send() {
+            sent += socket.send_slice(&data[sent..]).unwrap();
+        }
+        if sent == data.len() && !closed {
+            socket.close();
+            closed = true;
+        }
+        while socket.can_recv() {
+            socket
+                .recv(|chunk| {
+                    answer.extend_from_slice(chunk);
+                    (chunk.len(), ())
+                })
+                .unwrap();
+        }
+        answer.len() == data.len()
+            && matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait)
+    });
+    assert_eq!(answer, data.to_ascii_uppercase());
+    assert!(connections.try_recv().is_ok());
+    assert!(connections.try_recv().is_err(), "one connection");
 }
 
 #[test]

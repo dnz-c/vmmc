@@ -12,6 +12,7 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+agent-proto = { path = "crates/agent-proto" }
 devices = { path = "crates/devices" }
 disk = { path = "crates/disk" }
 net = { path = "crates/net" }

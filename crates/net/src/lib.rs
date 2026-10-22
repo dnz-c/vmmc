@@ -8,11 +8,13 @@
 mod dhcp;
 mod dns;
 mod frames;
+mod local;
 mod nat;
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
+pub use local::{LocalService, LocalStream};
 pub use nat::Nat;
 
 /// Where a guest NIC sends the frames the guest transmits.
@@ -59,6 +61,8 @@ pub struct NatConfig {
     pub gateway_mac: [u8; 6],
     /// The DNS domain DHCP offers.
     pub domain: String,
+    /// A port on the gateway the NAT answers itself.
+    pub service: Option<LocalService>,
 }
 
 impl Default for NatConfig {
@@ -72,6 +76,7 @@ impl Default for NatConfig {
             prefix: 24,
             gateway_mac: [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02],
             domain: "vmmc.internal".into(),
+            service: None,
         }
     }
 }
