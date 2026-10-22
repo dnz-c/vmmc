@@ -140,6 +140,7 @@ export component AppWindow inherits Window {
     callback open-settings();
     callback new-vm();
     callback import-vm();
+    callback export-vm();
     callback suspend-vm();
 
     // The current VM's snapshots, as a tree, and the one picked (its ID).
@@ -249,7 +250,7 @@ export component AppWindow inherits Window {
                                 clicked => { root.new-vm(); }
                             }
                             Button {
-                                text: "Import VMware VM";
+                                text: "Import VM";
                                 clicked => { root.import-vm(); }
                             }
                         }
@@ -515,6 +516,11 @@ export component AppWindow inherits Window {
                                     Button {
                                         text: "Clone…";
                                         clicked => { root.open-clone(); }
+                                    }
+                                    Button {
+                                        text: "Export…";
+                                        enabled: !root.current.running;
+                                        clicked => { root.export-vm(); }
                                     }
                                     Button {
                                         text: "Remove from library";

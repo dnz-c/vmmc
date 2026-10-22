@@ -568,23 +568,52 @@ fn in_background(
     failed: &'static str,
     job: impl FnOnce() -> Result<String, String> + Send + 'static,
 ) {
+    background(window, doing, job, move |window, result| match result {
+        Ok(done) => window.set_status_text(capitalized(&done).into()),
+        Err(e) => {
+            window.set_status_text("".into());
+            message(window, failed, &e);
+        }
+    });
+}
+
+/// Runs `job` off the window's thread, saying `doing` meanwhile, then hands its result
+/// to `finished` on the window's.
+fn background<T: Send + 'static>(
+    window: &AppWindow,
+    doing: String,
+    job: impl FnOnce() -> T + Send + 'static,
+    finished: impl FnOnce(&AppWindow, T) + Send + 'static,
+) {
     window.set_status_text(doing.into());
     let weak = window.as_weak();
     std::thread::spawn(move || {
         let result = job();
         let _ = slint::invoke_from_event_loop(move || {
-            let Some(window) = weak.upgrade() else {
-                return;
-            };
-            match result {
-                Ok(done) => window.set_status_text(capitalized(&done).into()),
-                Err(e) => {
-                    window.set_status_text("".into());
-                    message(&window, failed, &e);
-                }
+            if let Some(window) = weak.upgrade() {
+                finished(&window, result);
             }
         });
     });
+}
+
+/// Shows a long job's progress (bytes done, of a total) in the status line, as
+/// "`what`: 45%".
+fn status_progress(window: &AppWindow, what: String) -> impl FnMut(u64, u64) + Send + 'static {
+    let weak = window.as_weak();
+    let mut shown = 0;
+    move |done, total| {
+        let percent = done * 100 / total.max(1);
+        if percent > shown {
+            shown = percent;
+            let (weak, text) = (weak.clone(), format!("{what}: {percent}%"));
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(window) = weak.upgrade() {
+                    window.set_status_text(text.into());
+                }
+            });
+        }
+    }
 }
 
 /// `text` with its first letter upper case, for the status line.
@@ -1097,35 +1126,15 @@ fn wire(window: &AppWindow, app: &Shared) {
         let linked = window.get_clone_linked() && snapshot.is_some();
         let name = window.get_clone_name().trim().to_owned();
         window.set_clone_open(false);
-        let weak = window.as_weak();
+        let progress = status_progress(&window, format!("Cloning {}", vm.config.name));
         let library_changed = app.borrow().library_changed.clone();
         in_background(
             &window,
             format!("Cloning {}…", vm.config.name),
             "Couldn't clone",
             move || {
-                let mut shown = 0;
-                let clone = vmmc_client::clone_vm(
-                    &vm,
-                    snapshot.as_deref(),
-                    &name,
-                    linked,
-                    |done, total| {
-                        let percent = done * 100 / total.max(1);
-                        if percent > shown {
-                            shown = percent;
-                            let (weak, text) = (
-                                weak.clone(),
-                                format!("Cloning {}: {percent}%", vm.config.name),
-                            );
-                            let _ = slint::invoke_from_event_loop(move || {
-                                if let Some(window) = weak.upgrade() {
-                                    window.set_status_text(text.into());
-                                }
-                            });
-                        }
-                    },
-                )?;
+                let clone =
+                    vmmc_client::clone_vm(&vm, snapshot.as_deref(), &name, linked, progress)?;
                 library_changed.store(true, Ordering::Relaxed);
                 Ok(format!(
                     "{} {} as {}",
@@ -1133,6 +1142,29 @@ fn wire(window: &AppWindow, app: &Shared) {
                     vm.config.name,
                     clone.config.name
                 ))
+            },
+        );
+    }));
+    window.on_export_vm(with!(app, window, {
+        let Some(vm) = current_vm(&app, &window) else {
+            return;
+        };
+        let Some(to) = dialogs::pick_save(
+            "Export as an OVF package",
+            "OVF package (*.ova)",
+            "*.ova",
+            &format!("{}.ova", vm.config.name),
+        ) else {
+            return;
+        };
+        let progress = status_progress(&window, format!("Exporting {}", vm.config.name));
+        in_background(
+            &window,
+            format!("Exporting {}…", vm.config.name),
+            "Couldn't export",
+            move || {
+                vmmc_client::export_vm(&vm, &to, progress)?;
+                Ok(format!("exported {} to {}", vm.config.name, to.display()))
             },
         );
     }));
@@ -1308,10 +1340,49 @@ fn wire(window: &AppWindow, app: &Shared) {
         }
     }));
     window.on_import_vm(with!(app, window, {
-        let Some(vmx) = dialogs::pick_file("Open a VMware VM", "VMware VM (*.vmx)", "*.vmx") else {
+        let Some(file) = dialogs::pick_file(
+            "Import a VM",
+            "VMware VMs and OVF packages (*.vmx, *.ova, *.ovf)",
+            "*.vmx;*.ova;*.ovf",
+        ) else {
             return;
         };
-        match vmconfig::import::import(&vmx, None) {
+        let ovf = file.extension().is_some_and(|extension| {
+            ["ova", "ovf"].contains(&extension.to_string_lossy().to_ascii_lowercase().as_str())
+        });
+        if ovf {
+            // Its disks are converted: off the window's thread.
+            let progress = status_progress(&window, "Importing: converting the disks".into());
+            let library_changed = app.borrow().library_changed.clone();
+            background(
+                &window,
+                format!("Importing {}…", file.display()),
+                move || vmmc_client::import_ovf(&file, None, progress),
+                move |window, imported| {
+                    window.set_status_text("".into());
+                    match imported {
+                        Ok(imported) => {
+                            library_changed.store(true, Ordering::Relaxed);
+                            let mut text = format!(
+                                "{} is in the library, its files in {}.",
+                                imported.vm.config.name,
+                                imported.vm.dir().display()
+                            );
+                            if !imported.warnings.is_empty() {
+                                text += "\n\nWorth knowing:\n";
+                                for warning in &imported.warnings {
+                                    text += &format!("• {warning}\n");
+                                }
+                            }
+                            message(window, "Imported", &text);
+                        }
+                        Err(e) => message(window, "Couldn't import that VM", &e),
+                    }
+                },
+            );
+            return;
+        }
+        match vmconfig::import::import(&file, None) {
             Ok(imported) => {
                 let mut state = app.borrow_mut();
                 state.library.add(&imported.vm.path, None);

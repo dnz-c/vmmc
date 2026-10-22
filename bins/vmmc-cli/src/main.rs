@@ -40,18 +40,24 @@ enum Command {
     /// Make a new VM: a folder with its config (.vmmc) and an empty disk, added to the
     /// library.
     Create(Box<CreateArgs>),
-    /// Open a VMware VM in place. vmmc's files go in a `vmmc` folder beside the .vmx,
-    /// and its writes go to delta disks there: VMware's files are never changed, and
-    /// deleting that folder leaves the VMware VM as it was.
+    /// Open a VMware VM (.vmx) in place, or make a new VM from an OVF package (.ova or
+    /// .ovf). A VMware VM's vmmc files go in a `vmmc` folder beside the .vmx, and its
+    /// writes go to delta disks there: VMware's files are never changed, and deleting
+    /// that folder leaves the VMware VM as it was. An OVF package's disks are converted
+    /// into a new VM's folder.
     Import {
-        vmx: PathBuf,
-        /// Put vmmc's files here instead.
+        file: PathBuf,
+        /// Put vmmc's files here instead (for an OVF package: the new VM's folder goes
+        /// here) [default for OVF: Documents\vmmc VMs].
         #[arg(long)]
         state_dir: Option<PathBuf>,
         /// The library folder to put it in.
         #[arg(long)]
         folder: Option<String>,
     },
+    /// Write a VM (it must be off) as an OVF package: an .ova, or an .ovf with its disks
+    /// and manifest beside it, as VMware and others import them.
+    Export { vm: String, to: PathBuf },
     /// List the library's VMs.
     List,
     /// Start a VM in the background, sandboxed. Its output goes to vmmc-vmx.log in its
@@ -554,6 +560,19 @@ fn worker_command(_: Command) -> Result<(), String> {
     Err("running VMs needs Windows for now".into())
 }
 
+/// Says every tenth of the way, on stderr, how far a long job (`done`, of `total`
+/// bytes) has come: "  copied 30%".
+fn progress_line(what: &'static str) -> impl FnMut(u64, u64) {
+    let mut shown = 0;
+    move |done, total| {
+        let percent = done * 100 / total.max(1);
+        if percent >= shown + 10 {
+            shown = percent - percent % 10;
+            eprintln!("  {what} {shown}%");
+        }
+    }
+}
+
 fn library_change(change: impl FnOnce(&mut Library) -> Result<(), String>) -> Result<(), String> {
     let mut library = Library::load(&library::default_path()).map_err(|e| e.to_string())?;
     change(&mut library)?;
@@ -571,11 +590,18 @@ fn run(command: Command) -> Result<(), String> {
             );
         }
         Command::Import {
-            vmx,
+            file,
             state_dir,
             folder,
         } => {
-            let imported = vmconfig::import::import(&vmx, state_dir.as_deref())?;
+            let ovf = file.extension().is_some_and(|extension| {
+                ["ova", "ovf"].contains(&extension.to_string_lossy().to_ascii_lowercase().as_str())
+            });
+            let imported = if ovf {
+                vmmc_client::import_ovf(&file, state_dir.as_deref(), progress_line("converted"))?
+            } else {
+                vmconfig::import::import(&file, state_dir.as_deref())?
+            };
             library_change(|library| {
                 library.add(&imported.vm.path, folder.as_deref());
                 Ok(())
@@ -597,6 +623,11 @@ fn run(command: Command) -> Result<(), String> {
         | Command::Suspend { .. }
         | Command::Tools { .. }) => worker_command(command)?,
         Command::Snapshot(command) => snapshot_command(command)?,
+        Command::Export { vm, to } => {
+            let vm = find_vm(&vm)?;
+            vmmc_client::export_vm(&vm, &to, progress_line("written"))?;
+            println!("exported {} to {}", vm.config.name, to.display());
+        }
         Command::Clone {
             vm,
             name,
@@ -604,15 +635,13 @@ fn run(command: Command) -> Result<(), String> {
             linked,
         } => {
             let vm = find_vm(&vm)?;
-            let mut shown = 0;
-            let clone =
-                vmmc_client::clone_vm(&vm, snapshot.as_deref(), &name, linked, |done, total| {
-                    let percent = done * 100 / total.max(1);
-                    if percent >= shown + 10 {
-                        shown = percent;
-                        eprintln!("  copied {percent}%");
-                    }
-                })?;
+            let clone = vmmc_client::clone_vm(
+                &vm,
+                snapshot.as_deref(),
+                &name,
+                linked,
+                progress_line("copied"),
+            )?;
             println!(
                 "{} {} into {}",
                 if linked { "linked" } else { "cloned" },

@@ -44,6 +44,7 @@ smoltcp = { version = "0.14.0", default-features = false, features = [
     "socket-udp",
     "auto-icmp-echo-reply",
 ] }
+roxmltree = "0.21.1"
 ruzstd = "0.9.1"
 # The console window: software rendering through winit, no GPU needed.
 slint = { version = "1.18.1", default-features = false, features = [
@@ -53,6 +54,7 @@ slint = { version = "1.18.1", default-features = false, features = [
     "renderer-software",
 ] }
 serde = { version = "1.0.229", features = ["derive"] }
+sha1 = "0.11.0"
 sha2 = "0.11.0"
 slint-build = "1.18.1"
 tempfile = "3.27.0"

@@ -30,8 +30,10 @@ pub mod clone;
 pub mod create;
 pub mod import;
 pub mod library;
+pub mod ovf;
 pub mod presets;
 pub mod snapshots;
+pub mod tar;
 mod time;
 pub mod vmx;
 

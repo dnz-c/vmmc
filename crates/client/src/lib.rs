@@ -280,6 +280,38 @@ pub fn clone_vm(
     Ok(clone)
 }
 
+/// Writes `vm` as an OVF package (an `.ova`, or an `.ovf` with its files beside it),
+/// as its disks are: it must be off. `progress` hears the disk bytes written and their
+/// total.
+pub fn export_vm(vm: &Vm, to: &Path, progress: impl FnMut(u64, u64)) -> Result<(), String> {
+    #[cfg(windows)]
+    if is_running(vm) {
+        return Err(format!(
+            "{} is running: shut it down to export it",
+            vm.config.name
+        ));
+    }
+    vmconfig::ovf::export(vm, to, progress)
+}
+
+/// Makes a new VM from the OVF package at `path`, in a folder in `parent_dir` (by
+/// default the folder new VMs go in), and puts it in the library. `progress` hears the
+/// disk bytes converted and their total.
+pub fn import_ovf(
+    path: &Path,
+    parent_dir: Option<&Path>,
+    progress: impl FnMut(u64, u64),
+) -> Result<vmconfig::import::Imported, String> {
+    let parent_dir = parent_dir.map_or_else(library::default_vm_root, Path::to_owned);
+    std::fs::create_dir_all(&parent_dir)
+        .map_err(|e| format!("can't create {}: {e}", parent_dir.display()))?;
+    let imported = vmconfig::ovf::import(path, &parent_dir, progress)?;
+    let mut library = Library::load(&library::default_path()).map_err(|e| e.to_string())?;
+    library.add(&imported.vm.path, None);
+    library.save().map_err(|e| e.to_string())?;
+    Ok(imported)
+}
+
 /// `vm`'s writable disk `number` (from 1), for changing it: the VM must be off and have
 /// no snapshots, whose deltas wouldn't match the disk any more.
 fn disk_to_change(vm: &Vm, number: usize) -> Result<PathBuf, String> {

@@ -272,6 +272,64 @@ pub fn clone_test() -> Result<(), String> {
     Ok(())
 }
 
+/// VMware's ovftool, from VMware Workstation.
+const OVFTOOL: &str = r"C:\Program Files (x86)\VMware\VMware Workstation\OVFTool\ovftool.exe";
+
+/// Runs ovftool with `args`.
+fn ovftool(args: &[&Path]) -> Result<(), String> {
+    let output = std::process::Command::new(OVFTOOL)
+        .arg("--acceptAllEulas")
+        .args(args)
+        .output()
+        .map_err(|e| format!("can't run ovftool: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ovftool {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stdout).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// `cargo xtask ova-test`: the test Linux exported as an OVA, imported, and booted in a
+/// sandboxed worker, passing the guest's checks. With VMware's ovftool there, the OVA
+/// also goes through VMware: ovftool makes a VMware VM of it, and an OVA of that VM in
+/// VMware's own words, which vmmc imports and boots too.
+pub fn ova_test() -> Result<(), String> {
+    let root = setup("ova-test")?;
+    let vm = linux_vm(&root, "Linux")?;
+    let ova = root.join("Linux.ova");
+    vmconfig::ovf::export(&vm, &ova, |_, _| {})?;
+    eprintln!(
+        "xtask: exported the VM ({} KiB)",
+        fs::metadata(&ova).map_or(0, |m| m.len() >> 10)
+    );
+    let imported_dir = root.join("imported");
+    fs::create_dir_all(&imported_dir).map_err(|e| e.to_string())?;
+    let imported = vmconfig::ovf::import(&ova, &imported_dir, |_, _| {})?;
+    eprintln!("xtask: imported it: {:?}", imported.warnings);
+    boot_linux(&imported.vm)?;
+    if Path::new(OVFTOOL).is_file() {
+        let vmware = root.join("vmware");
+        fs::create_dir_all(&vmware).map_err(|e| e.to_string())?;
+        let vmx = vmware.join("Linux.vmx");
+        ovftool(&[&ova, &vmx])?;
+        eprintln!("xtask: VMware's ovftool made a VMware VM of vmmc's OVA");
+        let back = root.join("FromVMware.ova");
+        ovftool(&[&vmx, &back])?;
+        let from_vmware = vmconfig::ovf::import(&back, &imported_dir, |_, _| {})?;
+        eprintln!(
+            "xtask: imported VMware's OVA of it: {:?}",
+            from_vmware.warnings
+        );
+        boot_linux(&from_vmware.vm)?;
+    } else {
+        eprintln!("xtask: no ovftool ({OVFTOOL}): VMware's part skipped");
+    }
+    eprintln!("ova-test passed");
+    Ok(())
+}
+
 /// Boots the test Linux of `vm` in a sandboxed worker: the worker shares its screen,
 /// and the guest passes its checks and powers off, which ends the worker.
 fn boot_linux(vm: &Vm) -> Result<(), String> {

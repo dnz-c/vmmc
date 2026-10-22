@@ -35,7 +35,7 @@ const CONTROLLERS: [(&str, u32, u32); 4] = [
 const MAX_NICS: u32 = 10;
 
 /// What a guest OS id means for vmmc's presets.
-fn os_from_guest(guest: &str) -> &'static str {
+pub(crate) fn os_from_guest(guest: &str) -> &'static str {
     let guest = guest.to_ascii_lowercase();
     if guest.starts_with("windows11") {
         "windows11"

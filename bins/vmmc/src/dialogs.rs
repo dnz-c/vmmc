@@ -70,8 +70,50 @@ fn show(title: &str, filter: Option<(&str, &str)>) -> Option<PathBuf> {
     }
 }
 
+/// Asks where to save a file of `kind` (`pattern`, like `*.ova`), suggesting `name`.
+#[cfg(windows)]
+pub fn pick_save(title: &str, kind: &str, pattern: &str, name: &str) -> Option<PathBuf> {
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+        CoTaskMemFree,
+    };
+    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+    use windows::Win32::UI::Shell::{FileSaveDialog, IFileSaveDialog, SIGDN_FILESYSPATH};
+    use windows::core::{HSTRING, PCWSTR};
+
+    // SAFETY: COM calls on the UI thread; every string outlives the calls that use it,
+    // and the returned path is freed with CoTaskMemFree.
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let dialog: IFileSaveDialog =
+            CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        dialog.SetTitle(&HSTRING::from(title)).ok()?;
+        let (kind, pattern) = (HSTRING::from(kind), HSTRING::from(pattern));
+        let specs = [COMDLG_FILTERSPEC {
+            pszName: PCWSTR(kind.as_ptr()),
+            pszSpec: PCWSTR(pattern.as_ptr()),
+        }];
+        dialog.SetFileTypes(&specs).ok()?;
+        let extension = pattern.to_string().trim_start_matches("*.").to_owned();
+        dialog.SetDefaultExtension(&HSTRING::from(extension)).ok()?;
+        dialog.SetFileName(&HSTRING::from(name)).ok()?;
+        // An error here is the user cancelling.
+        dialog.Show(None).ok()?;
+        let item = dialog.GetResult().ok()?;
+        let path = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let text = path.to_string().ok();
+        CoTaskMemFree(Some(path.0.cast()));
+        text.map(PathBuf::from)
+    }
+}
+
 #[cfg(not(windows))]
 pub fn pick_file(_: &str, _: &str, _: &str) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(not(windows))]
+pub fn pick_save(_: &str, _: &str, _: &str, _: &str) -> Option<PathBuf> {
     None
 }
 

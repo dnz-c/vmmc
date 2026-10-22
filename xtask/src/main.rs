@@ -62,6 +62,8 @@ tasks:
   worker-test   start VMs in sandboxed workers, as vmmc-cli does, and control them
                 through their pipes
   clone-test    a linked and a full clone of the test Linux, each booting
+  ova-test      the test Linux exported as an OVA, imported and booted, also
+                through VMware's ovftool where it's installed
   snapshot-test save a running Linux guest's whole state, then resume it from it
   win-snapshot-test
                 revert the Windows win11-test installed to a snapshot, suspend it,
@@ -127,6 +129,7 @@ fn main() -> ExitCode {
         Some("vmdk-compat-test") => vmdk_compat::test(),
         Some("worker-test") => worker::test(),
         Some("clone-test") => worker::clone_test(),
+        Some("ova-test") => worker::ova_test(),
         Some("snapshot-test") => snapshot::test(),
         Some("win-snapshot-test") => win_snapshot::test(),
         Some("easy-install-test") => easy_install::test(env::args().nth(2).as_deref()),
