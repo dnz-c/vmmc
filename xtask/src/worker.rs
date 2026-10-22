@@ -9,7 +9,7 @@
 //!    a hard stop ends it.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -190,20 +190,25 @@ fn snapshots(vm: &mut Vm) -> Result<(), String> {
     Ok(())
 }
 
-pub fn test() -> Result<(), String> {
+/// Builds the worker, and gives the workers the firmware with the UEFI shell (which runs
+/// the test ESP's startup.nsh). Returns the test's empty folder for its VMs.
+fn setup(name: &str) -> Result<PathBuf, String> {
     let workspace = workspace();
     let native = native::fetch(&workspace)?;
     build_vmmc_vmx(&workspace)?;
-    // The firmware with the UEFI shell, which runs the ESP's startup.nsh; the worker
-    // inherits the variable.
+    // The worker inherits the variable.
     // SAFETY: no other thread of xtask reads the environment at this point.
     unsafe { std::env::set_var("VMMC_FIRMWARE", native.join("OVMF_CODE.test.fd")) };
-    let root = workspace.join("target").join("worker-test");
+    let root = workspace.join("target").join(name);
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).map_err(|e| format!("can't create {}: {e}", root.display()))?;
+    Ok(root)
+}
 
-    // 1. Linux, booted from an ESP, its scratch disk the VM's own VMDK.
-    let mut vm = new_vm(&root, "Linux")?;
+/// A new VM in `root` with the test Linux: booted from an ESP (a read-only disk), its
+/// scratch disk the VM's own VMDK, with a TPM.
+fn linux_vm(root: &Path, name: &str) -> Result<Vm, String> {
+    let mut vm = new_vm(root, name)?;
     let http = crate::serve_http()?;
     let files = firmware::linux_boot_files(&format!(" vmmc.http={http} vmmc.tpm"))?;
     let files: Vec<(&str, &[u8])> = files.iter().map(|(n, d)| (*n, d.as_slice())).collect();
@@ -218,8 +223,60 @@ pub fn test() -> Result<(), String> {
     );
     vm.config.firmware.tpm = true;
     vm.save().map_err(|e| e.to_string())?;
+    Ok(vm)
+}
+
+pub fn test() -> Result<(), String> {
+    let root = setup("worker-test")?;
+    // 1. Linux, booted from an ESP, its scratch disk the VM's own VMDK.
+    let vm = linux_vm(&root, "Linux")?;
+    boot_linux(&vm)?;
+
+    // 2. Nothing to boot: the firmware waits, until a hard stop.
+    idle(&root)?;
+    let _ = fs::remove_dir_all(&root);
+    eprintln!("worker-test passed");
+    Ok(())
+}
+
+/// `cargo xtask clone-test`: the test Linux cloned two ways, each clone booting in a
+/// sandboxed worker and passing the guest's checks on a disk of its own: a linked clone
+/// of a snapshot (its disk a delta on the snapshot's), and a full clone of the VM as it
+/// is. The linked clone's snapshot can't be deleted while the clone is there.
+pub fn clone_test() -> Result<(), String> {
+    let root = setup("clone-test")?;
+    let mut vm = linux_vm(&root, "Linux")?;
+    let snapshot = vmconfig::snapshots::take(&mut vm, "Clean", "")?;
+    let clone = |name, snapshot, linked| {
+        vmconfig::clone::clone_vm(
+            &vmconfig::clone::Clone {
+                source: &vm,
+                snapshot,
+                name,
+                parent_dir: &root,
+                linked,
+            },
+            |_, _| {},
+        )
+    };
+    let linked = clone("Linked", Some(snapshot.id.as_str()), true)?;
+    eprintln!("xtask: made a linked clone of {:?}", snapshot.name);
+    boot_linux(&linked)?;
+    let full = clone("Full", None, false)?;
+    eprintln!("xtask: made a full clone");
+    boot_linux(&full)?;
+    if vmconfig::snapshots::delete(&vm, &snapshot.id).is_ok() {
+        return Err("the linked clone's snapshot could be deleted".into());
+    }
+    eprintln!("clone-test passed");
+    Ok(())
+}
+
+/// Boots the test Linux of `vm` in a sandboxed worker: the worker shares its screen,
+/// and the guest passes its checks and powers off, which ends the worker.
+fn boot_linux(vm: &Vm) -> Result<(), String> {
     let log = vm.dir().join(vmmc_client::LOG_FILE);
-    let mut connection = vmmc_client::start(&vm)?;
+    let mut connection = vmmc_client::start(vm)?;
     let status = connection.status()?;
     eprintln!(
         "xtask: worker {} runs with {}",
@@ -248,17 +305,20 @@ pub fn test() -> Result<(), String> {
     start_shell(&mut connection, &log)?;
     expect_in_log(&log, &firmware::LINUX_MARKERS, TIMEOUT, 0)?;
     // The guest powers off after its checks, which ends the worker.
-    wait_until_stopped(&vm)?;
+    wait_until_stopped(vm)?;
     expect_in_log(
         &log,
         &["vmmc-vmx: guest powered off"],
         Duration::from_secs(5),
         0,
     )?;
-    drop((connection, screen));
+    Ok(())
+}
 
-    // 2. Nothing to boot: the firmware waits, until a hard stop.
-    let mut idle = new_vm(&root, "Idle")?;
+/// A VM with nothing to boot waits in the firmware: a second start is refused, a disc
+/// goes in, snapshots work, and a hard stop ends it.
+fn idle(root: &Path) -> Result<(), String> {
+    let mut idle = new_vm(root, "Idle")?;
     let mut connection = vmmc_client::start(&idle)?;
     let again = vmmc_client::start(&idle).err().unwrap_or_default();
     if !again.contains("running already") {
@@ -305,8 +365,5 @@ pub fn test() -> Result<(), String> {
     connection.command(&Request::Stop)?;
     wait_until_stopped(&idle)?;
     eprintln!("xtask: a hard stop ended the idle VM");
-
-    let _ = fs::remove_dir_all(&root);
-    eprintln!("worker-test passed");
     Ok(())
 }

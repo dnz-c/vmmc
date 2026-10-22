@@ -26,6 +26,7 @@
 //! mac = "52:54:00:4e:5f:60"
 //! ```
 
+pub mod clone;
 pub mod create;
 pub mod import;
 pub mod library;

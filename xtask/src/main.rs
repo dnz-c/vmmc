@@ -60,9 +60,12 @@ tasks:
                 install Windows ($VMMC_WIN11_ISO) and Ubuntu with Easy Install in
                 sandboxed workers, as the app does (20-60 minutes)
   worker-test   start VMs in sandboxed workers, as vmmc-cli does, and control them
-  snapshot-test save a running Linux guest's whole state, then resume it from it
-  win-snapshot-test  suspend the Windows win11-test installed, resume it, shut it down
                 through their pipes
+  clone-test    a linked and a full clone of the test Linux, each booting
+  snapshot-test save a running Linux guest's whole state, then resume it from it
+  win-snapshot-test
+                revert the Windows win11-test installed to a snapshot, suspend it,
+                resume it, shut it down
   vmdk-compat-test
                 check vmmc's VMDKs against VMware's vmware-vdiskmanager, both ways
                 (needs VMware Workstation)
@@ -123,6 +126,7 @@ fn main() -> ExitCode {
         Some("ubuntu-desktop-test") => ubuntu::test(),
         Some("vmdk-compat-test") => vmdk_compat::test(),
         Some("worker-test") => worker::test(),
+        Some("clone-test") => worker::clone_test(),
         Some("snapshot-test") => snapshot::test(),
         Some("win-snapshot-test") => win_snapshot::test(),
         Some("easy-install-test") => easy_install::test(env::args().nth(2).as_deref()),

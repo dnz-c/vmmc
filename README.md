@@ -88,6 +88,7 @@ cargo xtask ubuntu-desktop-test                 # Ubuntu 26.04 Desktop autoinsta
 cargo xtask vmdk-compat-test                    # vmmc's VMDKs against VMware's vdiskmanager (needs VMware)
 cargo xtask vmware-import-test                  # open a VMware VM in place and boot it (VMMC_VMWARE_VMX)
 cargo xtask worker-test                         # VMs in sandboxed workers, controlled through their pipes
+cargo xtask clone-test                          # a linked and a full clone of the test Linux, each booting
 cargo xtask easy-install-test                   # Easy Install of Windows ($VMMC_WIN11_ISO) and Ubuntu
 cargo xtask linux-shell                         # test Linux with a shell on this terminal
 ```

@@ -86,6 +86,19 @@ enum Command {
     Snapshot(SnapshotCommand),
     /// Save a running VM's state and stop it; its next start resumes it.
     Suspend { vm: String },
+    /// Make a new VM from one: of a snapshot of it, or of it as it is (with it off). A
+    /// full clone copies its disks; a linked clone (of a snapshot) writes to deltas on
+    /// the snapshot's disks, which then can't be deleted while the clone is there. The
+    /// clone gets a new UUID, MAC address, UEFI variables and TPM.
+    Clone {
+        vm: String,
+        name: String,
+        /// The snapshot to clone, by name or ID.
+        #[arg(long)]
+        snapshot: Option<String>,
+        #[arg(long)]
+        linked: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -101,7 +114,8 @@ enum SnapshotCommand {
     List { vm: String },
     /// Go back to a snapshot (by name or ID): what the VM did since is gone.
     Revert { vm: String, snapshot: String },
-    /// Delete a snapshot. Its disk images stay, under the disks that came after it.
+    /// Delete a snapshot. Its disk changes merge into the disks beneath, at once with the
+    /// VM off, or when it stops.
     Delete { vm: String, snapshot: String },
 }
 
@@ -563,6 +577,29 @@ fn run(command: Command) -> Result<(), String> {
         | Command::Suspend { .. }
         | Command::Tools { .. }) => worker_command(command)?,
         Command::Snapshot(command) => snapshot_command(command)?,
+        Command::Clone {
+            vm,
+            name,
+            snapshot,
+            linked,
+        } => {
+            let vm = find_vm(&vm)?;
+            let mut shown = 0;
+            let clone =
+                vmmc_client::clone_vm(&vm, snapshot.as_deref(), &name, linked, |done, total| {
+                    let percent = done * 100 / total.max(1);
+                    if percent >= shown + 10 {
+                        shown = percent;
+                        eprintln!("  copied {percent}%");
+                    }
+                })?;
+            println!(
+                "{} {} into {}",
+                if linked { "linked" } else { "cloned" },
+                vm.config.name,
+                clone.path.display()
+            );
+        }
         Command::Add { file, folder } => {
             let file = std::path::absolute(&file).map_err(|e| e.to_string())?;
             vmconfig::Vm::load(&file).map_err(|e| e.to_string())?;

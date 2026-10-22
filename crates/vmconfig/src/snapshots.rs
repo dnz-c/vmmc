@@ -62,6 +62,20 @@ pub struct Snapshot {
     /// Taken while the VM ran: it has the VM's memory and device state.
     #[serde(default)]
     pub running: bool,
+    /// The linked clones made from it (their `.vmmc` files), whose disks are deltas on
+    /// its images: it can't be deleted while they're there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clones: Vec<String>,
+}
+
+impl Snapshot {
+    /// The linked clones made from it that are still there.
+    pub fn live_clones(&self) -> impl Iterator<Item = &str> {
+        self.clones
+            .iter()
+            .map(String::as_str)
+            .filter(|clone| Path::new(clone).is_file())
+    }
 }
 
 /// The folder a VM's snapshots are in.
@@ -256,6 +270,7 @@ impl Pending {
             created: crate::now(),
             parent: tree.current.clone(),
             running,
+            clones: Vec::new(),
         };
         tree.current = Some(snapshot.id.clone());
         tree.snapshots.push(snapshot.clone());
@@ -409,6 +424,14 @@ pub fn delete(vm: &Vm, id: &str) -> Result<(), String> {
         .get(id)
         .cloned()
         .ok_or_else(|| format!("{} has no snapshot {id}", vm.config.name))?;
+    let clones: Vec<&str> = snapshot.live_clones().collect();
+    if !clones.is_empty() {
+        return Err(format!(
+            "“{}” is what the linked clone {} is made from: remove that first",
+            snapshot.name,
+            clones.join(", ")
+        ));
+    }
     tree.snapshots.retain(|other| other.id != id);
     for other in &mut tree.snapshots {
         if other.parent.as_deref() == Some(id) {

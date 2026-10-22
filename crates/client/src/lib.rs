@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use ipc::{Request, Response, Status, VERSION};
 use vmconfig::Vm;
+use vmconfig::library::{self, Library};
 
 /// The worker's log, in the VM's folder.
 pub const LOG_FILE: &str = "vmmc-vmx.log";
@@ -228,6 +229,55 @@ pub fn delete_snapshot(vm: &mut Vm, snapshot: &str) -> Result<String, String> {
             merged.join(", ")
         )
     })
+}
+
+/// Clones `vm` (see [`vmconfig::clone`]): a snapshot of it (by ID or name), or the VM
+/// as it is, which must be off then. The clone goes beside it, and into the library's
+/// folder `vm` is in. `progress` hears a full clone's bytes copied and their total.
+pub fn clone_vm(
+    vm: &Vm,
+    snapshot: Option<&str>,
+    name: &str,
+    linked: bool,
+    progress: impl FnMut(u64, u64),
+) -> Result<Vm, String> {
+    let tree = vmconfig::snapshots::Tree::load(vm).map_err(|e| e.to_string())?;
+    let id = match snapshot {
+        Some(snapshot) => Some(
+            tree.find(snapshot)
+                .ok_or_else(|| format!("{} has no snapshot {snapshot:?}", vm.config.name))?
+                .id
+                .clone(),
+        ),
+        None => None,
+    };
+    #[cfg(windows)]
+    if id.is_none() && is_running(vm) {
+        return Err(format!(
+            "{} is running: shut it down to clone it as it is, or clone a snapshot of it",
+            vm.config.name
+        ));
+    }
+    let parent_dir = vm.dir().parent().unwrap_or(vm.dir());
+    let clone = vmconfig::clone::clone_vm(
+        &vmconfig::clone::Clone {
+            source: vm,
+            snapshot: id.as_deref(),
+            name,
+            parent_dir,
+            linked,
+        },
+        progress,
+    )?;
+    let mut library = Library::load(&library::default_path()).map_err(|e| e.to_string())?;
+    let folder = library
+        .entries()
+        .iter()
+        .find(|entry| Path::new(&entry.path) == vm.path)
+        .and_then(|entry| entry.folder.clone());
+    library.add(&clone.path, folder.as_deref());
+    library.save().map_err(|e| e.to_string())?;
+    Ok(clone)
 }
 
 /// Suspends the running `vm`: its state is saved, and its next start resumes it.
