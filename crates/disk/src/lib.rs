@@ -13,6 +13,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 pub use switchable::Switchable;
+pub use vmdk::stream::write_stream_optimized;
 pub use vmdk::{
     compact, create_delta, create_sparse, expand, merge_into_parent, parent_of, reparent,
 };

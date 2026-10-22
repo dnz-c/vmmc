@@ -5,6 +5,7 @@ use std::thread;
 
 use super::descriptor::{Access, Descriptor, ExtentLine, ExtentType};
 use super::sparse::{self, Header};
+use super::stream::write_stream_optimized;
 use super::*;
 
 const MIB: u64 = 1 << 20;
@@ -297,6 +298,36 @@ fn compacting_drops_the_grains_of_zeroes() {
     );
     assert_eq!(disk.descriptor().extents[0].file, "disk.vmdk");
     assert!(!dir.path().join("disk.vmdk-compact").exists());
+}
+
+#[test]
+fn a_disk_written_as_a_stream_reads_back_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("disk.vmdk");
+    // Past the first grain table, with a last grain that isn't whole.
+    let len = 40 * MIB + 7 * 512;
+    fs::write(dir.path().join("disk.raw"), vec![0u8; len as usize]).unwrap();
+    create_sparse(&path, 40 * MIB).unwrap();
+    let source = crate::RawFile::open(&dir.path().join("disk.raw"), false).unwrap();
+    source
+        .write_at(&pattern(3 * GRAIN as usize, 1), GRAIN / 2)
+        .unwrap();
+    source.write_at(&pattern(1000, 2), 33 * MIB).unwrap();
+    source.write_at(&pattern(7 * 512, 3), 40 * MIB).unwrap();
+    let stream = dir.path().join("stream.vmdk");
+    let mut seen = 0;
+    write_stream_optimized(&source, &stream, |done| seen = done).unwrap();
+    assert_eq!(seen, len, "progress to the end");
+    assert!(
+        write_stream_optimized(&source, &stream, |_| {}).is_err(),
+        "never replaced"
+    );
+    let back = Vmdk::open(&stream, true).unwrap();
+    assert_eq!(back.len(), len);
+    assert_eq!(back.descriptor().create_type, "streamOptimized");
+    assert_eq!(read(&back, 0, len as usize), read(&source, 0, len as usize));
+    // Only the grains with data: four of them, and their tables.
+    assert!(fs::metadata(&stream).unwrap().len() < 200 << 10);
 }
 
 #[test]

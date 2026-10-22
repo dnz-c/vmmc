@@ -311,6 +311,21 @@ pub fn test() -> Result<(), String> {
     )?;
     eprintln!("xtask: VMware reads a disk vmmc expanded and compacted");
 
+    // 7. A stream-optimized disk vmmc wrote (as for OVF), read by VMware.
+    let streamed = dir.join("vmmc-stream.vmdk");
+    disk::write_stream_optimized(
+        &*disk::open(&resized, true).map_err(|e| e.to_string())?,
+        &streamed,
+        |_| {},
+    )
+    .map_err(|e| e.to_string())?;
+    check(
+        &vmware_copy(&tool, &streamed, "0", "check-stream.vmdk")?,
+        &resized_writes,
+        "VMware's copy of vmmc's stream-optimized disk",
+    )?;
+    eprintln!("xtask: VMware reads vmmc's stream-optimized disk");
+
     // Every disk is closed by now (each was opened for one check).
     fs::remove_dir_all(&dir).map_err(|e| format!("can't remove {}: {e}", dir.display()))?;
     eprintln!("vmdk-compat-test passed");

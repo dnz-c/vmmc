@@ -13,6 +13,7 @@
 
 pub mod descriptor;
 pub mod sparse;
+pub mod stream;
 
 use std::fs::{self, File, OpenOptions};
 use std::hash::{BuildHasher, RandomState};
