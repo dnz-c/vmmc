@@ -408,6 +408,17 @@ fn refresh(app: &Shared) {
             .iter()
             .map(|vm| vm.as_ref().is_ok_and(vmmc_client::is_running))
             .collect();
+        // A VM that started or stopped may have a changed file: its worker writes it
+        // (when it started, Easy Install's steps and discs, snapshots' disks).
+        for (index, now) in running.iter().enumerate() {
+            if state.running.get(index) != Some(now) {
+                let path = match &state.vms[index] {
+                    Ok(vm) => vm.path.clone(),
+                    Err((path, _)) => path.clone(),
+                };
+                state.vms[index] = Vm::load(&path).map_err(|e| (path, e.to_string()));
+            }
+        }
         state.running = running;
     }
     let entries = state.library.entries().to_vec();
@@ -666,6 +677,14 @@ fn current_vm(app: &Shared, window: &AppWindow) -> Option<Vm> {
     vm_at(&state, path).map(|(_, vm)| vm.clone())
 }
 
+/// The current tab's VM as its file has it now, to change and save. The worker changes
+/// the file (Easy Install's steps and discs, snapshots' disks), so what the library
+/// loaded earlier may be out of date, and saving that would undo those changes.
+fn current_vm_on_disk(app: &Shared, window: &AppWindow) -> Option<Result<Vm, String>> {
+    let path = current_vm(app, window)?.path;
+    Some(Vm::load(&path).map_err(|e| e.to_string()))
+}
+
 /// Sends `request` to the current VM, through its console or a fresh connection.
 fn command(app: &Shared, window: &AppWindow, request: Request) {
     if let Some(console) = app.borrow().console.as_ref()
@@ -893,10 +912,13 @@ fn wire(window: &AppWindow, app: &Shared) {
             let Some(window) = w.upgrade() else {
                 return;
             };
-            if let Some(mut vm) = current_vm(&app, &window) {
-                vm.config.notes = notes.to_string();
-                if let Err(e) = vm.save() {
-                    message(&window, "Couldn't save the notes", &e.to_string());
+            if let Some(vm) = current_vm_on_disk(&app, &window) {
+                let saved = vm.and_then(|mut vm| {
+                    vm.config.notes = notes.to_string();
+                    vm.save().map_err(|e| e.to_string())
+                });
+                if let Err(e) = saved {
+                    message(&window, "Couldn't save the notes", &e);
                 }
                 reload(&app);
                 refresh(&app);
@@ -1050,8 +1072,10 @@ fn wire(window: &AppWindow, app: &Shared) {
         }
     }));
     window.on_open_settings(with!(app, window, {
-        let Some(vm) = current_vm(&app, &window) else {
-            return;
+        let vm = match current_vm_on_disk(&app, &window) {
+            Some(Ok(vm)) => vm,
+            Some(Err(e)) => return message(&window, "Couldn't read the VM's file", &e),
+            None => return,
         };
         let config = &vm.config;
         window.set_settings_cpus(i32::from(config.cpus));
@@ -1084,8 +1108,10 @@ fn wire(window: &AppWindow, app: &Shared) {
         });
     }
     window.on_save_settings(with!(app, window, {
-        let Some(mut vm) = current_vm(&app, &window) else {
-            return;
+        let mut vm = match current_vm_on_disk(&app, &window) {
+            Some(Ok(vm)) => vm,
+            Some(Err(e)) => return window.set_settings_error(e.into()),
+            None => return,
         };
         let config = &mut vm.config;
         config.cpus = window

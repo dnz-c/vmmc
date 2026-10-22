@@ -160,6 +160,39 @@ pub fn create_vm(new: &NewVm) -> Result<Vm, String> {
     Ok(vm)
 }
 
+/// Ends Easy Install in `config`: the install discs come out (the first drive stays,
+/// empty, for a disc later; the answer disc's drive goes) and so do the steps.
+pub fn end_install(config: &mut VmConfig) {
+    let mut kept = false;
+    config.cdroms.retain_mut(|cd| {
+        if !cd.install_media {
+            return true;
+        }
+        if kept {
+            return false;
+        }
+        kept = true;
+        cd.path = None;
+        cd.install_media = false;
+        true
+    });
+    config.install = None;
+}
+
+/// Whether `vm`'s Easy Install is over though its config still has it: the answer disc
+/// is gone, which only the install's end deletes. (An old copy of the config saved over
+/// the new one brings the steps back; typed again, they'd install over the installed
+/// system.)
+pub fn install_is_over(vm: &Vm) -> bool {
+    vm.config.install.is_some()
+        && vm
+            .config
+            .cdroms
+            .iter()
+            .any(|cd| cd.install_media && cd.path.as_deref() == Some(ANSWER_DISC))
+        && !vm.resolve(ANSWER_DISC).exists()
+}
+
 /// The answer disc for `install`, and what the first boot does with it.
 fn answer_disc(
     name: &str,
@@ -396,6 +429,19 @@ mod tests {
         let install = config.install.as_ref().unwrap();
         assert_eq!(install.eject_on, Some(EjectOn::PowerOff));
         assert_eq!(install.steps[0].send, "c");
+        assert!(!install_is_over(&ubuntu), "its answer disc is there");
+
+        // Its end deletes the answer disc. A config with the install still in it then
+        // has an install that's over, which ends as the worker ends it.
+        fs::remove_file(ubuntu.dir().join(ANSWER_DISC)).unwrap();
+        let mut over = Vm::load(&ubuntu.path).unwrap();
+        assert!(install_is_over(&over));
+        end_install(&mut over.config);
+        assert!(over.config.install.is_none());
+        assert_eq!(over.config.cdroms.len(), 1, "the first drive stays");
+        assert_eq!(over.config.cdroms[0].path, None);
+        assert!(!over.config.cdroms[0].install_media);
+        assert!(!install_is_over(&over));
 
         let windows = create_vm(&new(
             "Windows",

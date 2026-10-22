@@ -91,21 +91,7 @@ impl Installer {
                 let _ = std::fs::remove_file(vm.resolve(vmconfig::create::ANSWER_DISC));
             }
         }
-        // The first drive stays, empty, for a disc later; the answer disc's goes.
-        let mut kept = false;
-        vm.config.cdroms.retain_mut(|cd| {
-            if !cd.install_media {
-                return true;
-            }
-            if kept {
-                return false;
-            }
-            kept = true;
-            cd.path = None;
-            cd.install_media = false;
-            true
-        });
-        vm.config.install = None;
+        vmconfig::create::end_install(&mut vm.config);
         if let Err(e) = vm.save() {
             eprint!("\r\nvmmc-vmx: Easy Install: can't update the VM's file: {e}\r\n");
         }

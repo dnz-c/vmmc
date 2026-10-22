@@ -208,6 +208,13 @@ fn with_vm(mut args: RunArgs) -> Result<RunArgs, String> {
         return Ok(args);
     };
     let mut vm = vmconfig::Vm::load(path).map_err(|e| e.to_string())?;
+    if vmconfig::create::install_is_over(&vm) {
+        vmconfig::create::end_install(&mut vm.config);
+        vm.save().map_err(|e| e.to_string())?;
+        eprintln!(
+            "vmmc-vmx: Easy Install's answer disc is gone, so the install is over: its discs and steps are out of the VM's file"
+        );
+    }
     let config = &vm.config;
     if args.firmware.is_none() {
         args.firmware =
