@@ -808,6 +808,8 @@ fn run_machines(
             && !targets.quitting()
             && let Some(vm) = installer.finish(ended)
         {
+            // Where the next machine's disks come from (see the loop's start).
+            targets.set_vm(Some(vm.clone()));
             args.loaded = Some(vm);
             drop(machine);
             continue;
