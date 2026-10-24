@@ -25,18 +25,22 @@ Windows from an ISO) is done:
   vmmc's Windows display driver, Windows follows the window's size and its cursor is
   drawn by the window.
 
-Phase 3 (the desktop app and moving over from VMware) is under way:
-- **VMs are files:** a folder with a `.vmmc` config, made by `vmmc-cli create`, run by
-  `vmmc-vmx run --vm`.
+Phase 3 (the desktop app and moving over from VMware) is done:
+- **VMs are files:** a folder with a `.vmmc` config and its disks.
 - **Disks are VMDKs**, VMware's format: vmmc reads and writes the kinds VMware makes,
   and VMware's own tools accept vmmc's.
-- **VMware VMs open in place** (`vmmc-cli import`), behind delta disks that keep
-  VMware's files unchanged.
-- **VMs run in sandboxed workers** (`vmmc-cli start`): a background process per VM,
-  at low integrity with a restricted token, which can write only to its VM's folder.
+- **VMware VMs open in place**, behind delta disks that keep VMware's files unchanged;
+  OVF packages (`.ova`, `.ovf`) import and export.
+- **VMs run in sandboxed workers:** a background process per VM, at low integrity with
+  a restricted token, which can write only to its VM's folder.
 - **The app** (`vmmc`): the library, a New VM wizard with **Easy Install** (Windows
-  and Ubuntu install with no questions), settings, and each running VM's screen in a
-  tab.
+  and Ubuntu install with no questions), settings, each running VM's screen in a tab,
+  snapshots, suspend, clones, and export.
+- **Snapshots** of running VMs keep their memory; revert, suspend and resume work for
+  Windows and Linux. Clones are full or linked; disks expand and compact.
+- **vmmc Tools** share the clipboard and drag files both ways, in Windows and Linux
+  guests.
+- **`vmmc-cli`** does all of it from the command line.
 
 What a release still needs is listed in [docs/RELEASE-BLOCKERS.md](docs/RELEASE-BLOCKERS.md).
 
@@ -114,13 +118,27 @@ target\release\vmmc.exe
   takes the install discs out (deleting the answer disc, which holds the password) and
   starts the guest from its disk. The guest gets your time zone, and Ubuntu your
   keyboard layout and locale.
-- **Import VMware VM** opens a `.vmx` in place (see below).
+- **Import VM** opens a VMware VM (`.vmx`) in place (see [Moving over from
+  VMware](#moving-over-from-vmware)), or makes a new VM from an OVF package (`.ova`,
+  `.ovf`), converting its disks.
 - **A VM's tab** shows its hardware and notes and starts it; while it runs, its screen.
   Click the screen to type in the guest: every key goes to it, the Windows key and
   Alt+Tab included, until **Ctrl+Alt** gives the keyboard back. The pointer is a USB
   tablet, so it moves freely in and out. With **Fit guest to window**, a Windows guest
   with vmmc's display driver takes the window's size. **Full screen**, **Ctrl+Alt+Del**,
-  shut down (the power button), power off and reset are on the toolbar.
+  shut down (the power button), power off, reset and **Suspend** (its state saved; Start
+  then resumes it) are on the toolbar.
+- **Settings:** processors, memory, the DVD drive's disc, resolution, Secure Boot, the
+  TPM, Hyper-V enlightenments, the network adapter (e1000e or virtio-net), and the
+  disks: add a new one, remove one (its file stays), or expand one.
+- **Snapshots:** a VM's page lists them as a tree. **Take snapshot** keeps the VM as
+  it is, with its memory while it runs (it pauses for a moment); **Revert to it** goes
+  back; **Delete** forgets one and merges its disk changes into the disks beneath (at
+  once with the VM off, or when it stops).
+- **Clone…** makes a new VM from the VM as it is (off) or from a snapshot: a full clone
+  copies the disks, a linked clone (of a snapshot) writes to new disks on top of the
+  snapshot's, which then stays while the clone is there. **Export…** writes the VM as
+  an `.ova` that VMware and others import.
 - **vmmc Tools:** **Install vmmc Tools** on a running VM's toolbar puts the Tools disc
   in its DVD drive. In Windows, AutoPlay offers its setup. In Linux, run
   `sudo sh "$(findmnt -nro TARGET -S LABEL=VMMC_TOOLS)/install-linux.sh"` in a terminal
@@ -137,6 +155,59 @@ target\release\vmmc.exe
   through XWayland, so Wayland desktops (GNOME's) take part.
 - VMs keep running when the app closes; open it again to get back to them.
 - The library is `%APPDATA%\vmmc\library.toml`; `VMMC_LIBRARY` names another.
+
+## Moving over from VMware
+
+1. **Shut the VM down in VMware.** vmmc refuses a suspended VM (VMware's suspended
+   state doesn't carry over), one VMware has open, and an encrypted one (remove the
+   encryption in VMware first).
+2. **Import VM** in the app, and pick the `.vmx` (or `vmmc-cli import
+   "D:\VMs\Windows 10\Windows 10.vmx"`). vmmc puts its own files in a `vmmc` folder
+   beside the `.vmx`: the config, fresh UEFI variables, and a delta disk on top of each
+   of VMware's disks, which takes everything the guest writes. VMware's disks, `.vmx`
+   and `.nvram` are never written. The VM's first snapshot, **Imported from VMware**,
+   is VMware's disks as VMware left them: reverting to it goes back there.
+3. **Start it.** Windows finds new hardware and sets it up (NVMe, SATA and e1000e have
+   drivers in Windows); it may ask to be activated again. A VM with a TPM gets a new
+   one, so BitLocker asks for its recovery key: have it ready (the import warns when it
+   finds a BitLocker volume).
+4. **Swap the tools:** uninstall VMware Tools (it needs VMware's hypervisor, and reports
+   an error at logon), then **Install vmmc Tools**: the clipboard, drag and drop and,
+   in Windows, the display driver.
+
+- **What carries over:** CPUs, memory, NVMe and SATA disks, the ISO in the DVD drive,
+  the NICs' MAC addresses (as e1000e on NAT), Secure Boot, and the system UUID.
+- **What doesn't:** sound, 3D, shared folders, bridged networking, nested
+  virtualization; the import lists what it left out. Disks on SCSI or IDE go on SATA.
+- **What it refuses:** encrypted VMs, VMs that boot with BIOS (vmmc's firmware is
+  UEFI), suspended VMs, and VMs VMware has open.
+- **Going back:** the VM still runs in VMware as before, and deleting the `vmmc` folder
+  undoes the import. (If the VM runs in VMware again, its disks change, and vmmc
+  refuses the deltas it made on the old contents, as VMware would.) To take what you
+  did in vmmc back to VMware, **Export…** an `.ova` and open it in VMware.
+- **Leaving VMware's files behind:** **Clone…** the VM as it is (a full clone), and the
+  clone's disks are its own; the VMware folder is then no longer needed.
+- **Other hypervisors:** an `.ova` or `.ovf` from VirtualBox, VMware or others imports
+  with **Import VM**, its disks converted into a new VM's folder, as long as the VM
+  boots with UEFI.
+
+## The command line
+
+`vmmc-cli` does what the app does:
+
+```text
+vmmc-cli create NAME [--os ...] [--iso ISO [--easy-install --password P]]
+vmmc-cli import FILE.vmx|FILE.ova|FILE.ovf      vmmc-cli export VM FILE.ova|FILE.ovf
+vmmc-cli list | start VM | stop VM [--hard] | reset VM | status VM | suspend VM | tools VM
+vmmc-cli snapshot create VM NAME | list VM | revert VM SNAPSHOT | delete VM SNAPSHOT
+vmmc-cli clone VM NAME [--snapshot SNAPSHOT] [--linked]
+vmmc-cli disk create PATH --size S | info PATH | convert FROM TO
+vmmc-cli disk expand VM --size S | compact VM
+vmmc-cli add FILE.vmmc | remove FILE.vmmc
+```
+
+A VM is named by its name in the library or its `.vmmc` file; `vmmc-cli help COMMAND`
+says more.
 
 ## Running a VM
 
@@ -259,37 +330,16 @@ Secure Boot and a TPM.
   driver is test-signed for now, so it needs a VM with Secure Boot off; see
   [guest drivers](guest-drivers/windows/README.md).
 
-### Opening a VMware VM
-
-```powershell
-target\release\vmmc-cli.exe import "D:\VMs\Windows 10\Windows 10.vmx"
-target\release\vmmc-vmx.exe run --vm "D:\VMs\Windows 10\vmmc\Windows 10.vmmc" --display window
-```
-
-The import reads the `.vmx` and puts vmmc's files in a `vmmc` folder beside it: the
-config, fresh UEFI variables, and a delta disk on top of each of VMware's disks, which
-takes everything the guest writes. VMware's disks, `.vmx` and `.nvram` are never
-written, so the VM still runs in VMware as before, and deleting the `vmmc` folder undoes
-the import. (If the VM runs in VMware again afterwards, its disks change, and vmmc
-refuses the deltas it made on the old contents, as VMware would.)
-
-- **What carries over:** CPUs, memory, NVMe and SATA disks, the ISO in the DVD drive,
-  the NICs' MAC addresses (as e1000e on NAT), Secure Boot, and the system UUID.
-- **What doesn't:** sound, 3D, shared folders, bridged networking, nested
-  virtualization; the import lists what it left out. Windows sees new hardware and
-  may want to be activated again; a VM with a TPM gets a new one, so BitLocker asks
-  for its recovery key (the import warns when it finds a BitLocker volume).
-- **What it refuses:** encrypted VMs (remove the encryption in VMware first), VMs that
-  boot with BIOS, suspended VMs, and VMs VMware has open.
-
-Or a Linux kernel, booted directly:
+### A Linux kernel, booted directly
 
 ```powershell
 cargo run -p vmmc-vmx -- run --kernel bzImage --initrd initramfs.cpio `
     --disk disk.raw --cpus 4 --memory 1024 --cmdline "console=ttyS0"
 ```
 
-The guest's serial console is the terminal. **Ctrl-A x** quits, **Ctrl-A p** presses the
+### The console's keys
+
+With `vmmc-vmx run`, the guest's serial console is the terminal. **Ctrl-A x** quits, **Ctrl-A p** presses the
 ACPI power button, **Ctrl-A r** prints each vCPU's registers and the code at its RIP
 (for finding where a hung guest is stuck), **Ctrl-A m** saves guest RAM and every vCPU's
 state to a new `vmmc-memory-*` directory in the temp directory, **Ctrl-A k** switches

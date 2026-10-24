@@ -43,6 +43,27 @@ which looks for `VEN_1234&DEV_1111`.
   `.github/workflows/native-deps.yml`, a new release, and its pin in
   `xtask/src/native.rs`. TPMs made earlier keep the old ID in their EK certificate.
 
+- **The Linux agent's drags into Wayland programs lean on mutter's insides.** mutter
+  shows its XDND window for a Wayland program only when a drag goes onto another
+  window than the last drag did, so the agent sends to that window, hidden, when it
+  sees nothing under the pointer (`guest-drivers/linux/agent/src/x11.rs`,
+  `stand_in`). A mutter that changes how it names or finds those windows breaks
+  drags in. Better: a fix in mutter (its `focus_surface` reset at the end of a drag),
+  or a native Wayland source once GNOME lets one start a drag without a press.
+- **Starting VMs unsandboxed is an environment variable.** Where the sandbox can't
+  start (software that loads itself into every program and fails there, a desktop
+  that doesn't admit sandboxed programs), the only way out is `VMMC_NO_SANDBOX=1`.
+  The app should say what failed and offer to start that VM unsandboxed, with a
+  warning.
+
+## Compatibility
+
+- **Grain tables vmmc allocates on demand** go at the end of the file, which VMware's
+  checker calls corrupt (it wants all of a sparse disk's tables ahead of its grains).
+  Neither VMware nor vmmc makes disks whose directory has empty entries, so it only
+  happens with disks other tools made. Fix: allocate a missing table where VMware's
+  layout puts it, or rewrite the disk, as expanding does (`crates/disk`).
+
 ## Security
 
 - **UEFI variables aren't protected from the guest OS.** WHP has no SMM, so OVMF is
@@ -60,5 +81,7 @@ which looks for `VEN_1234&DEV_1111`.
 ## Housekeeping
 
 - `deny.toml` ignores RUSTSEC-2026-0192 (ttf-parser unmaintained, reached only through
-  winit's Wayland decorations). Recheck before release.
+  winit's Wayland decorations) and RUSTSEC-2026-0370 to -0372 (zbus's crates
+  unmaintained, reached only through Slint's winit backend on Linux). Recheck before
+  release.
 - The GitHub release `native-deps-3` is superseded and can be deleted.
