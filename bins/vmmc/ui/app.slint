@@ -37,6 +37,13 @@ export struct SnapshotRow {
     current: bool,
 }
 
+export struct DiskRow {
+    // "NVMe · 64 GiB · Windows 11.vmdk".
+    label: string,
+    gib: int,
+    expandable: bool,
+}
+
 export struct TabRow {
     path: string,
     name: string,
@@ -203,8 +210,21 @@ export component AppWindow inherits Window {
     in-out property <bool> settings-tpm;
     in-out property <bool> settings-enlightenments;
     in property <string> settings-error;
+    in-out property <bool> settings-nic;
+    in-out property <int> settings-nic-model;
+    // Its disks, changed at once (they're files), and why some can't be expanded.
+    in property <[DiskRow]> settings-disks;
+    in property <bool> settings-has-snapshots;
     callback browse-cdrom();
     callback save-settings();
+    callback remove-disk(int);
+    // Adding a disk, or expanding disk `disk-index`.
+    in-out property <bool> disk-sheet-open;
+    in-out property <bool> disk-sheet-expand;
+    in-out property <int> disk-sheet-index;
+    in-out property <int> disk-sheet-gib;
+    in-out property <bool> disk-sheet-nvme: true;
+    callback disk-sheet-done();
 
     // A message, with OK.
     in-out property <bool> message-open;
@@ -855,6 +875,64 @@ export component AppWindow inherits Window {
                     checked <=> root.settings-enlightenments;
                 }
             }
+            Field {
+                label: "Network";
+                CheckBox {
+                    text: "Adapter, on vmmc's NAT";
+                    checked <=> root.settings-nic;
+                }
+                ComboBox {
+                    model: ["e1000e", "virtio-net"];
+                    enabled: root.settings-nic;
+                    current-index <=> root.settings-nic-model;
+                }
+            }
+            Text {
+                text: "Disks";
+                color: white;
+                font-weight: 700;
+            }
+            for disk[index] in root.settings-disks: HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    text: disk.label;
+                    color: #d0d0d0;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+                Button {
+                    text: "Expand…";
+                    enabled: disk.expandable;
+                    clicked => {
+                        root.disk-sheet-expand = true;
+                        root.disk-sheet-index = index;
+                        root.disk-sheet-gib = disk.gib * 2;
+                        root.disk-sheet-open = true;
+                    }
+                }
+                Button {
+                    text: "Remove";
+                    clicked => { root.remove-disk(index); }
+                }
+            }
+            HorizontalLayout {
+                alignment: start;
+                Button {
+                    text: "Add disk…";
+                    clicked => {
+                        root.disk-sheet-expand = false;
+                        root.disk-sheet-gib = 64;
+                        root.disk-sheet-open = true;
+                    }
+                }
+            }
+            if root.settings-has-snapshots: Text {
+                text: "Disks can't be expanded while the VM has snapshots, whose disks wouldn't match: delete them first.";
+                color: #8a8a8a;
+                font-size: 11px;
+                wrap: word-wrap;
+            }
             Text {
                 text: "Changing Secure Boot gives the VM a fresh UEFI variable store (the old one is kept as nvram.fd.old).";
                 color: #8a8a8a;
@@ -879,6 +957,47 @@ export component AppWindow inherits Window {
                 text: "Save";
                 primary: true;
                 clicked => { root.save-settings(); }
+            }
+        }
+    }
+
+    // Adding a disk, or expanding one.
+    if root.disk-sheet-open: Sheet {
+        width: root.width;
+        height: root.height;
+        heading: root.disk-sheet-expand ? "Expand disk " + (root.disk-sheet-index + 1) : "Add a disk";
+        Field {
+            label: "Size (GiB)";
+            SpinBox {
+                minimum: 1;
+                maximum: 65536;
+                value <=> root.disk-sheet-gib;
+            }
+        }
+        if !root.disk-sheet-expand: Field {
+            label: "Bus";
+            CheckBox {
+                text: "NVMe (SATA otherwise)";
+                checked <=> root.disk-sheet-nvme;
+            }
+        }
+        Text {
+            text: root.disk-sheet-expand ? "The disk is written anew at its new size, which takes a while for a big one. The guest then has free space at the end of the disk: extend its partition in the guest to use it." : "A new, empty disk in the VM's folder: it takes space only as the guest writes to it.";
+            color: #8a8a8a;
+            wrap: word-wrap;
+        }
+        Rectangle { }
+        HorizontalLayout {
+            alignment: end;
+            spacing: 8px;
+            Button {
+                text: "Cancel";
+                clicked => { root.disk-sheet-open = false; }
+            }
+            Button {
+                text: root.disk-sheet-expand ? "Expand" : "Add";
+                primary: true;
+                clicked => { root.disk-sheet-done(); }
             }
         }
     }

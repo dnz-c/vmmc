@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 agent-proto.workspace = true
+disk.workspace = true
 ipc.workspace = true
 slint = { workspace = true, features = ["raw-window-handle-06"] }
 tracing.workspace = true

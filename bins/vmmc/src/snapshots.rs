@@ -10,7 +10,7 @@ use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferTyp
 use slint::platform::{Platform, PlatformError, WindowAdapter};
 use slint::{ComponentHandle, Image, ModelRc, Rgb8Pixel, SharedPixelBuffer, VecModel};
 
-use super::{AppWindow, SnapshotRow, TabRow, VmRow};
+use super::{AppWindow, DiskRow, SnapshotRow, TabRow, VmRow};
 
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 820;
@@ -193,8 +193,27 @@ fn every_state_draws() {
     app.set_settings_secure_boot(true);
     app.set_settings_tpm(true);
     app.set_settings_enlightenments(true);
+    app.set_settings_nic(true);
+    app.set_settings_disks(ModelRc::new(VecModel::from(vec![
+        DiskRow {
+            label: "NVMe · 64 GiB · Windows 11.vmdk".into(),
+            gib: 64,
+            expandable: true,
+        },
+        DiskRow {
+            label: "SATA · 0 GiB · esp.raw (read-only)".into(),
+            gib: 0,
+            expandable: false,
+        },
+    ])));
     app.set_settings_open(true);
     snapshot(&window, "settings");
+    app.set_disk_sheet_expand(true);
+    app.set_disk_sheet_index(0);
+    app.set_disk_sheet_gib(128);
+    app.set_disk_sheet_open(true);
+    snapshot(&window, "expand-disk");
+    app.set_disk_sheet_open(false);
     app.set_settings_open(false);
 
     app.set_message_title("Imported".into());

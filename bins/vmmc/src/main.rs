@@ -120,7 +120,7 @@ struct App {
 
 type Shared = Rc<RefCell<App>>;
 
-/// A snapshot operation that waits for the user to say yes.
+/// An operation that waits for the user to say yes.
 enum Confirm {
     Revert {
         vm: PathBuf,
@@ -132,6 +132,58 @@ enum Confirm {
         id: String,
         name: String,
     },
+    /// Taking disk `index` out of the VM (its file stays).
+    RemoveDisk { vm: PathBuf, index: usize },
+}
+
+/// The settings' list of `vm`'s disks, and which can be expanded: a writable VMDK of
+/// its own (not a delta), in a VM without snapshots.
+fn show_disks(window: &AppWindow, vm: &Vm) {
+    let snapshots = Tree::load(vm).is_ok_and(|tree| !tree.snapshots.is_empty());
+    let rows: Vec<DiskRow> = vm
+        .config
+        .disks
+        .iter()
+        .map(|disk| {
+            let path = vm.resolve(&disk.path);
+            let vmdk = path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("vmdk"));
+            let gib = disk::open(&path, true).map_or(0, |opened| opened.len() >> 30);
+            let delta = vmdk && disk::parent_of(&path).ok().flatten().is_some();
+            let bus = match disk.bus {
+                Bus::Nvme => "NVMe",
+                Bus::Sata => "SATA",
+                Bus::Virtio => "virtio",
+            };
+            let read_only = if disk.read_only { " (read-only)" } else { "" };
+            DiskRow {
+                label: format!("{bus} · {gib} GiB · {}{read_only}", disk.path).into(),
+                gib: i32::try_from(gib).unwrap_or(i32::MAX),
+                expandable: vmdk && !disk.read_only && !delta && !snapshots,
+            }
+        })
+        .collect();
+    window.set_settings_disks(ModelRc::new(VecModel::from(rows)));
+    window.set_settings_has_snapshots(snapshots);
+}
+
+/// Gives `vm` a new, empty disk of `len` bytes on `bus`, in its folder.
+fn add_disk(mut vm: Vm, len: u64, bus: Bus) -> Result<Vm, String> {
+    let name = (2..)
+        .map(|n| format!("{}-{n}.vmdk", vm.config.name))
+        .find(|name| !vm.resolve(name).exists())
+        .expect("a free name");
+    let path = vm.resolve(&name);
+    disk::create_sparse(&path, len).map_err(|e| format!("can't make {}: {e}", path.display()))?;
+    vm.config.disks.push(vmconfig::Disk {
+        path: name,
+        bus,
+        read_only: false,
+    });
+    vm.config.validate()?;
+    vm.save().map_err(|e| e.to_string())?;
+    Ok(vm)
 }
 
 fn main() {
@@ -1172,11 +1224,27 @@ fn wire(window: &AppWindow, app: &Shared) {
         let Some(confirm) = app.borrow_mut().confirm.take() else {
             return;
         };
+        if let Confirm::RemoveDisk { vm, index } = &confirm {
+            // The VM's file as it is now, without the disk; the file stays.
+            let removed = Vm::load(vm).map_err(|e| e.to_string()).and_then(|mut vm| {
+                if *index < vm.config.disks.len() {
+                    vm.config.disks.remove(*index);
+                }
+                vm.save().map_err(|e| e.to_string())?;
+                Ok(vm)
+            });
+            match removed {
+                Ok(vm) => show_disks(&window, &vm),
+                Err(e) => message(&window, "Couldn't remove the disk", &e),
+            }
+            return;
+        }
         let (path, id, name, failed) = match &confirm {
             Confirm::Revert { vm, id, name } => (vm, id.clone(), name.clone(), "Couldn't revert"),
             Confirm::Delete { vm, id, name } => {
                 (vm, id.clone(), name.clone(), "Couldn't delete the snapshot")
             }
+            Confirm::RemoveDisk { .. } => return,
         };
         let mut vm = match Vm::load(path) {
             Ok(vm) => vm,
@@ -1198,6 +1266,7 @@ fn wire(window: &AppWindow, app: &Shared) {
                 failed,
                 move || vmmc_client::delete_snapshot(&mut vm, &id),
             ),
+            Confirm::RemoveDisk { .. } => {}
         }
     }));
     {
@@ -1492,8 +1561,88 @@ fn wire(window: &AppWindow, app: &Shared) {
         window.set_settings_secure_boot(config.firmware.secure_boot);
         window.set_settings_tpm(config.firmware.tpm);
         window.set_settings_enlightenments(config.advanced.enlightenments);
+        window.set_settings_nic(!config.nics.is_empty());
+        window.set_settings_nic_model(i32::from(
+            config
+                .nics
+                .first()
+                .is_some_and(|nic| nic.model == vmconfig::NicModel::Virtio),
+        ));
+        show_disks(&window, &vm);
         window.set_settings_error("".into());
         window.set_settings_open(true);
+    }));
+    {
+        let app = app.clone();
+        let w = weak();
+        window.on_remove_disk(move |index| {
+            let Some(window) = w.upgrade() else {
+                return;
+            };
+            let Some(vm) = current_vm(&app, &window) else {
+                return;
+            };
+            let Some(disk) = vm.config.disks.get(index as usize) else {
+                return;
+            };
+            let text = format!(
+                "{} won't have it any more. Its file, {}, stays in the VM's folder.",
+                vm.config.name, disk.path
+            );
+            app.borrow_mut().confirm = Some(Confirm::RemoveDisk {
+                vm: vm.path.clone(),
+                index: index as usize,
+            });
+            ask(
+                &window,
+                &format!("Remove disk {}?", index + 1),
+                &text,
+                "Remove",
+            );
+        });
+    }
+    window.on_disk_sheet_done(with!(app, window, {
+        let vm = match current_vm_on_disk(&app, &window) {
+            Some(Ok(vm)) => vm,
+            Some(Err(e)) => return message(&window, "Couldn't read the VM's file", &e),
+            None => return,
+        };
+        window.set_disk_sheet_open(false);
+        let bytes = u64::try_from(window.get_disk_sheet_gib()).unwrap_or(1) << 30;
+        if window.get_disk_sheet_expand() {
+            let index = window.get_disk_sheet_index() as usize;
+            // Its number among the writable disks, which the client counts.
+            let number = vm.config.disks[..index.min(vm.config.disks.len())]
+                .iter()
+                .filter(|disk| !disk.read_only)
+                .count()
+                + 1;
+            let path = vm.path.clone();
+            background(
+                &window,
+                format!("Expanding disk {}…", index + 1),
+                move || vmmc_client::expand_disk(&vm, number, bytes),
+                move |window, expanded| {
+                    window.set_status_text("".into());
+                    if let Err(e) = expanded {
+                        message(window, "Couldn't expand the disk", &e);
+                    }
+                    if let Ok(vm) = Vm::load(&path) {
+                        show_disks(window, &vm);
+                    }
+                },
+            );
+        } else {
+            let bus = if window.get_disk_sheet_nvme() {
+                Bus::Nvme
+            } else {
+                Bus::Sata
+            };
+            match add_disk(vm, bytes, bus) {
+                Ok(vm) => show_disks(&window, &vm),
+                Err(e) => message(&window, "Couldn't add the disk", &e),
+            }
+        }
     }));
     {
         let w = weak();
@@ -1533,6 +1682,23 @@ fn wire(window: &AppWindow, app: &Shared) {
         config.firmware.secure_boot = window.get_settings_secure_boot();
         config.firmware.tpm = window.get_settings_tpm();
         config.advanced.enlightenments = window.get_settings_enlightenments();
+        let model = if window.get_settings_nic_model() == 1 {
+            vmconfig::NicModel::Virtio
+        } else {
+            vmconfig::NicModel::E1000e
+        };
+        match (window.get_settings_nic(), config.nics.first_mut()) {
+            (true, Some(nic)) => nic.model = model,
+            (true, None) => {
+                // A MAC from the VM's UUID, as a new VM's.
+                let uuid = config.uuid_bytes();
+                config.nics.push(vmconfig::Nic {
+                    model,
+                    mac: vmconfig::format_mac(&[0x52, 0x54, 0x00, uuid[13], uuid[14], uuid[15]]),
+                });
+            }
+            (false, _) => config.nics.clear(),
+        }
         if let Err(e) = config.validate() {
             window.set_settings_error(e.into());
             return;
