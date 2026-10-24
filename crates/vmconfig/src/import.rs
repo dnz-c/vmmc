@@ -175,17 +175,6 @@ fn has_bitlocker(disk: &dyn BlockBackend) -> bool {
     starts.into_iter().any(bitlocker)
 }
 
-/// A file name for a delta disk in `dir`, unused so far.
-fn delta_name(dir: &Path, stem: &str, taken: &[String]) -> String {
-    let mut name = format!("{stem}-vmmc.vmdk");
-    let mut number = 2;
-    while taken.contains(&name) || dir.join(&name).exists() {
-        name = format!("{stem}-vmmc{number}.vmdk");
-        number += 1;
-    }
-    name
-}
-
 /// Imports the VMware VM at `vmx_path`. Its vmmc files go in `state_dir`, by default a
 /// `vmmc` folder beside the `.vmx`.
 pub fn import(vmx_path: &Path, state_dir: Option<&Path>) -> Result<Imported, String> {
@@ -377,7 +366,6 @@ pub fn import(vmx_path: &Path, state_dir: Option<&Path>) -> Result<Imported, Str
     fs::create_dir_all(&state_dir)
         .map_err(|e| format!("can't create {}: {e}", state_dir.display()))?;
     let result = (|| {
-        let mut deltas: Vec<String> = Vec::new();
         let mut bases = Vec::new();
         for device in &devices {
             if device.cdrom {
@@ -405,24 +393,26 @@ pub fn import(vmx_path: &Path, state_dir: Option<&Path>) -> Result<Imported, Str
                 ));
             }
             drop(base);
-            let stem = device
-                .path
-                .file_stem()
-                .map_or("disk".into(), |s| s.to_string_lossy().into_owned());
-            let delta = delta_name(&state_dir, &stem, &deltas);
-            disk::create_delta(&state_dir.join(&delta), &device.path)
+            // In vmmc's folder, named as snapshots name deltas: NAME-000001.vmdk.
+            let delta = crate::snapshots::next_delta(
+                &state_dir.join(device.path.file_name().unwrap_or_default()),
+            );
+            disk::create_delta(&delta, &device.path)
                 .map_err(|e| format!("{}: can't make vmmc's delta disk: {e}", device.name))?;
             config.disks.push(Disk {
-                path: delta.clone(),
+                path: delta
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
                 bus: device.bus,
                 read_only: false,
             });
-            deltas.push(delta);
             bases.push(device.path.display().to_string());
         }
         config.vmware = Some(VmwareOrigin {
             vmx: vmx_path.display().to_string(),
-            base_disks: bases,
+            base_disks: bases.clone(),
         });
         config.notes = format!(
             "Imported from VMware ({}) on {}.",
@@ -435,6 +425,15 @@ pub fn import(vmx_path: &Path, state_dir: Option<&Path>) -> Result<Imported, Str
             config: config.clone(),
         };
         vm.save().map_err(|e| e.to_string())?;
+        // VMware's disks, as VMware left them, are the VM's first snapshot: reverting to
+        // it goes back to them.
+        crate::snapshots::protect(
+            &vm,
+            "Imported from VMware",
+            "VMware's disks, as VMware left them",
+            &bases,
+        )
+        .map_err(|e| e.to_string())?;
         Ok(vm)
     })();
     match result {
@@ -513,6 +512,31 @@ mod tests {
         }
         assert_eq!(files(dir.path()), before);
         assert!(import(&vmx, None).unwrap_err().contains("already imported"));
+
+        // VMware's disks are the first snapshot: reverting to it goes back to them, the
+        // new deltas in vmmc's folder, VMware's untouched.
+        assert_eq!(config.disks[0].path, "Win-000001.vmdk");
+        let tree = crate::snapshots::Tree::load(vm).unwrap();
+        assert_eq!(tree.snapshots.len(), 1);
+        let protective = &tree.snapshots[0];
+        assert_eq!(protective.name, "Imported from VMware");
+        assert_eq!(tree.current.as_deref(), Some(protective.id.as_str()));
+        let mut vm = Vm::load(&vm.path).unwrap();
+        crate::snapshots::revert(&mut vm, &protective.id).unwrap();
+        assert_eq!(vm.config.disks[0].path, "Win-000002.vmdk");
+        assert!(
+            !vm.resolve("Win-000001.vmdk").exists(),
+            "what came since is gone"
+        );
+        let disk = disk::open(&vm.resolve(&vm.config.disks[0].path), true).unwrap();
+        let mut first = [0u8; 16];
+        disk.read_at(&mut first, 0).unwrap();
+        assert_eq!(first, [0; 16], "VMware's disk as it was");
+        assert_eq!(files(dir.path()), before);
+        // Deleting it leaves VMware's disks alone too.
+        crate::snapshots::delete(&vm, &protective.id).unwrap();
+        crate::snapshots::consolidate(&mut vm).unwrap();
+        assert_eq!(files(dir.path()), before);
     }
 
     #[test]

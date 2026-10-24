@@ -181,6 +181,58 @@ pub fn next_delta(image: &Path) -> PathBuf {
         .expect("a free name")
 }
 
+/// The next free delta name for `image` in `vm`'s folder: beside the image when it's in
+/// the folder, and in the folder otherwise (a VMware VM's disks, whose folder vmmc never
+/// writes to).
+fn delta_for(vm: &Vm, image: &Path) -> PathBuf {
+    if normal(image).starts_with(normal(vm.dir())) {
+        next_delta(image)
+    } else {
+        next_delta(&vm.dir().join(image.file_name().unwrap_or_default()))
+    }
+}
+
+/// Records, as the first snapshot of a VM that has none, the images its disks are deltas
+/// on (one per writable disk, in the config's order): VMware's disks under an imported
+/// VM, kept as VMware left them. Reverting to it goes back to them.
+pub fn protect(
+    vm: &Vm,
+    name: &str,
+    description: &str,
+    images: &[String],
+) -> Result<Snapshot, Error> {
+    let mut tree = Tree::load(vm)?;
+    let mut frozen = vm.config.clone();
+    for (disk, image) in frozen
+        .disks
+        .iter_mut()
+        .filter(|disk| !disk.read_only)
+        .zip(images)
+    {
+        disk.path = image.clone();
+    }
+    let id = crate::format_uuid(&crate::random_uuid());
+    let dir = dir(vm);
+    fs::create_dir_all(&dir).map_err(|e| write_error(&dir, e))?;
+    let config = config_file(vm, &id);
+    let text = toml::to_string(&frozen)
+        .map_err(|e| write_error(&config, std::io::Error::other(e.to_string())))?;
+    fs::write(&config, text).map_err(|e| write_error(&config, e))?;
+    let snapshot = Snapshot {
+        id: id.clone(),
+        name: name.to_owned(),
+        description: description.to_owned(),
+        created: crate::now(),
+        parent: None,
+        running: false,
+        clones: Vec::new(),
+    };
+    tree.current = Some(id);
+    tree.snapshots.insert(0, snapshot.clone());
+    tree.save(vm)?;
+    Ok(snapshot)
+}
+
 /// A disk path as the config keeps it: relative to the VM's folder when it's inside.
 fn config_path(vm_dir: &Path, path: &Path) -> String {
     match path.strip_prefix(vm_dir) {
@@ -222,7 +274,7 @@ pub fn begin(vm: &Vm, name: &str, description: &str) -> Result<Pending, String> 
                 path.display()
             ));
         }
-        deltas.push(next_delta(&path));
+        deltas.push(delta_for(vm, &path));
     }
     Ok(Pending {
         state: state_file(vm, &id),
@@ -352,7 +404,7 @@ pub fn revert(vm: &mut Vm, id: &str) -> Result<Option<PathBuf>, String> {
     let mut made = Vec::new();
     for disk in config.disks.iter_mut().filter(|disk| !disk.read_only) {
         let image = vm.resolve(&disk.path);
-        let delta = next_delta(&image);
+        let delta = delta_for(vm, &image);
         if let Err(e) = disk::create_delta(&delta, &image) {
             for delta in made {
                 let _ = fs::remove_file(delta);
