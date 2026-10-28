@@ -27,8 +27,9 @@ after changing the app. Each line says what to do and what should happen.
 - [ ] The pointer moves in and out of the screen freely; clicks land where they show.
 - [ ] **Full screen**, then Ctrl+Alt+Enter and Esc: in and out; the bar at the top
       shows on entering and when the pointer touches the top edge.
-- [ ] **Fit guest to window** with vmmc's display driver in Windows: resizing the
-      window resizes the desktop.
+- [ ] **Fit guest to window** with vmmc's display driver in Windows, and in an Ubuntu
+      VM made with the Ubuntu preset (virtio-gpu): resizing the window resizes the
+      desktop.
 - [ ] **Ctrl+Alt+Del**, **Shut down**, **Power off**, **Reset** do what they say.
 
 ## Settings
@@ -59,7 +60,7 @@ after changing the app. Each line says what to do and what should happen.
 - [ ] **Install vmmc Tools** in Windows: AutoPlay offers setup; afterwards the
       clipboard goes both ways.
 - [ ] **Install vmmc Tools** in Ubuntu: the command the app shows installs the agent;
-      afterwards the clipboard goes both ways.
+      afterwards the clipboard goes both ways, and still does after logging off and on.
 - [ ] Drag a file and a folder from Explorer onto the console (Windows and Ubuntu
       guests): they land where the pointer is.
 - [ ] Drag a file out of the guest past the console's edge onto the desktop: it lands

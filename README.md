@@ -42,13 +42,17 @@ Phase 3 (the desktop app and moving over from VMware) is done:
   guests.
 - **`vmmc-cli`** does all of it from the command line.
 
+Phase 4 (guest integration) has begun:
+- **virtio-gpu:** Ubuntu VMs get a virtio-gpu display, and their desktop follows the
+  window's size.
+
 What a release still needs is listed in [docs/RELEASE-BLOCKERS.md](docs/RELEASE-BLOCKERS.md).
 
 What exists:
 - **Platform:** a Q35 PC (MCH host bridge, ICH9 LPC) with ACPI, SMP, an IOAPIC, PIT,
   RTC, 16550 serial console, PCIe (port I/O and ECAM), NVMe and virtio-blk disks, and
   an AHCI controller for SATA disks and DVD drives, a linear-framebuffer display
-  adapter, virtio-net or Intel e1000e network adapters on user-mode NAT, a PS/2
+  adapter or virtio-gpu, virtio-net or Intel e1000e network adapters on user-mode NAT, a PS/2
   keyboard and mouse, an xHCI controller with a USB tablet and keyboard, and a TPM 2.0.
 - **Boot:** UEFI firmware from flash (fw_cfg, ACPI through the table loader, SMBIOS), or
   direct Linux boot (bzImage + initramfs) in 64-bit mode.
@@ -89,6 +93,7 @@ cargo xtask win-perf                            # boot timings of that Windows, 
 cargo xtask guest-drivers                       # build and test-sign the Windows guest drivers (needs the WDK)
 cargo xtask win-display-test                    # install Windows with the display driver, change resolution
 cargo xtask ubuntu-desktop-test                 # Ubuntu 26.04 Desktop autoinstall (downloads 6.5 GB)
+cargo xtask ubuntu-gpu-test                     # Ubuntu on virtio-gpu follows the host's sizes, suspends, resumes
 cargo xtask vmdk-compat-test                    # vmmc's VMDKs against VMware's vdiskmanager (needs VMware)
 cargo xtask vmware-import-test                  # open a VMware VM in place and boot it (VMMC_VMWARE_VMX)
 cargo xtask worker-test                         # VMs in sandboxed workers, controlled through their pipes
@@ -124,11 +129,13 @@ target\release\vmmc.exe
 - **A VM's tab** shows its hardware and notes and starts it; while it runs, its screen.
   Click the screen to type in the guest: every key goes to it, the Windows key and
   Alt+Tab included, until **Ctrl+Alt** gives the keyboard back. The pointer is a USB
-  tablet, so it moves freely in and out. With **Fit guest to window**, a Windows guest
-  with vmmc's display driver takes the window's size. **Full screen**, **Ctrl+Alt+Del**,
+  tablet, so it moves freely in and out. With **Fit guest to window**, the guest takes
+  the window's size: Windows with vmmc's display driver, and Linux on virtio-gpu (as
+  the Ubuntu preset has it). **Full screen**, **Ctrl+Alt+Del**,
   shut down (the power button), power off, reset and **Suspend** (its state saved; Start
   then resumes it) are on the toolbar.
-- **Settings:** processors, memory, the DVD drive's disc, resolution, Secure Boot, the
+- **Settings:** processors, memory, the DVD drive's disc, the display adapter (vmmc's,
+  which any OS can use, or virtio-gpu, which Linux resizes), resolution, Secure Boot, the
   TPM, Hyper-V enlightenments, the network adapter (e1000e or virtio-net), and the
   disks: add a new one, remove one (its file stays), or expand one.
 - **Snapshots:** a VM's page lists them as a tree. **Take snapshot** keeps the VM as
@@ -277,8 +284,10 @@ rather than 10-25%. `--no-enlightenments` hides them.
 `--display window` shows the guest's screen in a window, one guest pixel per screen
 pixel, and follows the guest when it changes resolution:
 - **Size:** resizing the window asks the guest for that resolution. Windows with
-  vmmc's display driver switches to it (see [guest drivers](guest-drivers/windows/README.md));
-  other guests get it as their monitor's preferred resolution from their next boot.
+  vmmc's display driver switches to it (see [guest drivers](guest-drivers/windows/README.md)),
+  and so does Linux on virtio-gpu (`--adapter virtio-gpu`) with a desktop that follows
+  its monitor's preferred mode, as GNOME does; other guests get it as their monitor's
+  preferred resolution from their next boot.
 - **Pointer:** the host pointer drives a USB tablet, so it moves freely in and out.
   With vmmc's display driver, Windows' cursor is a hardware one: the window draws it
   at your pointer, so it doesn't lag behind.
@@ -291,8 +300,10 @@ pixel, and follows the guest when it changes resolution:
 `--resolution WxH` sets the resolution the display offers the guest (its EDID), which
 the firmware boots in and Windows and Linux prefer. Without it, a VM with a window gets
 the largest standard resolution that fits on your screen, and one without gets
-1280x800. Linux's own `bochs-drm` driver runs the display: resolutions are chosen in
-the guest, and don't follow the window.
+1280x800. On vmmc's adapter (the default), Linux's own `bochs-drm` driver runs the
+display: resolutions are chosen in the guest, and don't follow the window.
+`--adapter virtio-gpu` gives the guest virtio-gpu instead, whose driver Linux has; the
+firmware then has no linear framebuffer to hand on, so Windows can't use it.
 For everyday use, run a release build (`cargo run --release -p vmmc-vmx -- run ...`):
 dev builds optimize their dependencies, but vmmc's own device code runs unoptimized.
 
