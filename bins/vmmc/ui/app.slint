@@ -1122,8 +1122,8 @@ export component AppWindow inherits Window {
         heading: root.message-title;
         // As wide as the sheet, so long lines wrap rather than run off both edges.
         message-scroll := ScrollView {
-            viewport-width: self.visible-width;
-            viewport-height: max(self.visible-height, message-body.preferred-height);
+            content-width: self.visible-width;
+            content-height: max(self.visible-height, message-body.preferred-height);
             message-body := Text {
                 x: 0;
                 y: 0;
