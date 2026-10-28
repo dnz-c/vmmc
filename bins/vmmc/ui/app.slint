@@ -206,6 +206,8 @@ export component AppWindow inherits Window {
     in-out property <int> settings-memory-mib;
     in-out property <string> settings-cdrom;
     in-out property <string> settings-resolution;
+    // 0 vmmc's, 1 virtio-gpu.
+    in-out property <int> settings-adapter;
     in-out property <bool> settings-secure-boot;
     in-out property <bool> settings-tpm;
     in-out property <bool> settings-enlightenments;
@@ -848,6 +850,13 @@ export component AppWindow inherits Window {
                 Button {
                     text: "Browse…";
                     clicked => { root.browse-cdrom(); }
+                }
+            }
+            Field {
+                label: "Display adapter";
+                ComboBox {
+                    model: ["vmmc (any OS)", "virtio-gpu (Linux)"];
+                    current-index <=> root.settings-adapter;
                 }
             }
             Field {

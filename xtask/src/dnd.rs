@@ -91,7 +91,7 @@ pub fn win_test() -> Result<(), String> {
     Ok(())
 }
 
-const UBUNTU: &str = "ubuntu-dnd-test";
+pub(crate) const UBUNTU: &str = "ubuntu-dnd-test";
 const UBUNTU_USER_DATA: &str = include_str!("../guest/ubuntu-dnd-user-data.yaml");
 const UBUNTU_TEST: &str = include_str!("../guest/dnd-test.sh");
 const UBUNTU_PEER: &str = include_str!("../guest/dnd-peer.js");
@@ -105,15 +105,7 @@ const UBUNTU_PEER: &str = include_str!("../guest/dnd-peer.js");
 pub fn ubuntu_test() -> Result<(), String> {
     // The Tools disc, with the Linux agent.
     let drivers = drivers::build(false)?;
-    let image = crate::image_dir()?.join(format!("{UBUNTU}-disk.vmdk"));
-    if !image.is_file() || env::var_os("VMMC_REINSTALL").is_some() {
-        crate::ubuntu::install(
-            UBUNTU,
-            &UBUNTU_USER_DATA.replace(char::from(13), ""),
-            "VMMC-DND: autoinstall",
-            "VMMC-DND: installed",
-        )?;
-    }
+    ubuntu_image()?;
     let dir = workspace().join("target").join(UBUNTU);
     fs::create_dir_all(&dir).map_err(|e| format!("can't create {}: {e}", dir.display()))?;
     let disc = dir.join("test.iso");
@@ -173,6 +165,21 @@ pub fn ubuntu_test() -> Result<(), String> {
     }
     result?;
     eprintln!("{UBUNTU} passed");
+    Ok(())
+}
+
+/// Installs the test's Ubuntu, unless it's there (and `VMMC_REINSTALL` isn't set). Its
+/// first boot installs vmmc Tools from their disc, so the drivers must be built.
+pub(crate) fn ubuntu_image() -> Result<(), String> {
+    let image = crate::image_dir()?.join(format!("{UBUNTU}-disk.vmdk"));
+    if !image.is_file() || env::var_os("VMMC_REINSTALL").is_some() {
+        crate::ubuntu::install(
+            UBUNTU,
+            &UBUNTU_USER_DATA.replace(char::from(13), ""),
+            "VMMC-DND: autoinstall",
+            "VMMC-DND: installed",
+        )?;
+    }
     Ok(())
 }
 

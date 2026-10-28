@@ -112,6 +112,7 @@ pub fn create_vm(new: &NewVm) -> Result<Vm, String> {
     config.firmware.secure_boot = preset.secure_boot;
     config.firmware.tpm = preset.tpm;
     config.nics[0].model = preset.nic;
+    config.display.adapter = preset.adapter;
     if let Some(old) = new.adopt {
         adopt(&mut config, old, &dir)?;
     }

@@ -1558,6 +1558,9 @@ fn wire(window: &AppWindow, app: &Shared) {
         );
         window
             .set_settings_resolution(config.display.resolution.clone().unwrap_or_default().into());
+        window.set_settings_adapter(i32::from(
+            config.display.adapter == vmconfig::Adapter::VirtioGpu,
+        ));
         window.set_settings_secure_boot(config.firmware.secure_boot);
         window.set_settings_tpm(config.firmware.tpm);
         window.set_settings_enlightenments(config.advanced.enlightenments);
@@ -1678,6 +1681,11 @@ fn wire(window: &AppWindow, app: &Shared) {
         }
         let resolution = window.get_settings_resolution().trim().to_owned();
         config.display.resolution = (!resolution.is_empty()).then_some(resolution);
+        config.display.adapter = if window.get_settings_adapter() == 1 {
+            vmconfig::Adapter::VirtioGpu
+        } else {
+            vmconfig::Adapter::Vmmc
+        };
         let secure_boot_changed = config.firmware.secure_boot != window.get_settings_secure_boot();
         config.firmware.secure_boot = window.get_settings_secure_boot();
         config.firmware.tpm = window.get_settings_tpm();

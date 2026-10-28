@@ -6,6 +6,7 @@ mod drivers;
 mod easy_install;
 mod esp;
 mod firmware;
+mod gpu;
 mod guests;
 mod modules;
 mod native;
@@ -50,6 +51,9 @@ tasks:
   ubuntu-dnd-test
                 the clipboard both ways, and drags into and out of Ubuntu Desktop
                 through vmmc's Linux agent (installs Ubuntu the first time, 15-60 min)
+  ubuntu-gpu-test
+                Ubuntu Desktop (ubuntu-dnd-test's) on virtio-gpu: its screen follows
+                the sizes the host asks for
   win-perf [RUNS]
                 boot the Windows win11-test installed RUNS times (3) each without and
                 with Hyper-V enlightenments, in a release build, and compare timings
@@ -120,6 +124,7 @@ fn main() -> ExitCode {
         Some("win-display-test") => drivers::display_test(),
         Some("win-dnd-test") => dnd::win_test(),
         Some("ubuntu-dnd-test") => dnd::ubuntu_test(),
+        Some("ubuntu-gpu-test") => gpu::ubuntu_test(),
         Some("win-perf") => match env::args().nth(2).map(|runs| runs.parse::<usize>()) {
             None => perf::test(3),
             Some(Ok(runs)) if runs > 0 => perf::test(runs),

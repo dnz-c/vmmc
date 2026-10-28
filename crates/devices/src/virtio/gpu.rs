@@ -371,7 +371,8 @@ impl VirtioGpu {
             return;
         };
         let memory = &running.memory;
-        let Some(queue) = running.queues.get_mut(index) else {
+        // OVMF enables only the control queue.
+        let Some(queue) = running.queues.get_mut(index).filter(|queue| queue.ready()) else {
             return;
         };
         let served = (|| -> Result<bool, virtio_queue::Error> {

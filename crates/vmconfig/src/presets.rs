@@ -1,7 +1,7 @@
 //! What a new VM gets for each kind of guest, as the New VM wizard and `vmmc-cli
 //! create` offer them.
 
-use crate::{Bus, NicModel};
+use crate::{Adapter, Bus, NicModel};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Preset {
@@ -13,12 +13,15 @@ pub struct Preset {
     pub disk_gib: u64,
     pub bus: Bus,
     pub nic: NicModel,
+    pub adapter: Adapter,
     pub secure_boot: bool,
     pub tpm: bool,
 }
 
 /// Windows needs no extra drivers for NVMe and e1000e; Linux has virtio too, but
-/// the same devices keep the presets alike.
+/// the same devices keep the presets alike. Ubuntu gets virtio-gpu, whose screen
+/// follows the window; other Linuxes keep vmmc's adapter, which needs nothing of the
+/// guest (virtio-gpu leaves a kernel without its driver no screen at all).
 pub const PRESETS: [Preset; 5] = [
     Preset {
         id: "windows11",
@@ -28,6 +31,7 @@ pub const PRESETS: [Preset; 5] = [
         disk_gib: 64,
         bus: Bus::Nvme,
         nic: NicModel::E1000e,
+        adapter: Adapter::Vmmc,
         secure_boot: true,
         tpm: true,
     },
@@ -39,6 +43,7 @@ pub const PRESETS: [Preset; 5] = [
         disk_gib: 64,
         bus: Bus::Nvme,
         nic: NicModel::E1000e,
+        adapter: Adapter::Vmmc,
         secure_boot: true,
         tpm: true,
     },
@@ -50,6 +55,7 @@ pub const PRESETS: [Preset; 5] = [
         disk_gib: 32,
         bus: Bus::Nvme,
         nic: NicModel::E1000e,
+        adapter: Adapter::VirtioGpu,
         secure_boot: true,
         tpm: true,
     },
@@ -61,6 +67,7 @@ pub const PRESETS: [Preset; 5] = [
         disk_gib: 20,
         bus: Bus::Nvme,
         nic: NicModel::E1000e,
+        adapter: Adapter::Vmmc,
         secure_boot: false,
         tpm: false,
     },
@@ -72,6 +79,7 @@ pub const PRESETS: [Preset; 5] = [
         disk_gib: 20,
         bus: Bus::Sata,
         nic: NicModel::E1000e,
+        adapter: Adapter::Vmmc,
         secure_boot: false,
         tpm: false,
     },
