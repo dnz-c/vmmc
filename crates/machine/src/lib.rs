@@ -27,7 +27,7 @@ use devices::clock::{Clock, VmClock};
 use devices::display::bochs::{
     BochsDisplay, FRAMEBUFFER_BAR, FRAMEBUFFER_SIZE, MMIO_BAR, MMIO_SIZE,
 };
-pub use devices::display::bochs::{Capture, Cursor, Display, Frame, MAX_PREFERRED, MIN_PREFERRED};
+pub use devices::display::{Capture, Cursor, Display, Frame, MAX_PREFERRED, MIN_PREFERRED};
 use devices::firmware::fw_cfg::{self, FW_CFG_BASE, FW_CFG_PORTS, FwCfg};
 use devices::firmware::pflash::Pflash;
 use devices::irq::{IrqLine, MsiSink};
@@ -63,6 +63,7 @@ pub use devices::usb::hid::TABLET_MAX;
 use devices::usb::hid::{Keyboard as UsbKeyboard, KeyboardInput, Tablet, TabletInput};
 use devices::usb::xhci::{XHCI_BAR, XHCI_BAR_SIZE, Xhci};
 use devices::virtio::blk::VirtioBlk;
+use devices::virtio::gpu::VirtioGpu;
 use devices::virtio::net::VirtioNet;
 use devices::virtio::pci::{CONFIG_BAR, CONFIG_BAR_SIZE, MSIX_BAR, MSIX_BAR_SIZE, VirtioPci};
 use devices::{PowerEvent, PowerHandler};
@@ -203,8 +204,21 @@ pub struct MachineConfig {
     pub tpm: Option<SharedTpm>,
     /// Expose the hypervisor's Hyper-V enlightenments to the guest.
     pub enlightenments: bool,
+    pub display: DisplayModel,
     /// The screen resolution the display's EDID prefers, which the firmware boots in.
     pub resolution: (u32, u32),
+}
+
+/// Which display adapter the guest sees (slot 1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DisplayModel {
+    /// bochs-display, with vmmc's registers: a linear framebuffer that the firmware and
+    /// every OS can draw in. vmmc's Windows driver follows the window's size.
+    #[default]
+    Vmmc,
+    /// virtio-gpu, 2D. Linux's driver follows the window's size. Windows has no
+    /// driver, and gets no framebuffer from the firmware either.
+    VirtioGpu,
 }
 
 /// How a run ended.
@@ -478,16 +492,36 @@ impl<P: Partition + 'static> Machine<P> {
                     .ok_or_else(|| Error::Config("out of PCI address space".into()))
             };
 
-            let mut adapter =
-                BochsDisplay::new(vm.ram_mapper(), config.resolution).map_err(Error::Display)?;
-            display = adapter.display();
-            if direct_boot {
-                for (bar, size) in [(FRAMEBUFFER_BAR, FRAMEBUFFER_SIZE), (MMIO_BAR, MMIO_SIZE)] {
-                    let address = allocate(size)?;
-                    adapter.config_mut().set_bar_address(bar.into(), address);
+            match config.display {
+                DisplayModel::Vmmc => {
+                    let mut adapter = BochsDisplay::new(vm.ram_mapper(), config.resolution)
+                        .map_err(Error::Display)?;
+                    display = Display::Bochs(adapter.display());
+                    if direct_boot {
+                        for (bar, size) in
+                            [(FRAMEBUFFER_BAR, FRAMEBUFFER_SIZE), (MMIO_BAR, MMIO_SIZE)]
+                        {
+                            let address = allocate(size)?;
+                            adapter.config_mut().set_bar_address(bar.into(), address);
+                        }
+                    }
+                    root.add_device(DISPLAY_SLOT, Arc::new(Mutex::new(adapter)));
+                }
+                DisplayModel::VirtioGpu => {
+                    let gpu = VirtioGpu::new(config.resolution);
+                    display = Display::Gpu(gpu.display());
+                    let mut pci = VirtioPci::new(Box::new(gpu), vm.memory().clone(), sink.clone());
+                    if direct_boot {
+                        for (bar, size) in
+                            [(CONFIG_BAR, CONFIG_BAR_SIZE), (MSIX_BAR, MSIX_BAR_SIZE)]
+                        {
+                            pci.config_mut()
+                                .set_bar_address(bar.into(), allocate(size)?);
+                        }
+                    }
+                    root.add_device(DISPLAY_SLOT, Arc::new(Mutex::new(pci)));
                 }
             }
-            root.add_device(DISPLAY_SLOT, Arc::new(Mutex::new(adapter)));
 
             let mut namespaces = Vec::new();
             let mut virtio_disks = Vec::new();
@@ -808,12 +842,12 @@ impl<P: Partition + 'static> Machine<P> {
         SerialInput(self.com2.clone())
     }
 
-    /// A handle that presses the guest's ACPI power button from any thread.
     /// A handle that reads what the display adapter shows, from any thread.
     pub fn display(&self) -> Display {
         self.display.clone()
     }
 
+    /// A handle that presses the guest's ACPI power button from any thread.
     pub fn power_button(&self) -> PowerButton {
         PowerButton(self.acpi_pm.clone())
     }

@@ -259,7 +259,8 @@ impl VirtioPci {
             0x10 => self.vectors.config.load(Ordering::SeqCst).into(),
             0x12 => self.queues.len() as u64,
             0x14 => self.status.into(),
-            // The configuration never changes, so its generation stays 0.
+            // What changes in a configuration (virtio-gpu's events) is read in one
+            // access, so its generation stays 0.
             0x15 => 0,
             0x16 => self.queue_select.into(),
             0x18 => queue.map_or(0, |q| q.size.into()),
@@ -499,6 +500,8 @@ fn class_code(device_type: u16) -> u32 {
         virtio_bindings::virtio_ids::VIRTIO_ID_BLOCK => 0x01_00_00,
         // Network, Ethernet.
         virtio_bindings::virtio_ids::VIRTIO_ID_NET => 0x02_00_00,
+        // Display controller, other.
+        virtio_bindings::virtio_ids::VIRTIO_ID_GPU => 0x03_80_00,
         _ => 0xff_00_00,
     }
 }
@@ -580,6 +583,8 @@ struct VirtioPciState {
     queues: Vec<QueueConfig>,
     /// While the device runs: where it is in each queue.
     running: Option<Vec<SavedQueue>>,
+    /// The device's own state ([`VirtioDevice::save_device`]).
+    device: Vec<u8>,
 }
 
 impl Snapshot for VirtioPci {
@@ -608,6 +613,7 @@ impl Snapshot for VirtioPci {
                     .map(SavedQueue::from)
                     .collect()
             }),
+            device: self.device.save_device(),
         })
     }
 
@@ -638,6 +644,9 @@ impl Snapshot for VirtioPci {
         self.status = state.status;
         self.queue_select = state.queue_select;
         self.queues = state.queues;
+        self.device
+            .restore_device(&state.device)
+            .map_err(StateError)?;
         if let Some(running) = state.running {
             let queues = running
                 .iter()

@@ -127,9 +127,27 @@ impl Default for Firmware {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Display {
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub adapter: Adapter,
     /// `WxH`: the resolution the monitor prefers, which the firmware boots in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution: Option<String>,
+}
+
+/// The display adapter the guest sees.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Adapter {
+    /// vmmc's own (bochs-display with vmmc's registers): every OS can use it, and
+    /// vmmc's Windows driver resizes it.
+    #[default]
+    Vmmc,
+    /// virtio-gpu: Linux resizes it to the window. Windows can't use it.
+    VirtioGpu,
+}
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

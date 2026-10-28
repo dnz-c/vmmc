@@ -26,15 +26,12 @@ use serde::{Deserialize, Serialize};
 use vm_core::{MemoryAccess, RamMapper, RamRegion};
 
 use super::edid::{EDID_SIZE, edid};
+use super::{Capture, Cursor, Frame, preferred};
 use crate::pci::{BarKind, ConfigSpace, Identity, PciDevice};
 use crate::snapshot::{self, Snapshot, StateError};
 
 pub const FRAMEBUFFER_BAR: u8 = 0;
 pub const FRAMEBUFFER_SIZE: u64 = 32 << 20;
-/// The largest preferred resolution the EDID offers: what fits the framebuffer.
-pub const MAX_PREFERRED: (u32, u32) = (3840, 2160);
-/// The smallest: what UEFI's graphics console needs.
-pub const MIN_PREFERRED: (u32, u32) = (640, 480);
 pub const MMIO_BAR: u8 = 2;
 pub const MMIO_SIZE: u64 = 0x1000;
 
@@ -86,14 +83,6 @@ const MAX_XRES: u16 = 7680;
 const MAX_YRES: u16 = 4320;
 const MAX_BPP: u16 = 32;
 
-/// One captured frame, as packed 8-bit RGB.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Frame {
-    pub width: u32,
-    pub height: u32,
-    pub rgb: Vec<u8>,
-}
-
 struct State {
     registers: [u16; REGISTERS],
     /// The last ENABLE write asked for the maximum values instead of the current ones.
@@ -112,19 +101,6 @@ struct CursorRegisters {
     size: u32,
     hotspot: u32,
     count: u32,
-}
-
-/// The guest's hardware cursor.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Cursor {
-    /// How many images the guest has given; 0 while it draws the cursor itself.
-    pub count: u32,
-    pub shown: bool,
-    pub width: u32,
-    pub height: u32,
-    pub hotspot: (u32, u32),
-    /// Straight-alpha RGBA, `width` x `height`.
-    pub rgba: Vec<u8>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -149,8 +125,7 @@ impl Display {
     /// it from the next boot. Returns the size asked for, after keeping it within what
     /// the adapter can show.
     pub fn request_size(&self, width: u32, height: u32) -> (u32, u32) {
-        let width = width.clamp(MIN_PREFERRED.0, MAX_PREFERRED.0);
-        let mut height = height.clamp(MIN_PREFERRED.1, MAX_PREFERRED.1);
+        let (width, mut height) = preferred((width, height));
         // The picture has to end before the cursor's image.
         let rows = (CURSOR_OFFSET / (u64::from(width) * 4)) as u32;
         height = height.min(rows);
@@ -275,17 +250,6 @@ impl Display {
     }
 }
 
-/// What [`Display::capture`] saw last.
-#[derive(Default)]
-pub struct Capture {
-    /// Width, height, bytes per pixel, stride and start of the last picture.
-    geometry: Option<[u64; 5]>,
-    /// Its pixels as the framebuffer held them.
-    raw: Vec<u8>,
-    /// A buffer to read the next picture into.
-    spare: Vec<u8>,
-}
-
 pub struct BochsDisplay {
     config: ConfigSpace,
     display: Display,
@@ -295,11 +259,10 @@ pub struct BochsDisplay {
 }
 
 impl BochsDisplay {
-    /// An adapter whose EDID prefers `resolution`, kept between [`MIN_PREFERRED`] and
-    /// [`MAX_PREFERRED`].
+    /// An adapter whose EDID prefers `resolution`, kept between
+    /// [`MIN_PREFERRED`](super::MIN_PREFERRED) and [`MAX_PREFERRED`](super::MAX_PREFERRED).
     pub fn new(mapper: RamMapper, resolution: (u32, u32)) -> std::io::Result<Self> {
-        let width = resolution.0.clamp(MIN_PREFERRED.0, MAX_PREFERRED.0);
-        let height = resolution.1.clamp(MIN_PREFERRED.1, MAX_PREFERRED.1);
+        let (width, height) = preferred(resolution);
         let mut config = ConfigSpace::new(Identity {
             vendor_id: 0x1234,
             device_id: 0x1111,
@@ -609,6 +572,7 @@ impl PciDevice for BochsDisplay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::display::{MAX_PREFERRED, MIN_PREFERRED};
     use crate::pci::config;
 
     fn adapter() -> BochsDisplay {

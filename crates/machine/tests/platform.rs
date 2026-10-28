@@ -16,8 +16,8 @@ use fake_hv::{FakeHv, FakePartition};
 use guest_io::Guest;
 use machine::layout::MIB;
 use machine::{
-    DiskConfig, DiskInterface, FIRST_VIRTIO_SLOT, FirmwareConfig, Machine, MachineConfig,
-    NVME_SLOT, RunOutcome,
+    DiskConfig, DiskInterface, DisplayModel, FIRST_VIRTIO_SLOT, FirmwareConfig, Machine,
+    MachineConfig, NVME_SLOT, RunOutcome,
 };
 use vm_core::StopReason;
 
@@ -35,6 +35,7 @@ fn config(cpus: u8, disks: Vec<DiskConfig>) -> MachineConfig {
         firmware: None,
         tpm: None,
         enlightenments: false,
+        display: DisplayModel::Vmmc,
         resolution: (1280, 800),
     }
 }

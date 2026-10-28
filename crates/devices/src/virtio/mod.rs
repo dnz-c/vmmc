@@ -1,6 +1,7 @@
 //! virtio devices and their PCI transport (virtio 1.2, modern devices only).
 
 pub mod blk;
+pub mod gpu;
 pub mod net;
 pub mod pci;
 
@@ -59,6 +60,17 @@ pub trait VirtioDevice: Send {
     fn quiesce(&mut self) {}
 
     fn resume(&mut self) {}
+
+    /// What the device keeps besides its queues, for a snapshot.
+    fn save_device(&self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    /// Puts back what [`VirtioDevice::save_device`] saved, before the transport starts
+    /// the device again.
+    fn restore_device(&mut self, _saved: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// A queue's [`QueueState`], saved.

@@ -88,6 +88,22 @@ enum DisplayMode {
     Window,
 }
 
+/// `--adapter`'s values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum AdapterArg {
+    Vmmc,
+    VirtioGpu,
+}
+
+impl From<vmconfig::Adapter> for AdapterArg {
+    fn from(adapter: vmconfig::Adapter) -> Self {
+        match adapter {
+            vmconfig::Adapter::Vmmc => AdapterArg::Vmmc,
+            vmconfig::Adapter::VirtioGpu => AdapterArg::VirtioGpu,
+        }
+    }
+}
+
 #[derive(Args)]
 struct RunArgs {
     /// A VM's `.vmmc` file, which says what the machine is. Disks, CD-ROMs and NICs
@@ -131,6 +147,10 @@ struct RunArgs {
     /// Show the screen in a window, which also takes keyboard and pointer input.
     #[arg(long, value_enum, default_value_t = DisplayMode::None)]
     display: DisplayMode,
+    /// The display adapter: `vmmc` (any OS) or `virtio-gpu` (Linux, which then
+    /// follows the window's size) [default: the VM's, or vmmc].
+    #[arg(long, value_enum)]
+    adapter: Option<AdapterArg>,
     /// The guest's screen resolution, which its firmware boots in and its display
     /// driver prefers [default: with a window, the largest standard resolution that
     /// fits on the screen; without, 1280x800].
@@ -236,6 +256,7 @@ fn with_vm(mut args: RunArgs) -> Result<RunArgs, String> {
     args.cpus = args.cpus.or(Some(config.cpus));
     args.memory = args.memory.or(Some(config.memory_mib));
     args.resolution = args.resolution.or(config.resolution());
+    args.adapter = args.adapter.or(Some(config.display.adapter.into()));
     args.no_enlightenments |= !config.advanced.enlightenments;
     if let Err(e) = vm.mark_powered_on() {
         tracing::warn!(%e, "can't note when the VM was started");
@@ -714,6 +735,10 @@ fn run_machines(
                 firmware: boot.firmware_config()?,
                 tpm: tpm.cloned(),
                 enlightenments: !args.no_enlightenments,
+                display: match args.adapter {
+                    Some(AdapterArg::VirtioGpu) => machine::DisplayModel::VirtioGpu,
+                    Some(AdapterArg::Vmmc) | None => machine::DisplayModel::Vmmc,
+                },
                 resolution,
             },
         )?;
