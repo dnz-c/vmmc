@@ -30,6 +30,7 @@ udevadm control --reload-rules
 udevadm trigger --action=change --sysname-match=ttyS1
 udevadm settle || true
 
+# No X-GNOME-Autostart-Phase: GNOME 50's session skips entries that have one.
 mkdir -p /etc/xdg/autostart
 cat > /etc/xdg/autostart/vmmc-agent.desktop <<'EOF'
 [Desktop Entry]
@@ -38,7 +39,6 @@ Name=vmmc agent
 Comment=Shares the clipboard with the host and drags files to and from it
 Exec=/usr/local/bin/vmmc-agent
 NoDisplay=true
-X-GNOME-Autostart-Phase=Applications
 EOF
 
 # Now, in the session of the user who ran this, through sudo or pkexec. (Their agent
